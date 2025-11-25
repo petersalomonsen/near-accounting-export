@@ -111,8 +111,8 @@ async function getIntentsBalances(accountId, blockId) {
             }
         } catch (e) {
             console.warn(`Could not get balances for intents tokens:`, e.message);
-            for (const token of tokens) {
-                balances[token] = '0';
+            for (const tokenId of tokenIds) {
+                balances[tokenId] = '0';
             }
         }
     } catch (e) {
