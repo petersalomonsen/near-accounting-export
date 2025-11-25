@@ -1,0 +1,30 @@
+{
+  "name": "near-accounting-export",
+  "version": "1.0.0",
+  "description": "Gather NEAR account data history, tracking NEAR, Fungible Tokens, NEAR Intents and staking balance changes",
+  "type": "module",
+  "main": "scripts/get-account-history.js",
+  "bin": {
+    "near-accounting-export": "./scripts/get-account-history.js"
+  },
+  "scripts": {
+    "start": "node scripts/get-account-history.js",
+    "test": "mocha --timeout 60000 test/**/*.test.js"
+  },
+  "keywords": [
+    "near",
+    "accounting",
+    "blockchain",
+    "balance-tracker"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@near-js/accounts": "^2.5.1",
+    "@near-js/keystores": "^2.5.1",
+    "@near-js/providers": "^2.5.1"
+  },
+  "devDependencies": {
+    "mocha": "^11.7.5"
+  }
+}
