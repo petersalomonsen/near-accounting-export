@@ -15,7 +15,7 @@ COPY scripts/ ./scripts/
 RUN mkdir -p /data
 
 # Set environment variables
-ENV NEAR_RPC_ENDPOINT=https://archival-rpc.mainnet.near.org
+ENV NEAR_RPC_ENDPOINT=https://archival-rpc.mainnet.fastnear.com
 ENV RPC_DELAY_MS=50
 
 # Set entrypoint

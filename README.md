@@ -69,7 +69,7 @@ docker run -v $(pwd)/data:/data near-accounting-export \
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `NEAR_RPC_ENDPOINT` | RPC endpoint URL | `https://archival-rpc.mainnet.near.org` |
+| `NEAR_RPC_ENDPOINT` | RPC endpoint URL | `https://archival-rpc.mainnet.fastnear.com` |
 | `RPC_DELAY_MS` | Delay between RPC calls in ms | `50` |
 
 ## Output Format

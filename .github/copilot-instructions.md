@@ -43,7 +43,8 @@ npm test
 
 ## Environment Variables
 
-- `NEAR_RPC_ENDPOINT` - RPC endpoint URL (default: https://archival-rpc.mainnet.near.org)
+- `NEAR_RPC_ENDPOINT` - RPC endpoint URL (default: https://archival-rpc.mainnet.fastnear.com)
+  - **Note**: The old rpc.mainnet.near.org endpoint is deprecated and returns error -429. Use fastnear.com or alternative providers from https://docs.near.org/api/rpc/providers
 - `RPC_DELAY_MS` - Delay between RPC calls in milliseconds (default: 50)
 
 ## Key Conventions

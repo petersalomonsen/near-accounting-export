@@ -3,7 +3,7 @@ import { JsonRpcProvider } from '@near-js/providers';
 
 // Configuration
 const RPC_DELAY_MS = parseInt(process.env.RPC_DELAY_MS || '50', 10);
-const DEFAULT_RPC_ENDPOINT = 'https://archival-rpc.mainnet.near.org';
+const DEFAULT_RPC_ENDPOINT = 'https://archival-rpc.mainnet.fastnear.com';
 
 // Helper to add delay between RPC calls
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));

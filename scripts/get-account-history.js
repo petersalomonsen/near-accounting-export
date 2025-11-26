@@ -419,7 +419,7 @@ Options:
   -h, --help              Show this help message
 
 Environment Variables:
-  NEAR_RPC_ENDPOINT       RPC endpoint URL (default: https://archival-rpc.mainnet.near.org)
+  NEAR_RPC_ENDPOINT       RPC endpoint URL (default: https://archival-rpc.mainnet.fastnear.com)
   RPC_DELAY_MS            Delay between RPC calls in ms (default: 50)
 
 Examples:
