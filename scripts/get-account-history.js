@@ -183,10 +183,20 @@ export async function getAccountHistory(options) {
     let transactionsFound = 0;
     let currentSearchEnd = searchEnd;
     let currentSearchStart = searchStart;
+    const rangeSize = searchEnd - searchStart;
 
-    while (transactionsFound < maxTransactions && currentSearchEnd > currentSearchStart) {
+    while (transactionsFound < maxTransactions) {
         if (getStopSignal()) {
             console.log('Stop signal received, saving progress...');
+            break;
+        }
+
+        // Check if current range is valid
+        if (direction === 'backward' && currentSearchEnd < 0) {
+            console.log('Reached the beginning of the blockchain');
+            break;
+        } else if (direction === 'forward' && currentSearchStart > currentBlock) {
+            console.log('Reached the current block height');
             break;
         }
 
@@ -197,22 +207,59 @@ export async function getAccountHistory(options) {
             clearBalanceCache();
         }
 
-        // Find the block where balance changed
-        const balanceChange = await findLatestBalanceChangingBlock(
-            accountId,
-            currentSearchStart,
-            currentSearchEnd
-        );
+        let balanceChange;
+        try {
+            // Find the block where balance changed
+            balanceChange = await findLatestBalanceChangingBlock(
+                accountId,
+                currentSearchStart,
+                currentSearchEnd
+            );
+        } catch (error) {
+            if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                console.log(`Error during search: ${error.message}`);
+                console.log('Stopping and saving progress...');
+                break;
+            }
+            throw error;
+        }
 
         if (!balanceChange.hasChanges) {
-            console.log('No more balance changes found in range');
-            break;
+            console.log('No balance changes found in current range');
+            
+            // Move to adjacent range of equal size
+            if (direction === 'backward') {
+                currentSearchEnd = currentSearchStart - 1;
+                currentSearchStart = Math.max(0, currentSearchEnd - rangeSize);
+                console.log(`Moving to previous range: ${currentSearchStart} - ${currentSearchEnd}`);
+            } else {
+                currentSearchStart = currentSearchEnd + 1;
+                currentSearchEnd = Math.min(currentBlock, currentSearchStart + rangeSize);
+                console.log(`Moving to next range: ${currentSearchStart} - ${currentSearchEnd}`);
+            }
+            
+            // Save progress even when no transactions found
+            history.updatedAt = new Date().toISOString();
+            saveHistory(outputFile, history);
+            console.log(`Progress saved to ${outputFile}`);
+            
+            continue;
         }
 
         console.log(`Found balance change at block ${balanceChange.block}`);
 
-        // Find the transaction that caused the change
-        const txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block);
+        let txInfo;
+        try {
+            // Find the transaction that caused the change
+            txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block);
+        } catch (error) {
+            if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                console.log(`Error fetching transaction details: ${error.message}`);
+                console.log('Stopping and saving progress...');
+                break;
+            }
+            throw error;
+        }
 
         // Create transaction entry
         const entry = {
@@ -421,6 +468,12 @@ Options:
 Environment Variables:
   NEAR_RPC_ENDPOINT       RPC endpoint URL (default: https://archival-rpc.mainnet.fastnear.com)
   RPC_DELAY_MS            Delay between RPC calls in ms (default: 50)
+
+Behavior:
+  The script continuously searches for balance changes in adjacent ranges. When no 
+  changes are found in the current range, it automatically moves to the next adjacent 
+  range of equal size. It continues until interrupted (Ctrl+C), rate limited, max 
+  transactions reached, or endpoint becomes unresponsive. Progress is saved continuously.
 
 Examples:
   # Fetch last 50 transactions for an account

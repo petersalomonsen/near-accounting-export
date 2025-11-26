@@ -31,8 +31,10 @@ Balance tracking and binary search logic:
 Main CLI script that:
 - Loads existing history files to continue from
 - Searches forward or backward in time
+- Continuously searches through adjacent ranges when no balance changes found
+- Stops on: user interrupt (Ctrl+C), rate limit, max transactions, or endpoint errors
 - Verifies transaction connectivity (balance changes match between adjacent transactions)
-- Saves progress periodically
+- Saves progress continuously (every 5 transactions and when moving to new ranges)
 
 ## Testing
 
@@ -53,11 +55,13 @@ npm test
 
 2. **Binary Search**: Use binary search to find balance-changing blocks efficiently instead of scanning every block.
 
-3. **Error Handling**: Handle rate limiting gracefully with a stop signal mechanism.
+3. **Continuous Search**: When no balance changes are found in a range, automatically move to the adjacent range of equal size and continue searching until interrupted, rate limited, or endpoint becomes unresponsive.
 
-4. **Progress Saving**: Save progress periodically to allow resuming interrupted jobs.
+4. **Error Handling**: Handle rate limiting and endpoint errors gracefully with a stop signal mechanism. Always save progress before stopping.
 
-5. **BigInt for Balances**: Always use BigInt when comparing or calculating balance differences to avoid precision issues.
+5. **Progress Saving**: Save progress continuously - every 5 transactions and when moving to new search ranges - to ensure no data is lost on interruption.
+
+6. **BigInt for Balances**: Always use BigInt when comparing or calculating balance differences to avoid precision issues.
 
 ## Docker Usage
 
