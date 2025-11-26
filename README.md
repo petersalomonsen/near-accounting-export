@@ -2,6 +2,8 @@
 
 Gather NEAR account data history, tracking NEAR, Fungible Tokens, NEAR Intents and staking balance changes.
 
+This project is written in **TypeScript** and uses the official **@near-js/jsonrpc-client** library for blockchain interactions.
+
 ## Features
 
 - **Binary Search Discovery**: Efficiently finds balance-changing transactions using binary search instead of scanning every block
@@ -10,11 +12,24 @@ Gather NEAR account data history, tracking NEAR, Fungible Tokens, NEAR Intents a
 - **Bidirectional**: Search forward or backward in time
 - **Verification**: Verify transaction connectivity by checking that balance changes match between adjacent transactions
 - **Docker Ready**: Designed to run in Docker containers for scheduled jobs
+- **Type Safe**: Fully typed with TypeScript for better development experience
 
 ## Installation
 
 ```bash
 npm install
+```
+
+## Building
+
+The project is written in TypeScript and must be compiled:
+
+```bash
+# Build TypeScript to JavaScript
+npm run build
+
+# For development with auto-reload
+npm run dev
 ```
 
 ## Usage
@@ -23,16 +38,19 @@ npm install
 
 ```bash
 # Fetch last 50 transactions for an account
-node scripts/get-account-history.js --account myaccount.near --max 50
+npm start -- --account myaccount.near --max 50
+
+# Or use the compiled script directly
+node dist/scripts/get-account-history.js --account myaccount.near --max 50
 
 # Continue fetching backward from existing file
-node scripts/get-account-history.js --account myaccount.near --output ./history.json
+node dist/scripts/get-account-history.js --account myaccount.near --output ./history.json
 
 # Fetch forward from a specific block
-node scripts/get-account-history.js -a myaccount.near --direction forward --start-block 100000000
+node dist/scripts/get-account-history.js -a myaccount.near --direction forward --start-block 100000000
 
 # Verify an existing history file
-node scripts/get-account-history.js --verify --output ./history.json
+node dist/scripts/get-account-history.js --verify --output ./history.json
 ```
 
 ### Docker

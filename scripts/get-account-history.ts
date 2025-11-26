@@ -7,29 +7,101 @@ import path from 'path';
 import {
     getCurrentBlockHeight,
     setStopSignal,
-    getStopSignal,
-    setProvider
+    getStopSignal
 } from './rpc.js';
 import {
     findLatestBalanceChangingBlock,
     findBalanceChangingTransaction,
-    getAllBalances,
-    getBlockHeightAtDate,
     clearBalanceCache
 } from './balance-tracker.js';
+import type { BalanceSnapshot, BalanceChanges, TransactionInfo } from './balance-tracker.js';
+
+// Types
+interface VerificationError {
+    type: string;
+    token?: string;
+    expected: string;
+    actual: string;
+    message: string;
+}
+
+interface VerificationResult {
+    valid: boolean;
+    errors: VerificationError[];
+}
+
+interface TransactionEntry {
+    block: number;
+    timestamp: number | null;
+    transactionHashes: string[];
+    transactions: any[];
+    balanceBefore?: BalanceSnapshot;
+    balanceAfter?: BalanceSnapshot;
+    changes: {
+        nearChanged: boolean;
+        nearDiff?: string;
+        tokensChanged: Record<string, { start: string; end: string; diff: string }>;
+        intentsChanged: Record<string, { start: string; end: string; diff: string }>;
+    };
+    verificationWithNext?: VerificationResult;
+    verificationWithPrevious?: VerificationResult;
+}
+
+interface AccountHistory {
+    accountId: string;
+    createdAt: string;
+    updatedAt: string;
+    transactions: TransactionEntry[];
+    metadata: {
+        firstBlock: number | null;
+        lastBlock: number | null;
+        totalTransactions: number;
+    };
+}
+
+interface GetAccountHistoryOptions {
+    accountId: string;
+    outputFile: string;
+    direction?: 'forward' | 'backward';
+    maxTransactions?: number;
+    startBlock?: number;
+    endBlock?: number;
+}
+
+interface ParsedArgs {
+    accountId: string | null;
+    outputFile: string | null;
+    direction: 'forward' | 'backward';
+    maxTransactions: number;
+    startBlock: number | null;
+    endBlock: number | null;
+    verify: boolean;
+    help: boolean;
+}
+
+interface VerificationResults {
+    valid: boolean;
+    totalTransactions: number;
+    verifiedCount: number;
+    errorCount: number;
+    errors: Array<{
+        previousBlock: number;
+        currentBlock: number;
+        errors: VerificationError[];
+    }>;
+    error?: string;
+}
 
 /**
  * Load existing accounting history from file
- * @param {string} filePath - Path to the history file
- * @returns {Object|null} Existing history or null
  */
-function loadExistingHistory(filePath) {
+function loadExistingHistory(filePath: string): AccountHistory | null {
     try {
         if (fs.existsSync(filePath)) {
             const data = fs.readFileSync(filePath, 'utf-8');
             return JSON.parse(data);
         }
-    } catch (error) {
+    } catch (error: any) {
         console.error(`Error loading existing history from ${filePath}:`, error.message);
     }
     return null;
@@ -37,10 +109,8 @@ function loadExistingHistory(filePath) {
 
 /**
  * Save accounting history to file
- * @param {string} filePath - Path to save to
- * @param {Object} history - History data to save
  */
-function saveHistory(filePath, history) {
+function saveHistory(filePath: string, history: AccountHistory): void {
     const dir = path.dirname(filePath);
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -50,12 +120,12 @@ function saveHistory(filePath, history) {
 
 /**
  * Verify that a transaction's balance changes match the expected changes
- * @param {Object} transaction - Transaction entry
- * @param {Object} previousTransaction - Previous transaction entry (can be null)
- * @returns {Object} Verification result
  */
-function verifyTransactionConnectivity(transaction, previousTransaction) {
-    const result = {
+function verifyTransactionConnectivity(
+    transaction: TransactionEntry,
+    previousTransaction: TransactionEntry | null
+): VerificationResult {
+    const result: VerificationResult = {
         valid: true,
         errors: []
     };
@@ -123,16 +193,8 @@ function verifyTransactionConnectivity(transaction, previousTransaction) {
 
 /**
  * Get accounting history for an account
- * @param {Object} options - Options for the export
- * @param {string} options.accountId - NEAR account ID
- * @param {string} options.outputFile - Output file path
- * @param {string} options.direction - 'forward' or 'backward'
- * @param {number} options.maxTransactions - Maximum transactions to fetch
- * @param {number} options.startBlock - Starting block (optional)
- * @param {number} options.endBlock - Ending block (optional)
- * @returns {Promise<Object>} History data
  */
-export async function getAccountHistory(options) {
+export async function getAccountHistory(options: GetAccountHistoryOptions): Promise<AccountHistory> {
     const {
         accountId,
         outputFile,
@@ -168,7 +230,7 @@ export async function getAccountHistory(options) {
     console.log(`Current block height: ${currentBlock}`);
 
     // Determine search range based on direction and existing data
-    let searchStart, searchEnd;
+    let searchStart: number, searchEnd: number;
     
     if (direction === 'backward') {
         searchEnd = startBlock || (history.metadata.firstBlock ? history.metadata.firstBlock - 1 : currentBlock);
@@ -211,7 +273,7 @@ export async function getAccountHistory(options) {
             clearBalanceCache();
         }
 
-        let balanceChange;
+        let balanceChange: BalanceChanges;
         try {
             // Find the block where balance changed
             balanceChange = await findLatestBalanceChangingBlock(
@@ -219,7 +281,7 @@ export async function getAccountHistory(options) {
                 currentSearchStart,
                 currentSearchEnd
             );
-        } catch (error) {
+        } catch (error: any) {
             if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
                 console.log(`Error during search: ${error.message}`);
                 console.log('Stopping and saving progress...');
@@ -256,11 +318,11 @@ export async function getAccountHistory(options) {
 
         console.log(`Found balance change at block ${balanceChange.block}`);
 
-        let txInfo;
+        let txInfo: TransactionInfo;
         try {
             // Find the transaction that caused the change
-            txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block);
-        } catch (error) {
+            txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block!);
+        } catch (error: any) {
             if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
                 console.log(`Error fetching transaction details: ${error.message}`);
                 console.log('Stopping and saving progress...');
@@ -274,8 +336,8 @@ export async function getAccountHistory(options) {
         }
 
         // Create transaction entry
-        const entry = {
-            block: balanceChange.block,
+        const entry: TransactionEntry = {
+            block: balanceChange.block!,
             timestamp: txInfo.blockTimestamp,
             transactionHashes: txInfo.transactionHashes,
             transactions: txInfo.transactions,
@@ -322,9 +384,9 @@ export async function getAccountHistory(options) {
 
         // Update search range for next iteration
         if (direction === 'backward') {
-            currentSearchEnd = balanceChange.block - 1;
+            currentSearchEnd = balanceChange.block! - 1;
         } else {
-            currentSearchStart = balanceChange.block + 1;
+            currentSearchStart = balanceChange.block! + 1;
         }
 
         // Update metadata
@@ -353,17 +415,15 @@ export async function getAccountHistory(options) {
 
 /**
  * Verify an existing history file
- * @param {string} filePath - Path to the history file
- * @returns {Object} Verification results
  */
-export function verifyHistoryFile(filePath) {
+export function verifyHistoryFile(filePath: string): VerificationResults {
     const history = loadExistingHistory(filePath);
     
     if (!history) {
-        return { valid: false, error: 'Could not load history file' };
+        return { valid: false, error: 'Could not load history file', totalTransactions: 0, verifiedCount: 0, errorCount: 0, errors: [] };
     }
 
-    const results = {
+    const results: VerificationResults = {
         valid: true,
         totalTransactions: history.transactions.length,
         verifiedCount: 0,
@@ -397,11 +457,10 @@ export function verifyHistoryFile(filePath) {
 
 /**
  * Parse command line arguments
- * @returns {Object} Parsed arguments
  */
-function parseArgs() {
+function parseArgs(): ParsedArgs {
     const args = process.argv.slice(2);
-    const options = {
+    const options: ParsedArgs = {
         accountId: null,
         outputFile: null,
         direction: 'backward',
@@ -426,7 +485,7 @@ function parseArgs() {
                 break;
             case '--direction':
             case '-d':
-                options.direction = args[++i];
+                options.direction = args[++i] as 'forward' | 'backward';
                 break;
             case '--max':
             case '-m':
@@ -460,7 +519,7 @@ function parseArgs() {
 /**
  * Print help message
  */
-function printHelp() {
+function printHelp(): void {
     console.log(`
 NEAR Accounting Export - Get account transaction history
 
@@ -470,7 +529,7 @@ Usage:
 Options:
   -a, --account <id>      NEAR account ID to fetch history for
   -o, --output <file>     Output file path (default: <account-id>.json)
-  -d, --direction <dir>   Search direction: 'backward' or 'forward' (default: backward)
+  -d, --direction <dir>   Search direction: 'forward' or 'backward' (default: backward)
   -m, --max <number>      Maximum transactions to fetch (default: 100)
   --start-block <number>  Starting block height
   --end-block <number>    Ending block height
@@ -503,7 +562,7 @@ Examples:
 }
 
 // Main execution
-async function main() {
+async function main(): Promise<void> {
     const options = parseArgs();
 
     if (options.help) {
@@ -555,8 +614,8 @@ async function main() {
     });
 
     try {
-        await getAccountHistory(options);
-    } catch (error) {
+        await getAccountHistory(options as GetAccountHistoryOptions);
+    } catch (error: any) {
         console.error('Error:', error.message);
         process.exit(1);
     }

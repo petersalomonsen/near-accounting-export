@@ -2,32 +2,36 @@
 
 ## Project Overview
 
-This project provides tools to gather NEAR account data history, tracking:
+This TypeScript project provides tools to gather NEAR account data history, tracking:
 - NEAR token balance changes
 - Fungible Token (FT) balance changes
 - NEAR Intents multi-token balance changes
 - Staking balance changes
 
+The project uses `@near-js/jsonrpc-client` for RPC interactions and is written in TypeScript for type safety.
+
 ## Architecture
 
 The project uses a binary search approach to efficiently discover balance changes without scanning every block. The main components are:
 
-### scripts/rpc.js
-RPC helper module for NEAR blockchain interactions. Provides:
-- `getProvider()` - Get/create the JSON-RPC provider
+### scripts/rpc.ts
+RPC helper module for NEAR blockchain interactions using @near-js/jsonrpc-client. Provides:
+- `getClient()` - Get/create the NearRpcClient instance
 - `viewAccount(accountId, blockId)` - View account state at a specific block
 - `callViewFunction(contractId, methodName, args, blockId)` - Call view functions
 - `getCurrentBlockHeight()` - Get the current block height
 - `fetchBlockData(blockHeight)` - Fetch detailed block data including receipts
+- Proper TypeScript types from @near-js/jsonrpc-types
 
-### scripts/balance-tracker.js
-Balance tracking and binary search logic:
+### scripts/balance-tracker.ts
+Balance tracking and binary search logic with TypeScript interfaces:
 - `getAllBalances(accountId, blockId, tokenContracts, intentsTokens, checkNear)` - Get all balances at a block
 - `findLatestBalanceChangingBlock(accountId, firstBlock, lastBlock)` - Binary search for balance changes
 - `findBalanceChangingTransaction(targetAccountId, balanceChangeBlock)` - Find the transaction that caused a change
 - `getBlockHeightAtDate(date)` - Estimate block height at a specific date
+- Exports TypeScript interfaces: BalanceSnapshot, BalanceChanges, TransactionInfo
 
-### scripts/get-account-history.js
+### scripts/get-account-history.ts
 Main CLI script that:
 - Loads existing history files to continue from
 - Searches forward or backward in time
@@ -35,13 +39,27 @@ Main CLI script that:
 - Stops on: user interrupt (Ctrl+C), rate limit, max transactions, or endpoint errors
 - Verifies transaction connectivity (balance changes match between adjacent transactions)
 - Saves progress continuously (every 5 transactions and when moving to new ranges)
+- Fully typed with TypeScript interfaces for all data structures
 
-## Testing
+## Building and Testing
 
-Tests are located in `test/` directory and use Mocha. Run with:
+The project is written in TypeScript and must be compiled before running:
+
 ```bash
+# Build TypeScript to JavaScript
+npm run build
+
+# Run the compiled script
+npm start
+
+# Run tests (tests will be auto-compiled)
 npm test
+
+# For development with auto-reload
+npm run dev
 ```
+
+Built files are output to the `dist/` directory.
 
 ## Environment Variables
 

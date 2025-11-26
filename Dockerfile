@@ -2,14 +2,20 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+# Copy package files and tsconfig
+COPY package*.json tsconfig.json ./
 
-# Install dependencies
-RUN npm ci --production
+# Install dependencies (including devDependencies for build)
+RUN npm ci
 
-# Copy scripts
+# Copy TypeScript source
 COPY scripts/ ./scripts/
+
+# Build TypeScript
+RUN npm run build
+
+# Remove devDependencies to reduce image size
+RUN npm prune --production
 
 # Create data directory
 RUN mkdir -p /data
@@ -19,7 +25,7 @@ ENV NEAR_RPC_ENDPOINT=https://archival-rpc.mainnet.fastnear.com
 ENV RPC_DELAY_MS=50
 
 # Set entrypoint
-ENTRYPOINT ["node", "scripts/get-account-history.js"]
+ENTRYPOINT ["node", "dist/scripts/get-account-history.js"]
 
 # Default command shows help
 CMD ["--help"]

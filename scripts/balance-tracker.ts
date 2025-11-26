@@ -9,9 +9,36 @@ import {
     getTransactionStatusWithReceipts,
     getStopSignal
 } from './rpc.js';
+import type { RpcBlockResponse } from '@near-js/jsonrpc-types';
+
+// Types
+export interface BalanceSnapshot {
+    near: string;
+    fungibleTokens: Record<string, string>;
+    intentsTokens: Record<string, string>;
+}
+
+export interface BalanceChanges {
+    hasChanges: boolean;
+    nearChanged: boolean;
+    tokensChanged: Record<string, { start: string; end: string; diff: string }>;
+    intentsChanged: Record<string, { start: string; end: string; diff: string }>;
+    nearDiff?: string;
+    startBalance?: BalanceSnapshot;
+    endBalance?: BalanceSnapshot;
+    block?: number;
+}
+
+export interface TransactionInfo {
+    transactions: any[];
+    transactionHashes: string[];
+    transactionBlock: number | null;
+    receiptBlock: number;
+    blockTimestamp: number | null;
+}
 
 // Cache for balance snapshots to avoid redundant RPC calls
-const balanceCache = new Map();
+const balanceCache = new Map<string, BalanceSnapshot>();
 
 // Default fungible token contracts to track
 const DEFAULT_TOKENS = [
@@ -23,19 +50,19 @@ const DEFAULT_TOKENS = [
 /**
  * Clear the balance cache
  */
-export function clearBalanceCache() {
+export function clearBalanceCache(): void {
     balanceCache.clear();
 }
 
 /**
  * Get fungible token balances for account
- * @param {string} accountId
- * @param {number} blockId
- * @param {string[]} tokenContracts - List of token contracts to check
- * @returns {Promise<Object>} Map of token contract to balance
  */
-async function getFungibleTokenBalances(accountId, blockId, tokenContracts = []) {
-    const balances = {};
+async function getFungibleTokenBalances(
+    accountId: string,
+    blockId: number | string,
+    tokenContracts: string[] = []
+): Promise<Record<string, string>> {
+    const balances: Record<string, string> = {};
 
     for (const token of tokenContracts) {
         if (getStopSignal()) {
@@ -61,12 +88,12 @@ async function getFungibleTokenBalances(accountId, blockId, tokenContracts = [])
 
 /**
  * Get Intents multi-token balances
- * @param {string} accountId
- * @param {number} blockId
- * @returns {Promise<Object>} Map of token to balance
  */
-async function getIntentsBalances(accountId, blockId) {
-    const balances = {};
+async function getIntentsBalances(
+    accountId: string,
+    blockId: number | string
+): Promise<Record<string, string>> {
+    const balances: Record<string, string> = {};
 
     if (getStopSignal()) {
         throw new Error('Operation cancelled by user');
@@ -86,7 +113,9 @@ async function getIntentsBalances(accountId, blockId) {
         }
 
         // Extract token IDs from the token objects
-        const tokenIds = tokens.map(token => typeof token === 'string' ? token : token.token_id);
+        const tokenIds = Array.isArray(tokens) ? tokens.map((token: any) => 
+            typeof token === 'string' ? token : token.token_id
+        ) : [];
 
         // Get balances for all tokens in batch
         try {
@@ -105,11 +134,11 @@ async function getIntentsBalances(accountId, blockId) {
             );
 
             if (batchBalances && Array.isArray(batchBalances)) {
-                tokenIds.forEach((tokenId, index) => {
+                tokenIds.forEach((tokenId: string, index: number) => {
                     balances[tokenId] = batchBalances[index] || '0';
                 });
             }
-        } catch (e) {
+        } catch (e: any) {
             console.warn(`Could not get balances for intents tokens:`, e.message);
             for (const tokenId of tokenIds) {
                 balances[tokenId] = '0';
@@ -124,21 +153,21 @@ async function getIntentsBalances(accountId, blockId) {
 
 /**
  * Get all balances (NEAR, fungible tokens, intents) for an account at a specific block
- * @param {string} accountId - Account ID
- * @param {number|string} blockId - Block height or 'final'
- * @param {string[]|null|undefined} tokenContracts - Token contracts to check (null = none, undefined = defaults)
- * @param {string[]|null|undefined} intentsTokens - Intents tokens to check (null = none, undefined = auto-detect)
- * @param {boolean} checkNear - Whether to check NEAR balance
- * @returns {Promise<Object>} Balances object
  */
-export async function getAllBalances(accountId, blockId, tokenContracts = undefined, intentsTokens = undefined, checkNear = true) {
+export async function getAllBalances(
+    accountId: string,
+    blockId: number | string,
+    tokenContracts: string[] | null | undefined = undefined,
+    intentsTokens: string[] | null | undefined = undefined,
+    checkNear = true
+): Promise<BalanceSnapshot> {
     const cacheKey = `${accountId}:${blockId}:${JSON.stringify(tokenContracts)}:${JSON.stringify(intentsTokens)}:${checkNear}`;
 
     if (balanceCache.has(cacheKey)) {
-        return balanceCache.get(cacheKey);
+        return balanceCache.get(cacheKey)!;
     }
 
-    const result = {
+    const result: BalanceSnapshot = {
         near: '0',
         fungibleTokens: {},
         intentsTokens: {}
@@ -149,7 +178,7 @@ export async function getAllBalances(accountId, blockId, tokenContracts = undefi
         try {
             const account = await viewAccount(accountId, blockId);
             result.near = account?.amount || '0';
-        } catch (e) {
+        } catch (e: any) {
             if (!e.message?.includes('does not exist')) {
                 throw e;
             }
@@ -174,7 +203,7 @@ export async function getAllBalances(accountId, blockId, tokenContracts = undefi
         result.intentsTokens = {};
     } else if (intentsTokens !== undefined) {
         if (intentsTokens.length > 0) {
-            const intentsBalances = {};
+            const intentsBalances: Record<string, string> = {};
             try {
                 if (getStopSignal()) {
                     throw new Error('Operation cancelled by user');
@@ -195,7 +224,7 @@ export async function getAllBalances(accountId, blockId, tokenContracts = undefi
                         intentsBalances[token] = batchBalances[index] || '0';
                     });
                 }
-            } catch (e) {
+            } catch (e: any) {
                 console.warn(`Could not get batch balances for intents tokens:`, e.message);
                 for (const token of intentsTokens) {
                     intentsBalances[token] = '0';
@@ -215,12 +244,12 @@ export async function getAllBalances(accountId, blockId, tokenContracts = undefi
 
 /**
  * Detect balance changes between two snapshots
- * @param {Object} startBalance - Start balance snapshot
- * @param {Object} endBalance - End balance snapshot
- * @returns {Object} Changes detected
  */
-function detectBalanceChanges(startBalance, endBalance) {
-    const changes = {
+function detectBalanceChanges(
+    startBalance: BalanceSnapshot,
+    endBalance: BalanceSnapshot
+): BalanceChanges {
+    const changes: BalanceChanges = {
         hasChanges: false,
         nearChanged: false,
         tokensChanged: {},
@@ -279,22 +308,15 @@ function detectBalanceChanges(startBalance, endBalance) {
 
 /**
  * Find the latest block where a balance changed using binary search
- * @param {string} accountId - Account ID
- * @param {number} firstBlock - Start of search range
- * @param {number} lastBlock - End of search range
- * @param {string[]|null|undefined} tokenContracts - Token contracts to check
- * @param {string[]|null|undefined} intentsTokens - Intents tokens to check
- * @param {boolean} checkNear - Whether to check NEAR balance
- * @returns {Promise<Object>} Balance change info
  */
 export async function findLatestBalanceChangingBlock(
-    accountId,
-    firstBlock,
-    lastBlock,
-    tokenContracts = undefined,
-    intentsTokens = undefined,
+    accountId: string,
+    firstBlock: number,
+    lastBlock: number,
+    tokenContracts: string[] | null | undefined = undefined,
+    intentsTokens: string[] | null | undefined = undefined,
     checkNear = true
-) {
+): Promise<BalanceChanges> {
     if (getStopSignal()) {
         throw new Error('Operation cancelled by user');
     }
@@ -309,7 +331,10 @@ export async function findLatestBalanceChangingBlock(
             hasChanges: false,
             block: lastBlock,
             startBalance,
-            endBalance
+            endBalance,
+            nearChanged: false,
+            tokensChanged: {},
+            intentsChanged: {}
         };
     }
 
@@ -331,7 +356,7 @@ export async function findLatestBalanceChangingBlock(
     const middleBlock = lastBlock - Math.floor(numBlocks / 2);
 
     // Build list of tokens to check in recursion
-    const changedTokens = [];
+    const changedTokens: string[] = [];
     if (detectedChanges.tokensChanged) {
         Object.keys(detectedChanges.tokensChanged).forEach(token => {
             if (!changedTokens.includes(token)) {
@@ -340,7 +365,7 @@ export async function findLatestBalanceChangingBlock(
         });
     }
 
-    const changedIntentsTokens = [];
+    const changedIntentsTokens: string[] = [];
     if (detectedChanges.intentsChanged) {
         Object.keys(detectedChanges.intentsChanged).forEach(token => {
             changedIntentsTokens.push(token);
@@ -372,25 +397,25 @@ export async function findLatestBalanceChangingBlock(
 
 /**
  * Find transaction that caused a balance change
- * @param {string} targetAccountId - The account whose balance changed
- * @param {number} balanceChangeBlock - The block where the balance changed
- * @returns {Promise<Object>} Transaction info
  */
-export async function findBalanceChangingTransaction(targetAccountId, balanceChangeBlock) {
+export async function findBalanceChangingTransaction(
+    targetAccountId: string,
+    balanceChangeBlock: number
+): Promise<TransactionInfo> {
     if (getStopSignal()) {
         throw new Error('Operation cancelled by user');
     }
 
     try {
-        const blockData = await fetchBlockData(balanceChangeBlock);
-        const blockTimestamp = blockData.block?.header?.timestamp;
+        const blockData: RpcBlockResponse = await fetchBlockData(balanceChangeBlock);
+        const blockTimestamp = blockData.header?.timestamp;
 
-        const matchingTxHashes = new Set();
-        const transactions = [];
+        const matchingTxHashes = new Set<string>();
+        const transactions: any[] = [];
 
         // Check all shards for receipt execution outcomes
-        for (const shard of blockData.shards || []) {
-            for (const receiptOutcome of shard.receipt_execution_outcomes || []) {
+        for (const shard of blockData.chunks || []) {
+            for (const receiptOutcome of (shard as any).receipt_execution_outcomes || []) {
                 const receipt = receiptOutcome.receipt;
                 const executionOutcome = receiptOutcome.execution_outcome;
                 const txHash = receiptOutcome.tx_hash;
@@ -426,8 +451,8 @@ export async function findBalanceChangingTransaction(targetAccountId, balanceCha
                 if (affectsTargetAccount && txHash && !matchingTxHashes.has(txHash)) {
                     matchingTxHashes.add(txHash);
 
-                    for (const txShard of blockData.shards || []) {
-                        for (const tx of txShard.chunk?.transactions || []) {
+                    for (const txShard of blockData.chunks || []) {
+                        for (const tx of (txShard as any).transactions || []) {
                             if (tx.hash === txHash) {
                                 transactions.push(tx);
                                 break;
@@ -439,15 +464,15 @@ export async function findBalanceChangingTransaction(targetAccountId, balanceCha
         }
 
         if (transactions.length > 0 || matchingTxHashes.size > 0) {
-            const fetchedTransactions = [];
+            const fetchedTransactions: any[] = [];
 
-            for (const shard of blockData.shards || []) {
-                for (const receiptOutcome of shard.receipt_execution_outcomes || []) {
+            for (const shard of blockData.chunks || []) {
+                for (const receiptOutcome of (shard as any).receipt_execution_outcomes || []) {
                     const txHash = receiptOutcome.tx_hash;
                     const receipt = receiptOutcome.receipt;
 
-                    if (matchingTxHashes.has(txHash) && receipt.receipt?.Action?.signer_id) {
-                        const signerId = receipt.receipt.Action.signer_id;
+                    if (matchingTxHashes.has(txHash) && receipt.Action?.signer_id) {
+                        const signerId = receipt.Action.signer_id;
 
                         try {
                             const txResult = await getTransactionStatusWithReceipts(txHash, signerId);
@@ -461,7 +486,7 @@ export async function findBalanceChangingTransaction(targetAccountId, balanceCha
                                     actions: txInfo.actions || []
                                 });
                             }
-                        } catch (error) {
+                        } catch (error: any) {
                             console.error(`Error fetching transaction ${txHash}:`, error.message);
                         }
                     }
@@ -473,10 +498,10 @@ export async function findBalanceChangingTransaction(targetAccountId, balanceCha
                 transactionHashes: Array.from(matchingTxHashes),
                 transactionBlock: balanceChangeBlock,
                 receiptBlock: balanceChangeBlock,
-                blockTimestamp: blockTimestamp
+                blockTimestamp: blockTimestamp || null
             };
         }
-    } catch (error) {
+    } catch (error: any) {
         console.error(`Error fetching block data:`, error.message);
     }
 
@@ -491,12 +516,12 @@ export async function findBalanceChangingTransaction(targetAccountId, balanceCha
 
 /**
  * Find latest balance change with expanding search if needed
- * @param {string} accountId - Account ID
- * @param {number} startBlock - Start of search range
- * @param {number} endBlock - End of search range
- * @returns {Promise<Object>} Balance change info
  */
-export async function findLatestBalanceChangeWithExpansion(accountId, startBlock, endBlock) {
+export async function findLatestBalanceChangeWithExpansion(
+    accountId: string,
+    startBlock: number,
+    endBlock: number
+): Promise<BalanceChanges & { searchStart?: number }> {
     if (getStopSignal()) {
         throw new Error('Operation cancelled by user');
     }
@@ -504,8 +529,7 @@ export async function findLatestBalanceChangeWithExpansion(accountId, startBlock
     const change = await findLatestBalanceChangingBlock(accountId, startBlock, endBlock);
 
     if (change.hasChanges) {
-        change.searchStart = startBlock;
-        return change;
+        return { ...change, searchStart: startBlock };
     }
 
     let currentStart = startBlock;
@@ -527,8 +551,7 @@ export async function findLatestBalanceChangeWithExpansion(accountId, startBlock
         const expandedChange = await findLatestBalanceChangingBlock(accountId, currentStart, currentEnd);
 
         if (expandedChange.hasChanges) {
-            expandedChange.searchStart = currentStart;
-            return expandedChange;
+            return { ...expandedChange, searchStart: currentStart };
         }
 
         expansionCount++;
@@ -537,19 +560,20 @@ export async function findLatestBalanceChangeWithExpansion(accountId, startBlock
 
     return {
         hasChanges: false,
-        block: startBlock
+        block: startBlock,
+        nearChanged: false,
+        tokensChanged: {},
+        intentsChanged: {}
     };
 }
 
 /**
  * Get block height estimate at a specific date
- * @param {Date|string} date - Date to estimate block height for
- * @returns {Promise<number>} Estimated block height
  */
-export async function getBlockHeightAtDate(date) {
+export async function getBlockHeightAtDate(date: Date | string): Promise<number> {
     const targetDate = typeof date === 'string' ? new Date(date) : date;
     const now = new Date();
-    const secondsDiff = Math.floor((now - targetDate) / 1000);
+    const secondsDiff = Math.floor((now.getTime() - targetDate.getTime()) / 1000);
 
     const currentBlock = await getCurrentBlockHeight();
     return Math.max(0, currentBlock - secondsDiff);

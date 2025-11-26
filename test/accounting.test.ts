@@ -7,8 +7,7 @@ import {
     getCurrentBlockHeight,
     viewAccount,
     callViewFunction,
-    setStopSignal,
-    setProvider
+    setStopSignal
 } from '../scripts/rpc.js';
 import {
     getAllBalances,
@@ -16,6 +15,7 @@ import {
     findBalanceChangingTransaction,
     clearBalanceCache
 } from '../scripts/balance-tracker.js';
+import type { BalanceSnapshot } from '../scripts/balance-tracker.js';
 import {
     getAccountHistory,
     verifyHistoryFile
@@ -24,7 +24,7 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Helper to check if RPC is available
-async function isRpcAvailable() {
+async function isRpcAvailable(): Promise<boolean> {
     try {
         await getCurrentBlockHeight();
         return true;
@@ -97,9 +97,15 @@ describe('NEAR Accounting Export', function() {
                 return;
             }
             const accountId = 'this-account-definitely-does-not-exist-12345.near';
-            const account = await viewAccount(accountId, 'final');
             
-            assert.equal(account.amount, '0', 'Non-existent account should have 0 balance');
+            try {
+                const account = await viewAccount(accountId, 'final');
+                // If we get here without error, check if amount is 0
+                assert.equal(account.amount, '0', 'Non-existent account should have 0 balance');
+            } catch (error: any) {
+                // It's also valid for this to throw an error about account not existing
+                assert.ok(error.message.includes('does not exist'), 'Should indicate account does not exist');
+            }
         });
     });
 
@@ -185,18 +191,43 @@ describe('NEAR Accounting Export', function() {
             // Create a mock history file with valid connectivity
             const mockHistory = {
                 accountId: 'test.near',
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
                 transactions: [
                     {
                         block: 100,
+                        timestamp: null,
+                        transactionHashes: [],
+                        transactions: [],
                         balanceBefore: { near: '1000', fungibleTokens: {}, intentsTokens: {} },
-                        balanceAfter: { near: '900', fungibleTokens: {}, intentsTokens: {} }
+                        balanceAfter: { near: '900', fungibleTokens: {}, intentsTokens: {} },
+                        changes: {
+                            nearChanged: true,
+                            nearDiff: '-100',
+                            tokensChanged: {},
+                            intentsChanged: {}
+                        }
                     },
                     {
                         block: 200,
+                        timestamp: null,
+                        transactionHashes: [],
+                        transactions: [],
                         balanceBefore: { near: '900', fungibleTokens: {}, intentsTokens: {} },
-                        balanceAfter: { near: '800', fungibleTokens: {}, intentsTokens: {} }
+                        balanceAfter: { near: '800', fungibleTokens: {}, intentsTokens: {} },
+                        changes: {
+                            nearChanged: true,
+                            nearDiff: '-100',
+                            tokensChanged: {},
+                            intentsChanged: {}
+                        }
                     }
-                ]
+                ],
+                metadata: {
+                    firstBlock: 100,
+                    lastBlock: 200,
+                    totalTransactions: 2
+                }
             };
 
             fs.writeFileSync(testOutputFile, JSON.stringify(mockHistory, null, 2));
@@ -210,19 +241,44 @@ describe('NEAR Accounting Export', function() {
             // Create a mock history file with invalid connectivity
             const mockHistory = {
                 accountId: 'test.near',
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
                 transactions: [
                     {
                         block: 100,
+                        timestamp: null,
+                        transactionHashes: [],
+                        transactions: [],
                         balanceBefore: { near: '1000', fungibleTokens: {}, intentsTokens: {} },
-                        balanceAfter: { near: '900', fungibleTokens: {}, intentsTokens: {} }
+                        balanceAfter: { near: '900', fungibleTokens: {}, intentsTokens: {} },
+                        changes: {
+                            nearChanged: true,
+                            nearDiff: '-100',
+                            tokensChanged: {},
+                            intentsChanged: {}
+                        }
                     },
                     {
                         block: 200,
+                        timestamp: null,
+                        transactionHashes: [],
+                        transactions: [],
                         // Note: balanceBefore should be 900 to match previous balanceAfter
                         balanceBefore: { near: '850', fungibleTokens: {}, intentsTokens: {} },
-                        balanceAfter: { near: '800', fungibleTokens: {}, intentsTokens: {} }
+                        balanceAfter: { near: '800', fungibleTokens: {}, intentsTokens: {} },
+                        changes: {
+                            nearChanged: true,
+                            nearDiff: '-50',
+                            tokensChanged: {},
+                            intentsChanged: {}
+                        }
                     }
-                ]
+                ],
+                metadata: {
+                    firstBlock: 100,
+                    lastBlock: 200,
+                    totalTransactions: 2
+                }
             };
 
             fs.writeFileSync(testOutputFile, JSON.stringify(mockHistory, null, 2));
@@ -253,7 +309,7 @@ describe('NEAR Accounting Export', function() {
                 currentBlock
             );
 
-            if (balanceChange.hasChanges) {
+            if (balanceChange.hasChanges && balanceChange.block) {
                 console.log(`Found balance change at block ${balanceChange.block}`);
                 
                 const txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block);
