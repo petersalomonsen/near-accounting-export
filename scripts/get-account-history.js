@@ -188,6 +188,10 @@ export async function getAccountHistory(options) {
     while (transactionsFound < maxTransactions) {
         if (getStopSignal()) {
             console.log('Stop signal received, saving progress...');
+            // Save immediately before breaking
+            history.updatedAt = new Date().toISOString();
+            saveHistory(outputFile, history);
+            console.log(`Progress saved to ${outputFile}`);
             break;
         }
 
@@ -219,6 +223,10 @@ export async function getAccountHistory(options) {
             if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
                 console.log(`Error during search: ${error.message}`);
                 console.log('Stopping and saving progress...');
+                // Save immediately before breaking
+                history.updatedAt = new Date().toISOString();
+                saveHistory(outputFile, history);
+                console.log(`Progress saved to ${outputFile}`);
                 break;
             }
             throw error;
@@ -256,6 +264,10 @@ export async function getAccountHistory(options) {
             if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
                 console.log(`Error fetching transaction details: ${error.message}`);
                 console.log('Stopping and saving progress...');
+                // Save immediately before breaking
+                history.updatedAt = new Date().toISOString();
+                saveHistory(outputFile, history);
+                console.log(`Progress saved to ${outputFile}`);
                 break;
             }
             throw error;
