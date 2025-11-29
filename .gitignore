@@ -6,6 +6,7 @@ test/test-output.json
 *.json
 !package.json
 !package-lock.json
+!tsconfig*.json
 
 # IDE
 .idea/
@@ -24,6 +25,12 @@ npm-debug.log*
 # Build artifacts
 dist/
 build/
+
+# Test compiled files
+test/**/*.js
+test/**/*.d.ts
+test/**/*.js.map
+test/**/*.d.ts.map
 
 # Environment files
 .env

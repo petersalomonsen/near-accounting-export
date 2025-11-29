@@ -354,21 +354,25 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         // Verify connectivity with adjacent transactions
         if (direction === 'backward' && history.transactions.length > 0) {
             const nextTransaction = history.transactions[0]; // Most recent in list
-            const verification = verifyTransactionConnectivity(nextTransaction, entry);
-            entry.verificationWithNext = verification;
-            
-            if (!verification.valid) {
-                console.warn(`Warning: Connectivity issue detected at block ${balanceChange.block}`);
-                verification.errors.forEach(err => console.warn(`  - ${err.message}`));
+            if (nextTransaction) {
+                const verification = verifyTransactionConnectivity(nextTransaction, entry);
+                entry.verificationWithNext = verification;
+                
+                if (!verification.valid) {
+                    console.warn(`Warning: Connectivity issue detected at block ${balanceChange.block}`);
+                    verification.errors.forEach(err => console.warn(`  - ${err.message}`));
+                }
             }
         } else if (direction === 'forward' && history.transactions.length > 0) {
             const prevTransaction = history.transactions[history.transactions.length - 1];
-            const verification = verifyTransactionConnectivity(entry, prevTransaction);
-            entry.verificationWithPrevious = verification;
-            
-            if (!verification.valid) {
-                console.warn(`Warning: Connectivity issue detected at block ${balanceChange.block}`);
-                verification.errors.forEach(err => console.warn(`  - ${err.message}`));
+            if (prevTransaction) {
+                const verification = verifyTransactionConnectivity(entry, prevTransaction);
+                entry.verificationWithPrevious = verification;
+                
+                if (!verification.valid) {
+                    console.warn(`Warning: Connectivity issue detected at block ${balanceChange.block}`);
+                    verification.errors.forEach(err => console.warn(`  - ${err.message}`));
+                }
             }
         }
 
@@ -438,17 +442,19 @@ export function verifyHistoryFile(filePath: string): VerificationResults {
         const prevTx = sortedTransactions[i - 1];
         const currTx = sortedTransactions[i];
 
-        const verification = verifyTransactionConnectivity(currTx, prevTx);
-        results.verifiedCount++;
+        if (prevTx && currTx) {
+            const verification = verifyTransactionConnectivity(currTx, prevTx);
+            results.verifiedCount++;
 
-        if (!verification.valid) {
-            results.valid = false;
-            results.errorCount++;
-            results.errors.push({
-                previousBlock: prevTx.block,
-                currentBlock: currTx.block,
-                errors: verification.errors
-            });
+            if (!verification.valid) {
+                results.valid = false;
+                results.errorCount++;
+                results.errors.push({
+                    previousBlock: prevTx.block,
+                    currentBlock: currTx.block,
+                    errors: verification.errors
+                });
+            }
         }
     }
 
@@ -477,25 +483,25 @@ function parseArgs(): ParsedArgs {
         switch (arg) {
             case '--account':
             case '-a':
-                options.accountId = args[++i];
+                if (args[i + 1]) options.accountId = args[++i] ?? null;
                 break;
             case '--output':
             case '-o':
-                options.outputFile = args[++i];
+                if (args[i + 1]) options.outputFile = args[++i] ?? null;
                 break;
             case '--direction':
             case '-d':
-                options.direction = args[++i] as 'forward' | 'backward';
+                if (args[i + 1]) options.direction = args[++i] as 'forward' | 'backward';
                 break;
             case '--max':
             case '-m':
-                options.maxTransactions = parseInt(args[++i], 10);
+                if (args[i + 1]) options.maxTransactions = parseInt(args[++i]!, 10);
                 break;
             case '--start-block':
-                options.startBlock = parseInt(args[++i], 10);
+                if (args[i + 1]) options.startBlock = parseInt(args[++i]!, 10);
                 break;
             case '--end-block':
-                options.endBlock = parseInt(args[++i], 10);
+                if (args[i + 1]) options.endBlock = parseInt(args[++i]!, 10);
                 break;
             case '--verify':
             case '-v':
@@ -507,8 +513,8 @@ function parseArgs(): ParsedArgs {
                 break;
             default:
                 // If not a flag, treat as account ID
-                if (!arg.startsWith('-') && !options.accountId) {
-                    options.accountId = arg;
+                if (arg && !arg.startsWith('-') && !options.accountId) {
+                    options.accountId = arg ?? null;
                 }
         }
     }
