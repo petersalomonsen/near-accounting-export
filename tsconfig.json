@@ -1,0 +1,36 @@
+{
+  // Visit https://aka.ms/tsconfig to read more about this file
+  "compilerOptions": {
+    // File Layout
+    "outDir": "dist",
+
+    // Environment Settings
+    // See also https://aka.ms/tsconfig/module
+    "module": "esnext",
+    "target": "es2022",
+    "types": ["node", "mocha"],
+    "lib": ["es2022"],
+
+    // Other Outputs
+    "sourceMap": true,
+    "declaration": true,
+    "declarationMap": true,
+
+    // Stricter Typechecking Options
+    "noUncheckedIndexedAccess": true,
+
+    // Recommended Options
+    "strict": true,
+    "jsx": "react-jsx",
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "noUncheckedSideEffectImports": true,
+    "moduleDetection": "force",
+    "skipLibCheck": true,
+
+    "moduleResolution": "node10",
+    "esModuleInterop": true,
+    "resolveJsonModule": true
+  },
+  "include": ["scripts/**/*", "test/**/*"]
+}

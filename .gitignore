@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Test output
+test/test-output.json
+*.json
+!package.json
+!package-lock.json
+!tsconfig*.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build artifacts
+dist/
+build/
+
+# Test compiled files
+test/**/*.js
+test/**/*.d.ts
+test/**/*.js.map
+test/**/*.d.ts.map
+
+# Environment files
+.env
+.env.local
+.env.*.local
