@@ -7,11 +7,12 @@ This project is written in **TypeScript** and uses the official **@near-js/jsonr
 ## Features
 
 - **Binary Search Discovery**: Efficiently finds balance-changing transactions using binary search instead of scanning every block
+- **Gap Detection & Filling**: Automatically detects and fills gaps in transaction history where balance connectivity is broken
 - **Multiple Asset Types**: Tracks NEAR balance, fungible tokens (USDC, wNEAR, USDT, etc.), and NEAR Intents tokens
 - **Resumable**: Save progress to file and continue from where you left off
 - **Bidirectional**: Search forward or backward in time
 - **Verification**: Verify transaction connectivity by checking that balance changes match between adjacent transactions
-- **Docker Ready**: Designed to run in Docker containers for scheduled jobs
+- **Docker Ready**: Designed to run in Docker containers with persistent volumes for scheduled jobs
 - **Type Safe**: Fully typed with TypeScript for better development experience
 
 ## Installation
@@ -61,14 +62,40 @@ Build the image:
 docker build -t near-accounting-export .
 ```
 
-Run the container:
+Run the container with a persistent volume:
 
 ```bash
+# Create a local data directory
+mkdir -p ./data
+
+# Run with volume mounted to persist data
 docker run -v $(pwd)/data:/data near-accounting-export \
   --account myaccount.near \
   --output /data/myaccount.json \
   --max 50
+
+# Run again to continue from where you left off
+docker run -v $(pwd)/data:/data near-accounting-export \
+  --account myaccount.near \
+  --output /data/myaccount.json \
+  --max 50
+
+# Fill gaps in existing history
+docker run -v $(pwd)/data:/data near-accounting-export \
+  --fill-gaps-only \
+  --output /data/myaccount.json
 ```
+
+**Important**: Always use the `-v` flag to mount a volume. This persists your data outside the container so:
+- You can access the JSON file when the container is not running
+- You can continue adding more transactions in subsequent runs
+- Your data survives container restarts and deletions
+
+The script automatically:
+- Loads existing history from the output file
+- Detects and fills gaps where balance connectivity is broken
+- Continues searching from where it left off
+- Saves progress continuously (every 5 transactions)
 
 ## Options
 
@@ -81,6 +108,7 @@ docker run -v $(pwd)/data:/data near-accounting-export \
 | `--start-block <number>` | Starting block height | Auto-determined |
 | `--end-block <number>` | Ending block height | Current block |
 | `-v, --verify` | Verify an existing history file | `false` |
+| `--fill-gaps-only` | Only fill gaps, don't search for new transactions | `false` |
 | `-h, --help` | Show help message | |
 
 ## Environment Variables

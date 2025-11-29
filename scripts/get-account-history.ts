@@ -76,6 +76,7 @@ interface ParsedArgs {
     startBlock: number | null;
     endBlock: number | null;
     verify: boolean;
+    fillGapsOnly: boolean;
     help: boolean;
 }
 
@@ -192,6 +193,169 @@ function verifyTransactionConnectivity(
 }
 
 /**
+ * Detect gaps in transaction history where balance connectivity is broken
+ */
+function detectGaps(history: AccountHistory): Array<{ prevBlock: number; nextBlock: number; prevTx: TransactionEntry; nextTx: TransactionEntry }> {
+    const gaps: Array<{ prevBlock: number; nextBlock: number; prevTx: TransactionEntry; nextTx: TransactionEntry }> = [];
+    
+    if (history.transactions.length < 2) {
+        return gaps;
+    }
+    
+    // Sort transactions by block
+    const sortedTransactions = [...history.transactions].sort((a, b) => a.block - b.block);
+    
+    for (let i = 1; i < sortedTransactions.length; i++) {
+        const prevTx = sortedTransactions[i - 1];
+        const currTx = sortedTransactions[i];
+        
+        if (prevTx && currTx) {
+            const verification = verifyTransactionConnectivity(currTx, prevTx);
+            
+            if (!verification.valid) {
+                gaps.push({
+                    prevBlock: prevTx.block,
+                    nextBlock: currTx.block,
+                    prevTx,
+                    nextTx: currTx
+                });
+            }
+        }
+    }
+    
+    return gaps;
+}
+
+/**
+ * Fill gaps in transaction history
+ */
+async function fillGaps(
+    history: AccountHistory,
+    outputFile: string,
+    maxTransactionsToFill: number = 50
+): Promise<number> {
+    const gaps = detectGaps(history);
+    
+    if (gaps.length === 0) {
+        console.log('No gaps detected in transaction history');
+        return 0;
+    }
+    
+    console.log(`\n=== Detected ${gaps.length} gap(s) in transaction history ===`);
+    let totalFilled = 0;
+    
+    for (const gap of gaps) {
+        if (getStopSignal() || totalFilled >= maxTransactionsToFill) {
+            break;
+        }
+        
+        console.log(`\nFilling gap between blocks ${gap.prevBlock} and ${gap.nextBlock}...`);
+        
+        const searchStart = gap.prevBlock + 1;
+        const searchEnd = gap.nextBlock - 1;
+        
+        if (searchStart > searchEnd) {
+            console.log('Gap is adjacent blocks, no intermediate transactions');
+            continue;
+        }
+        
+        let currentStart = searchStart;
+        let currentEnd = searchEnd;
+        let foundInGap = 0;
+        
+        while (currentStart <= currentEnd && foundInGap < maxTransactionsToFill - totalFilled) {
+            if (getStopSignal()) {
+                break;
+            }
+            
+            console.log(`Searching in range ${currentStart} - ${currentEnd}...`);
+            
+            let balanceChange: BalanceChanges;
+            try {
+                balanceChange = await findLatestBalanceChangingBlock(
+                    history.accountId,
+                    currentStart,
+                    currentEnd
+                );
+            } catch (error: any) {
+                if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                    console.log(`Error during gap fill: ${error.message}`);
+                    break;
+                }
+                throw error;
+            }
+            
+            if (!balanceChange.hasChanges) {
+                console.log('No balance changes found in gap range');
+                break;
+            }
+            
+            if (!balanceChange.block) {
+                console.log('Balance change has no block number');
+                break;
+            }
+            
+            // Find the transaction that caused the change
+            const txInfo = await findBalanceChangingTransaction(history.accountId, balanceChange.block);
+            
+            if (!txInfo) {
+                console.log(`Could not find transaction at block ${balanceChange.block}`);
+                currentEnd = balanceChange.block - 1;
+                continue;
+            }
+            
+            // Create transaction entry
+            const entry: TransactionEntry = {
+                block: balanceChange.block,
+                timestamp: txInfo.blockTimestamp,
+                transactionHashes: txInfo.transactionHashes,
+                transactions: txInfo.transactions,
+                balanceBefore: balanceChange.startBalance,
+                balanceAfter: balanceChange.endBalance,
+                changes: {
+                    nearChanged: balanceChange.nearChanged,
+                    nearDiff: balanceChange.nearDiff,
+                    tokensChanged: balanceChange.tokensChanged,
+                    intentsChanged: balanceChange.intentsChanged
+                }
+            };
+            
+            // Add to history
+            history.transactions.push(entry);
+            foundInGap++;
+            totalFilled++;
+            
+            console.log(`Gap transaction ${foundInGap} added at block ${balanceChange.block}`);
+            
+            // Update metadata
+            if (!history.metadata.firstBlock || balanceChange.block < history.metadata.firstBlock) {
+                history.metadata.firstBlock = balanceChange.block;
+            }
+            if (!history.metadata.lastBlock || balanceChange.block > history.metadata.lastBlock) {
+                history.metadata.lastBlock = balanceChange.block;
+            }
+            history.metadata.totalTransactions = history.transactions.length;
+            
+            // Save progress
+            if (foundInGap % 5 === 0) {
+                history.updatedAt = new Date().toISOString();
+                saveHistory(outputFile, history);
+            }
+            
+            // Search for more in the remaining range
+            currentEnd = balanceChange.block - 1;
+        }
+        
+        // Save after filling each gap
+        history.updatedAt = new Date().toISOString();
+        saveHistory(outputFile, history);
+        console.log(`Filled ${foundInGap} transaction(s) in this gap`);
+    }
+    
+    return totalFilled;
+}
+
+/**
  * Get accounting history for an account
  */
 export async function getAccountHistory(options: GetAccountHistoryOptions): Promise<AccountHistory> {
@@ -199,10 +363,11 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         accountId,
         outputFile,
         direction = 'backward',
-        maxTransactions = 100,
         startBlock,
         endBlock
     } = options;
+    
+    let maxTransactions = options.maxTransactions || 100;
 
     console.log(`\n=== Getting accounting history for ${accountId} ===`);
     console.log(`Direction: ${direction}`);
@@ -223,6 +388,21 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                 totalTransactions: 0
             }
         };
+    }
+
+    // Check for and fill any gaps in existing history
+    if (history.transactions.length > 0) {
+        console.log(`\nLoaded ${history.transactions.length} existing transaction(s)`);
+        const gapsFilled = await fillGaps(history, outputFile, Math.min(50, maxTransactions));
+        if (gapsFilled > 0) {
+            console.log(`\nFilled ${gapsFilled} transaction(s) in gaps`);
+            // Reduce max transactions by the number we just filled
+            maxTransactions = Math.max(0, maxTransactions - gapsFilled);
+            if (maxTransactions === 0) {
+                console.log('Reached max transactions limit while filling gaps');
+                return history;
+            }
+        }
     }
 
     // Get current block height
@@ -474,6 +654,7 @@ function parseArgs(): ParsedArgs {
         startBlock: null,
         endBlock: null,
         verify: false,
+        fillGapsOnly: false,
         help: false
     };
 
@@ -506,6 +687,10 @@ function parseArgs(): ParsedArgs {
             case '--verify':
             case '-v':
                 options.verify = true;
+                break;
+            case '--fill-gaps':
+            case '--fill-gaps-only':
+                options.fillGapsOnly = true;
                 break;
             case '--help':
             case '-h':
@@ -540,6 +725,7 @@ Options:
   --start-block <number>  Starting block height
   --end-block <number>    Ending block height
   -v, --verify            Verify an existing history file
+  --fill-gaps-only        Only fill gaps in existing history, don't search for new transactions
   -h, --help              Show this help message
 
 Environment Variables:
@@ -547,17 +733,21 @@ Environment Variables:
   RPC_DELAY_MS            Delay between RPC calls in ms (default: 50)
 
 Behavior:
-  The script continuously searches for balance changes in adjacent ranges. When no 
-  changes are found in the current range, it automatically moves to the next adjacent 
-  range of equal size. It continues until interrupted (Ctrl+C), rate limited, max 
-  transactions reached, or endpoint becomes unresponsive. Progress is saved continuously.
+  The script automatically detects and fills gaps in existing transaction history where
+  balance connectivity is broken. After filling gaps, it continues searching for new
+  balance changes in adjacent ranges. When no changes are found, it moves to the next
+  adjacent range of equal size. It continues until interrupted (Ctrl+C), rate limited,
+  max transactions reached, or endpoint becomes unresponsive. Progress is saved continuously.
 
 Examples:
   # Fetch last 50 transactions for an account
   node get-account-history.js --account myaccount.near --max 50
 
-  # Continue fetching backward from existing file
+  # Continue fetching backward from existing file (fills gaps automatically)
   node get-account-history.js --account myaccount.near --output ./history.json
+
+  # Only fill gaps in existing history without searching for new transactions
+  node get-account-history.js --fill-gaps-only --output ./history.json
 
   # Fetch forward from a specific block
   node get-account-history.js -a myaccount.near --direction forward --start-block 100000000
@@ -594,6 +784,37 @@ async function main(): Promise<void> {
         } else {
             console.log('\nAll transactions verified successfully!');
             process.exit(0);
+        }
+    }
+
+    if (options.fillGapsOnly && options.outputFile) {
+        console.log(`Filling gaps in history file: ${options.outputFile}`);
+        
+        const history = loadExistingHistory(options.outputFile);
+        if (!history) {
+            console.error('Error: No existing history file found');
+            process.exit(1);
+        }
+        
+        // Handle graceful shutdown
+        process.on('SIGINT', () => {
+            console.log('\nReceived SIGINT, stopping gracefully...');
+            setStopSignal(true);
+        });
+
+        process.on('SIGTERM', () => {
+            console.log('\nReceived SIGTERM, stopping gracefully...');
+            setStopSignal(true);
+        });
+        
+        try {
+            const filled = await fillGaps(history, options.outputFile, options.maxTransactions);
+            console.log(`\n=== Gap filling complete ===`);
+            console.log(`Total gaps filled: ${filled}`);
+            process.exit(0);
+        } catch (error: any) {
+            console.error('Error:', error.message);
+            process.exit(1);
         }
     }
 
