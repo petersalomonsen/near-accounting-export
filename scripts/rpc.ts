@@ -126,7 +126,18 @@ export async function getCurrentBlockHeight(): Promise<number> {
 }
 
 /**
+ * Check if an error is an unknown block error
+ */
+function isUnknownBlockError(error: any): boolean {
+    const errorStr = error.message || '';
+    return errorStr.includes('UNKNOWN_BLOCK') || 
+           errorStr.includes('DB Not Found Error: BLOCK HEIGHT') ||
+           (errorStr.includes('Server error') && error.data?.includes?.('BLOCK HEIGHT'));
+}
+
+/**
  * View account state at a specific block
+ * Retries with adjacent blocks if the block is not found (skipped block)
  */
 export async function viewAccount(
     accountId: string,
@@ -136,18 +147,56 @@ export async function viewAccount(
         throw new Error('Operation cancelled by user');
     }
 
-    return wrapRpcCall(() => 
-        query(getClient(), {
-            requestType: 'view_account',
-            accountId,
-            blockId: typeof blockId === 'string' ? blockId : blockId,
-            finality: typeof blockId === 'string' && blockId === 'final' ? 'final' : undefined
-        }) as Promise<AccountView>
-    );
+    // For numeric block IDs, retry with adjacent blocks if not found
+    if (typeof blockId === 'number') {
+        let currentBlock = blockId;
+        let lastError: any = null;
+
+        for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+                return await wrapRpcCall(() => 
+                    query(getClient(), {
+                        requestType: 'view_account',
+                        accountId,
+                        blockId: currentBlock,
+                        finality: undefined
+                    }) as Promise<AccountView>
+                );
+            } catch (error: any) {
+                lastError = error;
+                if (isUnknownBlockError(error)) {
+                    console.warn(`Block ${currentBlock} not found, trying block ${currentBlock - 1}`);
+                    currentBlock--;
+                } else {
+                    console.error(`RPC error in viewAccount for ${accountId} at block ${blockId}:`, error.message);
+                    throw error;
+                }
+            }
+        }
+
+        console.error(`RPC error in viewAccount for ${accountId} at block ${blockId}: Could not find valid block after 5 attempts`);
+        throw lastError || new Error(`Could not find valid block near ${blockId}`);
+    }
+
+    // For string block IDs (like 'final'), just do a single attempt
+    try {
+        return await wrapRpcCall(() => 
+            query(getClient(), {
+                requestType: 'view_account',
+                accountId,
+                blockId: blockId,
+                finality: blockId === 'final' ? 'final' : undefined
+            }) as Promise<AccountView>
+        );
+    } catch (error: any) {
+        console.error(`RPC error in viewAccount for ${accountId} at block ${blockId}:`, error.message);
+        throw error;
+    }
 }
 
 /**
  * Call a view function on a contract
+ * Retries with adjacent blocks if the block is not found (skipped block)
  */
 export async function callViewFunction(
     contractId: string,
@@ -160,22 +209,66 @@ export async function callViewFunction(
     }
 
     const argsBase64 = Buffer.from(JSON.stringify(args)).toString('base64');
-    
-    const result = await wrapRpcCall(() =>
-        query(getClient(), {
-            requestType: 'call_function',
-            accountId: contractId,
-            methodName,
-            argsBase64,
-            blockId: typeof blockId === 'string' ? blockId : blockId,
-            finality: typeof blockId === 'string' && blockId === 'final' ? 'final' : undefined
-        }) as Promise<CallResult>
-    );
 
-    // Decode the result from base64/bytes
-    const bytes = new Uint8Array(result.result);
-    const text = new TextDecoder().decode(bytes);
-    return JSON.parse(text);
+    // For numeric block IDs, retry with adjacent blocks if not found
+    if (typeof blockId === 'number') {
+        let currentBlock = blockId;
+        let lastError: any = null;
+
+        for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+                const result = await wrapRpcCall(() =>
+                    query(getClient(), {
+                        requestType: 'call_function',
+                        accountId: contractId,
+                        methodName,
+                        argsBase64,
+                        blockId: currentBlock,
+                        finality: undefined
+                    }) as Promise<CallResult>
+                );
+
+                // Decode the result from base64/bytes
+                const bytes = new Uint8Array(result.result);
+                const text = new TextDecoder().decode(bytes);
+                return JSON.parse(text);
+            } catch (error: any) {
+                lastError = error;
+                if (isUnknownBlockError(error)) {
+                    console.warn(`Block ${currentBlock} not found for ${contractId}.${methodName}, trying block ${currentBlock - 1}`);
+                    currentBlock--;
+                } else {
+                    console.error(`RPC error in callViewFunction for ${contractId}.${methodName} at block ${blockId}:`, error.message);
+                    throw error;
+                }
+            }
+        }
+
+        console.error(`RPC error in callViewFunction for ${contractId}.${methodName} at block ${blockId}: Could not find valid block after 5 attempts`);
+        throw lastError || new Error(`Could not find valid block near ${blockId}`);
+    }
+
+    // For string block IDs (like 'final'), just do a single attempt
+    try {
+        const result = await wrapRpcCall(() =>
+            query(getClient(), {
+                requestType: 'call_function',
+                accountId: contractId,
+                methodName,
+                argsBase64,
+                blockId: blockId,
+                finality: blockId === 'final' ? 'final' : undefined
+            }) as Promise<CallResult>
+        );
+
+        // Decode the result from base64/bytes
+        const bytes = new Uint8Array(result.result);
+        const text = new TextDecoder().decode(bytes);
+        return JSON.parse(text);
+    } catch (error: any) {
+        console.error(`RPC error in callViewFunction for ${contractId}.${methodName} at block ${blockId}:`, error.message);
+        throw error;
+    }
 }
 
 /**
@@ -186,19 +279,19 @@ export async function fetchBlockData(blockHeight: number): Promise<RpcBlockRespo
         throw new Error('Operation cancelled by user');
     }
 
-    // Try to fetch the block, if it fails with server error, retry with previous block
+    // Try to fetch the block, if it fails with server error or unknown block, retry with previous block
     let currentBlock = blockHeight;
     let lastError: any = null;
 
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 5; attempt++) {
         try {
             return await wrapRpcCall(() =>
                 getBlock(getClient(), { blockId: currentBlock })
             );
         } catch (error: any) {
             lastError = error;
-            if (error.message?.includes('500') || error.message?.includes('Server error')) {
-                console.warn(`Server error at block ${currentBlock}, retrying with block ${currentBlock - 1}`);
+            if (isUnknownBlockError(error) || error.message?.includes('500') || error.message?.includes('Server error')) {
+                console.warn(`Block ${currentBlock} not found or server error, retrying with block ${currentBlock - 1}`);
                 currentBlock--;
             } else {
                 throw error;
@@ -206,7 +299,7 @@ export async function fetchBlockData(blockHeight: number): Promise<RpcBlockRespo
         }
     }
 
-    throw lastError || new Error(`Failed to fetch block data after 3 attempts`);
+    throw lastError || new Error(`Failed to fetch block data after 5 attempts`);
 }
 
 /**
