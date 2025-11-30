@@ -243,6 +243,32 @@ export async function getAllBalances(
 }
 
 /**
+ * Get balance changes at a specific block by comparing block-1 to block
+ * This is more efficient than binary search when we already know the block
+ */
+export async function getBalanceChangesAtBlock(
+    accountId: string,
+    blockHeight: number,
+    tokenContracts: string[] | null | undefined = undefined,
+    intentsTokens: string[] | null | undefined = undefined
+): Promise<BalanceChanges> {
+    if (getStopSignal()) {
+        throw new Error('Operation cancelled by user');
+    }
+
+    // Get balances before and after the block
+    const balanceBefore = await getAllBalances(accountId, blockHeight - 1, tokenContracts, intentsTokens, true);
+    const balanceAfter = await getAllBalances(accountId, blockHeight, tokenContracts, intentsTokens, true);
+
+    const changes = detectBalanceChanges(balanceBefore, balanceAfter);
+    changes.block = blockHeight;
+    changes.startBalance = balanceBefore;
+    changes.endBalance = balanceAfter;
+
+    return changes;
+}
+
+/**
  * Detect balance changes between two snapshots
  */
 function detectBalanceChanges(

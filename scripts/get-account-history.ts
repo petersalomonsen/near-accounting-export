@@ -12,9 +12,15 @@ import {
 import {
     findLatestBalanceChangingBlock,
     findBalanceChangingTransaction,
-    clearBalanceCache
+    clearBalanceCache,
+    getBalanceChangesAtBlock
 } from './balance-tracker.js';
+import {
+    getAllTransactionBlocks,
+    isNearBlocksAvailable
+} from './nearblocks-api.js';
 import type { BalanceSnapshot, BalanceChanges, TransactionInfo } from './balance-tracker.js';
+import type { TransactionBlock } from './nearblocks-api.js';
 
 // Types
 interface VerificationError {
@@ -423,9 +429,169 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
     console.log(`Search range: ${searchStart} - ${searchEnd}`);
 
     let transactionsFound = 0;
-    let currentSearchEnd = searchEnd;
-    let currentSearchStart = searchStart;
-    const rangeSize = searchEnd - searchStart;
+    
+    // Try using NearBlocks API first for faster transaction discovery
+    if (isNearBlocksAvailable()) {
+        console.log(`\nUsing NearBlocks API for faster transaction discovery...`);
+        
+        try {
+            // Get known transaction blocks from NearBlocks
+            const knownBlocks = await getAllTransactionBlocks(accountId, {
+                afterBlock: searchStart,
+                beforeBlock: searchEnd,
+                maxPages: Math.ceil(maxTransactions / 25) + 2
+            });
+            
+            // Filter to blocks we haven't processed yet
+            const existingBlocks = new Set(history.transactions.map(t => t.block));
+            const newBlocks = knownBlocks.filter(b => !existingBlocks.has(b.blockHeight));
+            
+            // Sort by block height based on direction
+            if (direction === 'backward') {
+                newBlocks.sort((a, b) => b.blockHeight - a.blockHeight);
+            } else {
+                newBlocks.sort((a, b) => a.blockHeight - b.blockHeight);
+            }
+            
+            console.log(`Found ${newBlocks.length} new transaction blocks to process`);
+            
+            // Process each known transaction block
+            for (const txBlock of newBlocks) {
+                if (getStopSignal()) {
+                    console.log('Stop signal received, saving progress...');
+                    history.updatedAt = new Date().toISOString();
+                    saveHistory(outputFile, history);
+                    console.log(`Progress saved to ${outputFile}`);
+                    break;
+                }
+                
+                if (transactionsFound >= maxTransactions) {
+                    break;
+                }
+                
+                // Clear cache periodically to avoid memory issues
+                if (transactionsFound % 10 === 0) {
+                    clearBalanceCache();
+                }
+                
+                try {
+                    // Get balance changes at this specific block
+                    const balanceChange = await getBalanceChangesAtBlock(accountId, txBlock.blockHeight);
+                    
+                    if (!balanceChange.hasChanges) {
+                        // This can happen for FT transactions where we're not tracking that token
+                        continue;
+                    }
+                    
+                    // Find the transaction details
+                    const txInfo = await findBalanceChangingTransaction(accountId, txBlock.blockHeight);
+                    
+                    // Create transaction entry
+                    const entry: TransactionEntry = {
+                        block: txBlock.blockHeight,
+                        timestamp: txInfo.blockTimestamp,
+                        transactionHashes: txInfo.transactionHashes,
+                        transactions: txInfo.transactions,
+                        balanceBefore: balanceChange.startBalance,
+                        balanceAfter: balanceChange.endBalance,
+                        changes: {
+                            nearChanged: balanceChange.nearChanged,
+                            nearDiff: balanceChange.nearDiff,
+                            tokensChanged: balanceChange.tokensChanged,
+                            intentsChanged: balanceChange.intentsChanged
+                        }
+                    };
+                    
+                    // Verify connectivity with adjacent transactions
+                    if (direction === 'backward' && history.transactions.length > 0) {
+                        const nextTransaction = history.transactions[0];
+                        if (nextTransaction) {
+                            const verification = verifyTransactionConnectivity(nextTransaction, entry);
+                            entry.verificationWithNext = verification;
+                            
+                            if (!verification.valid) {
+                                console.warn(`Warning: Connectivity issue detected at block ${txBlock.blockHeight}`);
+                                verification.errors.forEach(err => console.warn(`  - ${err.message}`));
+                            }
+                        }
+                    } else if (direction === 'forward' && history.transactions.length > 0) {
+                        const prevTransaction = history.transactions[history.transactions.length - 1];
+                        if (prevTransaction) {
+                            const verification = verifyTransactionConnectivity(entry, prevTransaction);
+                            entry.verificationWithPrevious = verification;
+                            
+                            if (!verification.valid) {
+                                console.warn(`Warning: Connectivity issue detected at block ${txBlock.blockHeight}`);
+                                verification.errors.forEach(err => console.warn(`  - ${err.message}`));
+                            }
+                        }
+                    }
+                    
+                    // Add to history in correct order
+                    if (direction === 'backward') {
+                        history.transactions.unshift(entry);
+                    } else {
+                        history.transactions.push(entry);
+                    }
+                    
+                    transactionsFound++;
+                    console.log(`Transaction ${transactionsFound}/${maxTransactions} added at block ${txBlock.blockHeight}`);
+                    
+                    // Update metadata
+                    const allBlocks = history.transactions.map(t => t.block);
+                    history.metadata.firstBlock = Math.min(...allBlocks);
+                    history.metadata.lastBlock = Math.max(...allBlocks);
+                    history.metadata.totalTransactions = history.transactions.length;
+                    history.updatedAt = new Date().toISOString();
+                    
+                    // Save progress periodically
+                    if (transactionsFound % 5 === 0) {
+                        saveHistory(outputFile, history);
+                        console.log(`Progress saved to ${outputFile}`);
+                    }
+                } catch (error: any) {
+                    if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                        console.log(`Error during NearBlocks processing: ${error.message}`);
+                        console.log('Stopping and saving progress...');
+                        history.updatedAt = new Date().toISOString();
+                        saveHistory(outputFile, history);
+                        console.log(`Progress saved to ${outputFile}`);
+                        break;
+                    }
+                    console.warn(`Error processing block ${txBlock.blockHeight}: ${error.message}`);
+                    // Continue with next block
+                }
+            }
+            
+            // Final save after NearBlocks processing
+            if (transactionsFound > 0) {
+                saveHistory(outputFile, history);
+                console.log(`\nNearBlocks API processing complete. Found ${transactionsFound} transactions.`);
+            }
+            
+            // If we found enough transactions, we're done
+            if (transactionsFound >= maxTransactions) {
+                saveHistory(outputFile, history);
+                console.log(`\n=== Export complete ===`);
+                console.log(`Total transactions: ${history.metadata.totalTransactions}`);
+                console.log(`Block range: ${history.metadata.firstBlock} - ${history.metadata.lastBlock}`);
+                console.log(`Output saved to: ${outputFile}`);
+                return history;
+            }
+        } catch (error: any) {
+            console.warn(`NearBlocks API error: ${error.message}`);
+            console.log('Falling back to binary search...');
+        }
+    }
+    
+    // Fall back to binary search for remaining transactions or if NearBlocks is not available
+    const remainingTransactions = maxTransactions - transactionsFound;
+    if (remainingTransactions > 0 && !getStopSignal()) {
+        console.log(`\nUsing binary search to find ${remainingTransactions} more transactions...`);
+        
+        let currentSearchEnd = searchEnd;
+        let currentSearchStart = searchStart;
+        const rangeSize = searchEnd - searchStart;
 
     while (transactionsFound < maxTransactions) {
         if (getStopSignal()) {
@@ -586,6 +752,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             console.log(`Progress saved to ${outputFile}`);
         }
     }
+    } // End of binary search fallback block
 
     // Final save
     saveHistory(outputFile, history);
