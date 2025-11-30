@@ -116,6 +116,7 @@ The script automatically:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `NEAR_RPC_ENDPOINT` | RPC endpoint URL | `https://archival-rpc.mainnet.fastnear.com` |
+| `FASTNEAR_API_KEY` | FastNEAR API key for higher rate limits | None |
 | `RPC_DELAY_MS` | Delay between RPC calls in ms | `50` |
 
 ## Output Format

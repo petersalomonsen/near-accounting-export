@@ -10,6 +10,18 @@ import type {
 const DEFAULT_RPC_ENDPOINT = 'https://archival-rpc.mainnet.fastnear.com';
 const RPC_DELAY_MS = parseInt(process.env.RPC_DELAY_MS || '50', 10);
 
+/**
+ * Get headers for RPC requests, including Authorization if API key is set
+ */
+function getRpcHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {};
+    const apiKey = process.env.FASTNEAR_API_KEY;
+    if (apiKey) {
+        headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+    return headers;
+}
+
 // Stop signal for graceful cancellation
 let stopSignal = false;
 
@@ -33,7 +45,8 @@ let client: NearRpcClient | null = null;
 export function getClient(): NearRpcClient {
     if (!client) {
         const endpoint = process.env.NEAR_RPC_ENDPOINT || DEFAULT_RPC_ENDPOINT;
-        client = new NearRpcClient({ endpoint });
+        const headers = getRpcHeaders();
+        client = new NearRpcClient({ endpoint, headers });
     }
     return client;
 }
@@ -208,12 +221,16 @@ export async function getTransactionStatusWithReceipts(
     }
 
     const endpoint = process.env.NEAR_RPC_ENDPOINT || DEFAULT_RPC_ENDPOINT;
+    const headers: Record<string, string> = { 
+        'Content-Type': 'application/json',
+        ...getRpcHeaders()
+    };
     
     return wrapRpcCall(async () => {
         await delay(RPC_DELAY_MS);
         const response = await fetch(endpoint, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers,
             body: JSON.stringify({
                 jsonrpc: '2.0',
                 id: '1',
