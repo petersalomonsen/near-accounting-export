@@ -13,7 +13,8 @@ import {
     findLatestBalanceChangingBlock,
     findBalanceChangingTransaction,
     clearBalanceCache,
-    getBalanceChangesAtBlock
+    getBalanceChangesAtBlock,
+    accountExistsAtBlock
 } from './balance-tracker.js';
 import {
     getAllTransactionBlocks,
@@ -619,6 +620,33 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             clearBalanceCache();
         }
 
+        // When searching backward, check if the account exists at the start of the range
+        // If it doesn't exist, we've reached the beginning of the account's history
+        if (direction === 'backward') {
+            try {
+                const existsAtStart = await accountExistsAtBlock(accountId, currentSearchStart);
+                if (!existsAtStart) {
+                    console.log(`Account does not exist at block ${currentSearchStart} - reached the beginning of account history`);
+                    // Save progress and stop searching
+                    history.updatedAt = new Date().toISOString();
+                    saveHistory(outputFile, history);
+                    console.log(`Progress saved to ${outputFile}`);
+                    break;
+                }
+            } catch (error: any) {
+                if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                    console.log(`Error checking account existence: ${error.message}`);
+                    console.log('Stopping and saving progress...');
+                    history.updatedAt = new Date().toISOString();
+                    saveHistory(outputFile, history);
+                    console.log(`Progress saved to ${outputFile}`);
+                    break;
+                }
+                // For other errors (like missing blocks), continue with the search
+                console.warn(`Warning: Could not check account existence at block ${currentSearchStart}: ${error.message}`);
+            }
+        }
+
         let balanceChange: BalanceChanges;
         try {
             // Find the block where balance changed
@@ -632,6 +660,14 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                 console.log(`Error during search: ${error.message}`);
                 console.log('Stopping and saving progress...');
                 // Save immediately before breaking
+                history.updatedAt = new Date().toISOString();
+                saveHistory(outputFile, history);
+                console.log(`Progress saved to ${outputFile}`);
+                break;
+            }
+            if (error.message.includes('does not exist')) {
+                console.log(`Account does not exist at block ${currentSearchStart} - reached the beginning of account history`);
+                // Save progress and stop searching in this direction
                 history.updatedAt = new Date().toISOString();
                 saveHistory(outputFile, history);
                 console.log(`Progress saved to ${outputFile}`);

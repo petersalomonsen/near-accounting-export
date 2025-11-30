@@ -7,7 +7,8 @@ import {
     getCurrentBlockHeight,
     fetchBlockData,
     getTransactionStatusWithReceipts,
-    getStopSignal
+    getStopSignal,
+    isAccountNotFoundError
 } from './rpc.js';
 import type { RpcBlockResponse } from '@near-js/jsonrpc-types';
 
@@ -52,6 +53,25 @@ const DEFAULT_TOKENS = [
  */
 export function clearBalanceCache(): void {
     balanceCache.clear();
+}
+
+/**
+ * Check if an account exists at a specific block
+ * Returns true if account exists, false if it doesn't exist
+ */
+export async function accountExistsAtBlock(
+    accountId: string,
+    blockId: number
+): Promise<boolean> {
+    try {
+        await viewAccount(accountId, blockId);
+        return true;
+    } catch (e: any) {
+        if (e.message?.includes('does not exist')) {
+            return false;
+        }
+        throw e;
+    }
 }
 
 /**

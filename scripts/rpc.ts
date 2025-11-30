@@ -130,9 +130,23 @@ export async function getCurrentBlockHeight(): Promise<number> {
  */
 function isUnknownBlockError(error: any): boolean {
     const errorStr = error.message || '';
+    const dataStr = typeof error.data === 'string' ? error.data : '';
     return errorStr.includes('UNKNOWN_BLOCK') || 
+           dataStr.includes('UNKNOWN_BLOCK') ||
            errorStr.includes('DB Not Found Error: BLOCK HEIGHT') ||
-           (errorStr.includes('Server error') && error.data?.includes?.('BLOCK HEIGHT'));
+           dataStr.includes('DB Not Found Error: BLOCK HEIGHT');
+}
+
+/**
+ * Check if an error indicates the account doesn't exist at a block
+ */
+export function isAccountNotFoundError(error: any): boolean {
+    const errorStr = error.message || '';
+    const dataStr = typeof error.data === 'string' ? error.data : '';
+    return errorStr.includes('does not exist') || 
+           dataStr.includes('does not exist') ||
+           errorStr.includes('UNKNOWN_ACCOUNT') ||
+           dataStr.includes('UNKNOWN_ACCOUNT');
 }
 
 /**
@@ -167,6 +181,9 @@ export async function viewAccount(
                 if (isUnknownBlockError(error)) {
                     console.warn(`Block ${currentBlock} not found, trying block ${currentBlock - 1}`);
                     currentBlock--;
+                } else if (isAccountNotFoundError(error)) {
+                    // Account doesn't exist at this block - this is a valid state, not an error to retry
+                    throw new Error(`Account ${accountId} does not exist at block ${blockId}`);
                 } else {
                     console.error(`RPC error in viewAccount for ${accountId} at block ${blockId}:`, error.message);
                     throw error;
