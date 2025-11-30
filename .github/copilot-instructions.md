@@ -66,17 +66,20 @@ Built files are output to the `dist/` directory.
 - `NEAR_RPC_ENDPOINT` - RPC endpoint URL (default: https://archival-rpc.mainnet.fastnear.com)
   - **Note**: The old rpc.mainnet.near.org endpoint is deprecated and returns error -429. Use fastnear.com or alternative providers from https://docs.near.org/api/rpc/providers
 - `FASTNEAR_API_KEY` - FastNEAR API key for higher rate limits (optional). When set, adds `Authorization: Bearer <key>` header to all RPC requests
+- `NEARBLOCKS_API_KEY` - NearBlocks API key for faster transaction discovery (optional). When set, fetches known transaction blocks from NearBlocks API before falling back to binary search
 - `RPC_DELAY_MS` - Delay between RPC calls in milliseconds (default: 50)
 
 ## Key Conventions
 
 1. **Balance Verification**: Always verify that transactions are connected by checking that the balance after one transaction matches the balance before the next.
 
-2. **Binary Search**: Use binary search to find balance-changing blocks efficiently instead of scanning every block.
+2. **NearBlocks API**: When available, use the NearBlocks API to quickly discover known transaction blocks, then fetch balance changes only at those specific blocks.
 
-3. **Continuous Search**: When no balance changes are found in a range, automatically move to the adjacent range of equal size and continue searching until interrupted, rate limited, or endpoint becomes unresponsive.
+3. **Binary Search**: Fall back to binary search to find balance-changing blocks efficiently when NearBlocks is not available or for intents transactions not indexed by NearBlocks.
 
-4. **Error Handling**: Handle rate limiting and endpoint errors gracefully with a stop signal mechanism. Always save progress before stopping.
+4. **Continuous Search**: When no balance changes are found in a range, automatically move to the adjacent range of equal size and continue searching until interrupted, rate limited, or endpoint becomes unresponsive.
+
+5. **Error Handling**: Handle rate limiting and endpoint errors gracefully with a stop signal mechanism. Always save progress before stopping.
 
 5. **Progress Saving**: Save progress continuously - every 5 transactions and when moving to new search ranges - to ensure no data is lost on interruption.
 

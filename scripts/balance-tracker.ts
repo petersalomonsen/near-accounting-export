@@ -7,7 +7,8 @@ import {
     getCurrentBlockHeight,
     fetchBlockData,
     getTransactionStatusWithReceipts,
-    getStopSignal
+    getStopSignal,
+    isAccountNotFoundError
 } from './rpc.js';
 import type { RpcBlockResponse } from '@near-js/jsonrpc-types';
 
@@ -52,6 +53,25 @@ const DEFAULT_TOKENS = [
  */
 export function clearBalanceCache(): void {
     balanceCache.clear();
+}
+
+/**
+ * Check if an account exists at a specific block
+ * Returns true if account exists, false if it doesn't exist
+ */
+export async function accountExistsAtBlock(
+    accountId: string,
+    blockId: number
+): Promise<boolean> {
+    try {
+        await viewAccount(accountId, blockId);
+        return true;
+    } catch (e: any) {
+        if (e.message?.includes('does not exist')) {
+            return false;
+        }
+        throw e;
+    }
 }
 
 /**
@@ -243,6 +263,32 @@ export async function getAllBalances(
 }
 
 /**
+ * Get balance changes at a specific block by comparing block-1 to block
+ * This is more efficient than binary search when we already know the block
+ */
+export async function getBalanceChangesAtBlock(
+    accountId: string,
+    blockHeight: number,
+    tokenContracts: string[] | null | undefined = undefined,
+    intentsTokens: string[] | null | undefined = undefined
+): Promise<BalanceChanges> {
+    if (getStopSignal()) {
+        throw new Error('Operation cancelled by user');
+    }
+
+    // Get balances before and after the block
+    const balanceBefore = await getAllBalances(accountId, blockHeight - 1, tokenContracts, intentsTokens, true);
+    const balanceAfter = await getAllBalances(accountId, blockHeight, tokenContracts, intentsTokens, true);
+
+    const changes = detectBalanceChanges(balanceBefore, balanceAfter);
+    changes.block = blockHeight;
+    changes.startBalance = balanceBefore;
+    changes.endBalance = balanceAfter;
+
+    return changes;
+}
+
+/**
  * Detect balance changes between two snapshots
  */
 function detectBalanceChanges(
@@ -344,13 +390,25 @@ export async function findLatestBalanceChangingBlock(
     const numBlocks = lastBlock - firstBlock;
 
     if (numBlocks <= 0) {
-        detectedChanges.block = firstBlock;
-        return detectedChanges;
+        // Re-fetch complete balances to ensure we have full snapshot
+        const completeStartBalance = await getAllBalances(accountId, firstBlock - 1, undefined, undefined, true);
+        const completeEndBalance = await getAllBalances(accountId, firstBlock, undefined, undefined, true);
+        const completeChanges = detectBalanceChanges(completeStartBalance, completeEndBalance);
+        completeChanges.block = firstBlock;
+        completeChanges.startBalance = completeStartBalance;
+        completeChanges.endBalance = completeEndBalance;
+        return completeChanges;
     }
 
     if (numBlocks === 1) {
-        detectedChanges.block = lastBlock;
-        return detectedChanges;
+        // Re-fetch complete balances to ensure we have full snapshot
+        const completeStartBalance = await getAllBalances(accountId, lastBlock - 1, undefined, undefined, true);
+        const completeEndBalance = await getAllBalances(accountId, lastBlock, undefined, undefined, true);
+        const completeChanges = detectBalanceChanges(completeStartBalance, completeEndBalance);
+        completeChanges.block = lastBlock;
+        completeChanges.startBalance = completeStartBalance;
+        completeChanges.endBalance = completeEndBalance;
+        return completeChanges;
     }
 
     const middleBlock = lastBlock - Math.floor(numBlocks / 2);
