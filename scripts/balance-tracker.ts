@@ -390,13 +390,25 @@ export async function findLatestBalanceChangingBlock(
     const numBlocks = lastBlock - firstBlock;
 
     if (numBlocks <= 0) {
-        detectedChanges.block = firstBlock;
-        return detectedChanges;
+        // Re-fetch complete balances to ensure we have full snapshot
+        const completeStartBalance = await getAllBalances(accountId, firstBlock - 1, undefined, undefined, true);
+        const completeEndBalance = await getAllBalances(accountId, firstBlock, undefined, undefined, true);
+        const completeChanges = detectBalanceChanges(completeStartBalance, completeEndBalance);
+        completeChanges.block = firstBlock;
+        completeChanges.startBalance = completeStartBalance;
+        completeChanges.endBalance = completeEndBalance;
+        return completeChanges;
     }
 
     if (numBlocks === 1) {
-        detectedChanges.block = lastBlock;
-        return detectedChanges;
+        // Re-fetch complete balances to ensure we have full snapshot
+        const completeStartBalance = await getAllBalances(accountId, lastBlock - 1, undefined, undefined, true);
+        const completeEndBalance = await getAllBalances(accountId, lastBlock, undefined, undefined, true);
+        const completeChanges = detectBalanceChanges(completeStartBalance, completeEndBalance);
+        completeChanges.block = lastBlock;
+        completeChanges.startBalance = completeStartBalance;
+        completeChanges.endBalance = completeEndBalance;
+        return completeChanges;
     }
 
     const middleBlock = lastBlock - Math.floor(numBlocks / 2);
