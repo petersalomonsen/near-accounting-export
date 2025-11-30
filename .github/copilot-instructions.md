@@ -65,6 +65,7 @@ Built files are output to the `dist/` directory.
 
 - `NEAR_RPC_ENDPOINT` - RPC endpoint URL (default: https://archival-rpc.mainnet.fastnear.com)
   - **Note**: The old rpc.mainnet.near.org endpoint is deprecated and returns error -429. Use fastnear.com or alternative providers from https://docs.near.org/api/rpc/providers
+- `FASTNEAR_API_KEY` - FastNEAR API key for higher rate limits (optional). When set, adds `Authorization: Bearer <key>` header to all RPC requests
 - `RPC_DELAY_MS` - Delay between RPC calls in milliseconds (default: 50)
 
 ## Key Conventions
