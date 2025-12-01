@@ -321,5 +321,28 @@ describe('NEAR Accounting Export', function() {
                 console.log('No balance changes found in range - this is valid');
             }
         });
+
+        it('should handle missing blocks gracefully during search', async function() {
+            if (!rpcAvailable) {
+                this.skip();
+                return;
+            }
+            // Block 163181131 is a known missing/skipped block in the archival RPC
+            // Search a small range around it to ensure missing block handling works
+            const accountId = 'near';
+            const missingBlock = 163181131;
+            
+            // Search a small range that includes the missing block
+            // This should not throw an error - the retry logic should handle it
+            const balanceChange = await findLatestBalanceChangingBlock(
+                accountId,
+                missingBlock - 5,
+                missingBlock + 5
+            );
+
+            // The search should complete without throwing
+            assert.ok(balanceChange !== undefined, 'Should return a result even with missing blocks');
+            console.log(`Missing block search result: hasChanges=${balanceChange.hasChanges}, block=${balanceChange.block}`);
+        });
     });
 });

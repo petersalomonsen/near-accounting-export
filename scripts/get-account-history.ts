@@ -743,6 +743,86 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                 if (!verification.valid) {
                     console.warn(`Warning: Connectivity issue detected at block ${balanceChange.block}`);
                     verification.errors.forEach(err => console.warn(`  - ${err.message}`));
+                    
+                    // There might be missing transactions between this block and the next
+                    // First check the block immediately after this one
+                    const immediateNextBlock = balanceChange.block! + 1;
+                    if (immediateNextBlock < nextTransaction.block && transactionsFound < maxTransactions) {
+                        console.log(`Checking for immediate balance change at block ${immediateNextBlock}`);
+                        try {
+                            const immediateChange = await getBalanceChangesAtBlock(accountId, immediateNextBlock);
+                            if (immediateChange.hasChanges) {
+                                // Found a missing transaction right after
+                                const immTxInfo = await findBalanceChangingTransaction(accountId, immediateNextBlock);
+                                const immEntry: TransactionEntry = {
+                                    block: immediateNextBlock,
+                                    timestamp: immTxInfo.blockTimestamp,
+                                    transactionHashes: immTxInfo.transactionHashes,
+                                    transactions: immTxInfo.transactions,
+                                    balanceBefore: immediateChange.startBalance,
+                                    balanceAfter: immediateChange.endBalance,
+                                    changes: {
+                                        nearChanged: immediateChange.nearChanged,
+                                        nearDiff: immediateChange.nearDiff,
+                                        tokensChanged: immediateChange.tokensChanged,
+                                        intentsChanged: immediateChange.intentsChanged
+                                    }
+                                };
+                                // Insert after the current entry (before nextTransaction)
+                                history.transactions.splice(1, 0, immEntry);
+                                transactionsFound++;
+                                console.log(`Immediate gap transaction added at block ${immediateNextBlock}`);
+                                
+                                // Re-verify the chain
+                                const newVerification = verifyTransactionConnectivity(immEntry, entry);
+                                entry.verificationWithNext = newVerification;
+                            }
+                        } catch (gapError: any) {
+                            console.warn(`Could not check immediate block: ${gapError.message}`);
+                        }
+                    }
+                    
+                    // If still not valid, search in the remaining gap
+                    if (entry.verificationWithNext && !entry.verificationWithNext.valid) {
+                        const gapStart = balanceChange.block! + 2; // Start after the immediate block we just checked
+                        const gapEnd = nextTransaction.block - 1;
+                        if (gapEnd >= gapStart && transactionsFound < maxTransactions) {
+                            console.log(`Searching for missing transactions in gap: ${gapStart} - ${gapEnd}`);
+                            try {
+                                const gapChange = await findLatestBalanceChangingBlock(accountId, gapStart, gapEnd);
+                                if (gapChange.hasChanges && gapChange.block) {
+                                    // Found a missing transaction, add it
+                                    const gapTxInfo = await findBalanceChangingTransaction(accountId, gapChange.block);
+                                    const gapEntry: TransactionEntry = {
+                                        block: gapChange.block,
+                                        timestamp: gapTxInfo.blockTimestamp,
+                                        transactionHashes: gapTxInfo.transactionHashes,
+                                        transactions: gapTxInfo.transactions,
+                                        balanceBefore: gapChange.startBalance,
+                                        balanceAfter: gapChange.endBalance,
+                                        changes: {
+                                            nearChanged: gapChange.nearChanged,
+                                            nearDiff: gapChange.nearDiff,
+                                            tokensChanged: gapChange.tokensChanged,
+                                            intentsChanged: gapChange.intentsChanged
+                                        }
+                                    };
+                                    // Insert in the right position
+                                    const gapBlock = gapChange.block!;
+                                    const insertPos = history.transactions.findIndex(t => t.block > gapBlock);
+                                    if (insertPos >= 0) {
+                                        history.transactions.splice(insertPos, 0, gapEntry);
+                                    } else {
+                                        history.transactions.push(gapEntry);
+                                    }
+                                    transactionsFound++;
+                                    console.log(`Gap transaction added at block ${gapBlock}`);
+                                }
+                            } catch (gapError: any) {
+                                console.warn(`Could not search gap: ${gapError.message}`);
+                            }
+                        }
+                    }
                 }
             }
         } else if (direction === 'forward' && history.transactions.length > 0) {
