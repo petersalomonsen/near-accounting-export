@@ -258,13 +258,48 @@ async function fillGaps(
         
         console.log(`\nFilling gap between blocks ${gap.prevBlock} and ${gap.nextBlock}...`);
         
-        const searchStart = gap.prevBlock + 1;
+        // Note: We start from gap.prevBlock (not +1) because the change we're looking for
+        // could have happened at the block right after prevBlock. The balance at prevBlock
+        // is known (from prevTx.balanceAfter), so we need to compare from that point.
+        const searchStart = gap.prevBlock;
         const searchEnd = gap.nextBlock - 1;
         
         if (searchStart > searchEnd) {
             console.log('Gap is adjacent blocks, no intermediate transactions');
             continue;
         }
+        
+        // Extract tokens that changed in this gap to pass to the search
+        // This ensures we look for the right tokens, especially intents tokens
+        const prevBalanceAfter = gap.prevTx.balanceAfter;
+        const nextBalanceBefore = gap.nextTx.balanceBefore;
+        
+        // Check if NEAR balance changed
+        const checkNear = prevBalanceAfter?.near !== nextBalanceBefore?.near;
+        
+        // Find fungible tokens that changed
+        const changedFungibleTokens: string[] = [];
+        const prevFT = prevBalanceAfter?.fungibleTokens || {};
+        const nextFT = nextBalanceBefore?.fungibleTokens || {};
+        const allFT = new Set([...Object.keys(prevFT), ...Object.keys(nextFT)]);
+        for (const token of allFT) {
+            if ((prevFT[token] || '0') !== (nextFT[token] || '0')) {
+                changedFungibleTokens.push(token);
+            }
+        }
+        
+        // Find intents tokens that changed
+        const changedIntentsTokens: string[] = [];
+        const prevIntents = prevBalanceAfter?.intentsTokens || {};
+        const nextIntents = nextBalanceBefore?.intentsTokens || {};
+        const allIntents = new Set([...Object.keys(prevIntents), ...Object.keys(nextIntents)]);
+        for (const token of allIntents) {
+            if ((prevIntents[token] || '0') !== (nextIntents[token] || '0')) {
+                changedIntentsTokens.push(token);
+            }
+        }
+        
+        console.log(`Gap analysis: NEAR changed=${checkNear}, FT changed=${changedFungibleTokens.length > 0 ? changedFungibleTokens.join(',') : 'none'}, Intents changed=${changedIntentsTokens.length > 0 ? changedIntentsTokens.join(',') : 'none'}`);
         
         let currentStart = searchStart;
         let currentEnd = searchEnd;
@@ -282,7 +317,10 @@ async function fillGaps(
                 balanceChange = await findLatestBalanceChangingBlock(
                     history.accountId,
                     currentStart,
-                    currentEnd
+                    currentEnd,
+                    changedFungibleTokens.length > 0 ? changedFungibleTokens : null,
+                    changedIntentsTokens.length > 0 ? changedIntentsTokens : null,
+                    checkNear
                 );
             } catch (error: any) {
                 if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
@@ -359,7 +397,37 @@ async function fillGaps(
         console.log(`Filled ${foundInGap} transaction(s) in this gap`);
     }
     
+    // After filling gaps, re-verify all transactions and update verification fields
+    if (totalFilled > 0) {
+        updateVerificationFields(history);
+        saveHistory(outputFile, history);
+    }
+    
     return totalFilled;
+}
+
+/**
+ * Update verification fields on all transactions after sorting
+ */
+function updateVerificationFields(history: AccountHistory): void {
+    // Sort transactions by block
+    history.transactions.sort((a, b) => a.block - b.block);
+    
+    // Update verificationWithNext for each transaction
+    for (let i = 0; i < history.transactions.length - 1; i++) {
+        const currentTx = history.transactions[i];
+        const nextTx = history.transactions[i + 1];
+        
+        if (currentTx && nextTx) {
+            currentTx.verificationWithNext = verifyTransactionConnectivity(nextTx, currentTx);
+        }
+    }
+    
+    // Clear verificationWithNext on the last transaction
+    const lastTx = history.transactions[history.transactions.length - 1];
+    if (lastTx) {
+        delete lastTx.verificationWithNext;
+    }
 }
 
 /**
@@ -409,6 +477,10 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                 console.log('Reached max transactions limit while filling gaps');
                 return history;
             }
+        } else {
+            // Even if no gaps were filled, update verification fields to fix any stale data
+            updateVerificationFields(history);
+            saveHistory(outputFile, history);
         }
     }
 
@@ -743,6 +815,86 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                 if (!verification.valid) {
                     console.warn(`Warning: Connectivity issue detected at block ${balanceChange.block}`);
                     verification.errors.forEach(err => console.warn(`  - ${err.message}`));
+                    
+                    // There might be missing transactions between this block and the next
+                    // First check the block immediately after this one
+                    const immediateNextBlock = balanceChange.block! + 1;
+                    if (immediateNextBlock < nextTransaction.block && transactionsFound < maxTransactions) {
+                        console.log(`Checking for immediate balance change at block ${immediateNextBlock}`);
+                        try {
+                            const immediateChange = await getBalanceChangesAtBlock(accountId, immediateNextBlock);
+                            if (immediateChange.hasChanges) {
+                                // Found a missing transaction right after
+                                const immTxInfo = await findBalanceChangingTransaction(accountId, immediateNextBlock);
+                                const immEntry: TransactionEntry = {
+                                    block: immediateNextBlock,
+                                    timestamp: immTxInfo.blockTimestamp,
+                                    transactionHashes: immTxInfo.transactionHashes,
+                                    transactions: immTxInfo.transactions,
+                                    balanceBefore: immediateChange.startBalance,
+                                    balanceAfter: immediateChange.endBalance,
+                                    changes: {
+                                        nearChanged: immediateChange.nearChanged,
+                                        nearDiff: immediateChange.nearDiff,
+                                        tokensChanged: immediateChange.tokensChanged,
+                                        intentsChanged: immediateChange.intentsChanged
+                                    }
+                                };
+                                // Insert after the current entry (before nextTransaction)
+                                history.transactions.splice(1, 0, immEntry);
+                                transactionsFound++;
+                                console.log(`Immediate gap transaction added at block ${immediateNextBlock}`);
+                                
+                                // Re-verify the chain
+                                const newVerification = verifyTransactionConnectivity(immEntry, entry);
+                                entry.verificationWithNext = newVerification;
+                            }
+                        } catch (gapError: any) {
+                            console.warn(`Could not check immediate block: ${gapError.message}`);
+                        }
+                    }
+                    
+                    // If still not valid, search in the remaining gap
+                    if (entry.verificationWithNext && !entry.verificationWithNext.valid) {
+                        const gapStart = balanceChange.block! + 2; // Start after the immediate block we just checked
+                        const gapEnd = nextTransaction.block - 1;
+                        if (gapEnd >= gapStart && transactionsFound < maxTransactions) {
+                            console.log(`Searching for missing transactions in gap: ${gapStart} - ${gapEnd}`);
+                            try {
+                                const gapChange = await findLatestBalanceChangingBlock(accountId, gapStart, gapEnd);
+                                if (gapChange.hasChanges && gapChange.block) {
+                                    // Found a missing transaction, add it
+                                    const gapTxInfo = await findBalanceChangingTransaction(accountId, gapChange.block);
+                                    const gapEntry: TransactionEntry = {
+                                        block: gapChange.block,
+                                        timestamp: gapTxInfo.blockTimestamp,
+                                        transactionHashes: gapTxInfo.transactionHashes,
+                                        transactions: gapTxInfo.transactions,
+                                        balanceBefore: gapChange.startBalance,
+                                        balanceAfter: gapChange.endBalance,
+                                        changes: {
+                                            nearChanged: gapChange.nearChanged,
+                                            nearDiff: gapChange.nearDiff,
+                                            tokensChanged: gapChange.tokensChanged,
+                                            intentsChanged: gapChange.intentsChanged
+                                        }
+                                    };
+                                    // Insert in the right position
+                                    const gapBlock = gapChange.block!;
+                                    const insertPos = history.transactions.findIndex(t => t.block > gapBlock);
+                                    if (insertPos >= 0) {
+                                        history.transactions.splice(insertPos, 0, gapEntry);
+                                    } else {
+                                        history.transactions.push(gapEntry);
+                                    }
+                                    transactionsFound++;
+                                    console.log(`Gap transaction added at block ${gapBlock}`);
+                                }
+                            } catch (gapError: any) {
+                                console.warn(`Could not search gap: ${gapError.message}`);
+                            }
+                        }
+                    }
                 }
             }
         } else if (direction === 'forward' && history.transactions.length > 0) {
