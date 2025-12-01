@@ -258,13 +258,48 @@ async function fillGaps(
         
         console.log(`\nFilling gap between blocks ${gap.prevBlock} and ${gap.nextBlock}...`);
         
-        const searchStart = gap.prevBlock + 1;
+        // Note: We start from gap.prevBlock (not +1) because the change we're looking for
+        // could have happened at the block right after prevBlock. The balance at prevBlock
+        // is known (from prevTx.balanceAfter), so we need to compare from that point.
+        const searchStart = gap.prevBlock;
         const searchEnd = gap.nextBlock - 1;
         
         if (searchStart > searchEnd) {
             console.log('Gap is adjacent blocks, no intermediate transactions');
             continue;
         }
+        
+        // Extract tokens that changed in this gap to pass to the search
+        // This ensures we look for the right tokens, especially intents tokens
+        const prevBalanceAfter = gap.prevTx.balanceAfter;
+        const nextBalanceBefore = gap.nextTx.balanceBefore;
+        
+        // Check if NEAR balance changed
+        const checkNear = prevBalanceAfter?.near !== nextBalanceBefore?.near;
+        
+        // Find fungible tokens that changed
+        const changedFungibleTokens: string[] = [];
+        const prevFT = prevBalanceAfter?.fungibleTokens || {};
+        const nextFT = nextBalanceBefore?.fungibleTokens || {};
+        const allFT = new Set([...Object.keys(prevFT), ...Object.keys(nextFT)]);
+        for (const token of allFT) {
+            if ((prevFT[token] || '0') !== (nextFT[token] || '0')) {
+                changedFungibleTokens.push(token);
+            }
+        }
+        
+        // Find intents tokens that changed
+        const changedIntentsTokens: string[] = [];
+        const prevIntents = prevBalanceAfter?.intentsTokens || {};
+        const nextIntents = nextBalanceBefore?.intentsTokens || {};
+        const allIntents = new Set([...Object.keys(prevIntents), ...Object.keys(nextIntents)]);
+        for (const token of allIntents) {
+            if ((prevIntents[token] || '0') !== (nextIntents[token] || '0')) {
+                changedIntentsTokens.push(token);
+            }
+        }
+        
+        console.log(`Gap analysis: NEAR changed=${checkNear}, FT changed=${changedFungibleTokens.length > 0 ? changedFungibleTokens.join(',') : 'none'}, Intents changed=${changedIntentsTokens.length > 0 ? changedIntentsTokens.join(',') : 'none'}`);
         
         let currentStart = searchStart;
         let currentEnd = searchEnd;
@@ -282,7 +317,10 @@ async function fillGaps(
                 balanceChange = await findLatestBalanceChangingBlock(
                     history.accountId,
                     currentStart,
-                    currentEnd
+                    currentEnd,
+                    changedFungibleTokens.length > 0 ? changedFungibleTokens : null,
+                    changedIntentsTokens.length > 0 ? changedIntentsTokens : null,
+                    checkNear
                 );
             } catch (error: any) {
                 if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {

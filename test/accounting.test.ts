@@ -3,6 +3,13 @@ import { strict as assert } from 'assert';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
+
+// Load environment variables from .env file
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// Go up two levels: dist/test -> dist -> root
+dotenv.config({ path: path.join(__dirname, '..', '..', '.env') });
+
 import {
     getCurrentBlockHeight,
     viewAccount,
@@ -20,8 +27,6 @@ import {
     getAccountHistory,
     verifyHistoryFile
 } from '../scripts/get-account-history.js';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Helper to check if RPC is available
 async function isRpcAvailable(): Promise<boolean> {
@@ -490,11 +495,12 @@ describe('NEAR Accounting Export', function() {
                 console.log('Expected missing transaction at block 151391583 with intents change');
                 
                 // Now run getAccountHistory which should fill the gap
+                // Setting maxTransactions to 1 so we only fill the gap and don't search for more
                 const history = await getAccountHistory({
                     accountId: 'webassemblymusic-treasury.sputnik-dao.near',
                     outputFile: gapTestFile,
                     direction: 'backward',
-                    maxTransactions: 5 // Allow up to 5 new transactions
+                    maxTransactions: 1 // Only fill gaps, don't search for more
                 });
                 
                 // Check that the gap was filled
