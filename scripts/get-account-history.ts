@@ -397,7 +397,37 @@ async function fillGaps(
         console.log(`Filled ${foundInGap} transaction(s) in this gap`);
     }
     
+    // After filling gaps, re-verify all transactions and update verification fields
+    if (totalFilled > 0) {
+        updateVerificationFields(history);
+        saveHistory(outputFile, history);
+    }
+    
     return totalFilled;
+}
+
+/**
+ * Update verification fields on all transactions after sorting
+ */
+function updateVerificationFields(history: AccountHistory): void {
+    // Sort transactions by block
+    history.transactions.sort((a, b) => a.block - b.block);
+    
+    // Update verificationWithNext for each transaction
+    for (let i = 0; i < history.transactions.length - 1; i++) {
+        const currentTx = history.transactions[i];
+        const nextTx = history.transactions[i + 1];
+        
+        if (currentTx && nextTx) {
+            currentTx.verificationWithNext = verifyTransactionConnectivity(nextTx, currentTx);
+        }
+    }
+    
+    // Clear verificationWithNext on the last transaction
+    const lastTx = history.transactions[history.transactions.length - 1];
+    if (lastTx) {
+        delete lastTx.verificationWithNext;
+    }
 }
 
 /**
@@ -447,6 +477,10 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                 console.log('Reached max transactions limit while filling gaps');
                 return history;
             }
+        } else {
+            // Even if no gaps were filled, update verification fields to fix any stale data
+            updateVerificationFields(history);
+            saveHistory(outputFile, history);
         }
     }
 
