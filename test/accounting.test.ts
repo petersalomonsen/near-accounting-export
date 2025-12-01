@@ -344,5 +344,244 @@ describe('NEAR Accounting Export', function() {
             assert.ok(balanceChange !== undefined, 'Should return a result even with missing blocks');
             console.log(`Missing block search result: hasChanges=${balanceChange.hasChanges}, block=${balanceChange.block}`);
         });
+
+        it('should find intents balance change at block 151391583', async function() {
+            if (!rpcAvailable) {
+                this.skip();
+                return;
+            }
+            // This is a known case where an intents ft_withdraw receipt was executed at block 151391583
+            // The intents balance for nep141:eth.omft.near changed from 10000000000000000 to 5000000000000000
+            // Starting search from 151391584 should find this change at 151391583
+            const accountId = 'webassemblymusic-treasury.sputnik-dao.near';
+            
+            // Search backward from 151391584 to find the change at 151391583
+            const balanceChange = await findLatestBalanceChangingBlock(
+                accountId,
+                151391582,  // Start block (before the change)
+                151391584   // End block (after the change)
+            );
+
+            console.log(`Intents balance change search result: hasChanges=${balanceChange.hasChanges}, block=${balanceChange.block}`);
+            console.log('Start balance intents:', JSON.stringify(balanceChange.startBalance?.intentsTokens, null, 2));
+            console.log('End balance intents:', JSON.stringify(balanceChange.endBalance?.intentsTokens, null, 2));
+            
+            // The search should find a change
+            assert.ok(balanceChange.hasChanges, 'Should detect balance change in this range');
+            // The change should be detected at block 151391583 or 151391584
+            assert.ok(balanceChange.block === 151391583 || balanceChange.block === 151391584, 
+                `Should find change at block 151391583 or 151391584, got ${balanceChange.block}`);
+            
+            // Verify intents token changed
+            assert.ok(balanceChange.intentsChanged && Object.keys(balanceChange.intentsChanged).length > 0,
+                'Should detect intents token change');
+            console.log('Intents changes:', JSON.stringify(balanceChange.intentsChanged, null, 2));
+        });
+
+        it('should fill gaps in existing history file with intents balance mismatch', async function() {
+            if (!rpcAvailable) {
+                this.skip();
+                return;
+            }
+            // BUG REPRODUCTION TEST: Gap-filling doesn't find the missing transaction
+            // 
+            // Real data from webassemblymusic-treasury.sputnik-dao.near where:
+            // - Block 151391582: balanceAfter.intentsTokens["nep141:eth.omft.near"] = "10000000000000000"
+            // - Block 151391586: balanceBefore.intentsTokens["nep141:eth.omft.near"] = "5000000000000000"
+            // 
+            // There's a missing transaction at block 151391583 where the eth balance changed
+            // from 10000000000000000 to 5000000000000000 (an ft_withdraw on intents.near)
+            
+            const gappedHistory = {
+                accountId: 'webassemblymusic-treasury.sputnik-dao.near',
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                transactions: [
+                    {
+                        block: 151391582,
+                        timestamp: null,
+                        transactionHashes: [],
+                        transactions: [],
+                        balanceBefore: {
+                            near: '11200437557049643499999999',
+                            fungibleTokens: {
+                                '17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1': '0',
+                                'wrap.near': '0',
+                                'usdt.tether-token.near': '0'
+                            },
+                            intentsTokens: {
+                                'nep141:eth.omft.near': '10000000000000000'
+                            }
+                        },
+                        balanceAfter: {
+                            near: '11200513712735084899999998',
+                            fungibleTokens: {
+                                '17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1': '0',
+                                'wrap.near': '0',
+                                'usdt.tether-token.near': '0'
+                            },
+                            intentsTokens: {
+                                'nep141:eth.omft.near': '10000000000000000'
+                            }
+                        },
+                        changes: {
+                            nearChanged: true,
+                            nearDiff: '76155685441399999999',
+                            tokensChanged: {},
+                            intentsChanged: {}
+                        }
+                    },
+                    {
+                        block: 151391586,
+                        timestamp: null,
+                        transactionHashes: [],
+                        transactions: [],
+                        balanceBefore: {
+                            near: '11200513712735084899999998',
+                            fungibleTokens: {
+                                '17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1': '0',
+                                'wrap.near': '0',
+                                'usdt.tether-token.near': '0'
+                            },
+                            intentsTokens: {
+                                'nep141:eth.omft.near': '5000000000000000'
+                            }
+                        },
+                        balanceAfter: {
+                            near: '11100569862488061499999998',
+                            fungibleTokens: {
+                                '17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1': '0',
+                                'wrap.near': '0',
+                                'usdt.tether-token.near': '0'
+                            },
+                            intentsTokens: {
+                                'nep141:eth.omft.near': '5000000000000000'
+                            }
+                        },
+                        changes: {
+                            nearChanged: true,
+                            nearDiff: '-99943850247023400000000',
+                            tokensChanged: {},
+                            intentsChanged: {}
+                        }
+                    }
+                ],
+                metadata: {
+                    firstBlock: 151391582,
+                    lastBlock: 151391586,
+                    totalTransactions: 2
+                }
+            };
+            
+            // Write the gapped history to a temp file
+            const gapTestFile = path.join(__dirname, 'gap-test-output.json');
+            fs.writeFileSync(gapTestFile, JSON.stringify(gappedHistory, null, 2));
+            
+            try {
+                // First verify that the gap is detected
+                const beforeResults = verifyHistoryFile(gapTestFile);
+                assert.ok(!beforeResults.valid, 'History should have gaps before filling');
+                assert.ok(beforeResults.errors.some(e => 
+                    e.errors.some(err => err.type === 'intents_balance_mismatch' && 
+                        err.token === 'nep141:eth.omft.near')),
+                    'Should detect intents eth balance mismatch');
+                
+                console.log('Gap detected between blocks 151391582 and 151391586');
+                console.log('Expected missing transaction at block 151391583 with intents change');
+                
+                // Now run getAccountHistory which should fill the gap
+                const history = await getAccountHistory({
+                    accountId: 'webassemblymusic-treasury.sputnik-dao.near',
+                    outputFile: gapTestFile,
+                    direction: 'backward',
+                    maxTransactions: 5 // Allow up to 5 new transactions
+                });
+                
+                // Check that the gap was filled
+                const block151391583 = history.transactions.find(t => t.block === 151391583);
+                assert.ok(block151391583, 'Block 151391583 should have been found and added');
+                
+                // Verify the intents change was recorded
+                assert.ok(block151391583.changes.intentsChanged['nep141:eth.omft.near'],
+                    'Should have intents eth change recorded at block 151391583');
+                
+                // Verify connectivity is now valid
+                const afterResults = verifyHistoryFile(gapTestFile);
+                assert.ok(afterResults.valid, 'History should be valid after gap filling');
+                
+                console.log('Gap successfully filled with transaction at block 151391583');
+                console.log('Intents change:', block151391583.changes.intentsChanged);
+            } finally {
+                // Cleanup
+                if (fs.existsSync(gapTestFile)) {
+                    fs.unlinkSync(gapTestFile);
+                }
+            }
+        });
+
+        it('should find ALL balance changes when multiple occur in adjacent blocks', async function() {
+            if (!rpcAvailable) {
+                this.skip();
+                return;
+            }
+            // BUG REPRODUCTION TEST:
+            // There are balance changes at blocks 151391582, 151391583, and 151391586 for this account.
+            // When searching backward from 151391586, findLatestBalanceChangingBlock returns the 
+            // "latest" change, which means:
+            // 1. First search finds 151391586
+            // 2. Then we search 151391580-151391585, which finds 151391582 (the latest in that range)
+            // 3. We miss 151391583 because after finding 151391582, we move to earlier ranges
+            //
+            // This test demonstrates that searching the range 151391580-151391586 will return
+            // block 151391586 (the latest), then 151391582 (the latest before that), 
+            // but MISS 151391583 which is in between.
+            
+            const accountId = 'webassemblymusic-treasury.sputnik-dao.near';
+            const foundBlocks: number[] = [];
+            
+            // Simulate the backward search algorithm
+            let searchEnd = 151391586;
+            const searchStart = 151391580;
+            
+            // First search: find the latest change in the range
+            let result = await findLatestBalanceChangingBlock(accountId, searchStart, searchEnd);
+            if (result.hasChanges && result.block) {
+                foundBlocks.push(result.block);
+                console.log(`First search found block: ${result.block}`);
+                
+                // Second search: find the next change before the one we just found
+                searchEnd = result.block - 1;
+                result = await findLatestBalanceChangingBlock(accountId, searchStart, searchEnd);
+                if (result.hasChanges && result.block) {
+                    foundBlocks.push(result.block);
+                    console.log(`Second search found block: ${result.block}`);
+                    
+                    // Third search: continue backward
+                    searchEnd = result.block - 1;
+                    result = await findLatestBalanceChangingBlock(accountId, searchStart, searchEnd);
+                    if (result.hasChanges && result.block) {
+                        foundBlocks.push(result.block);
+                        console.log(`Third search found block: ${result.block}`);
+                    }
+                }
+            }
+            
+            console.log('All blocks found by backward search:', foundBlocks);
+            
+            // The bug: block 151391583 should be found, but it's missed because
+            // the search jumps from 151391586 to 151391582, skipping 151391583
+            const expectedBlocks = [151391586, 151391583, 151391582];
+            const foundExpected = expectedBlocks.filter(b => foundBlocks.includes(b));
+            const missed = expectedBlocks.filter(b => !foundBlocks.includes(b));
+            
+            console.log('Expected blocks:', expectedBlocks);
+            console.log('Found expected:', foundExpected);
+            console.log('Missed blocks:', missed);
+            
+            // This assertion will FAIL until we fix the bug
+            // Currently the search finds [151391586, 151391582] but misses 151391583
+            assert.deepEqual(foundBlocks.sort((a,b) => b-a), expectedBlocks.sort((a,b) => b-a),
+                `Should find all balance-changing blocks. Missed: ${missed.join(', ')}`);
+        });
     });
 });
