@@ -6,11 +6,13 @@ import {
     callViewFunction,
     getCurrentBlockHeight,
     fetchBlockData,
+    fetchNeardataBlock,
     getTransactionStatusWithReceipts,
     getStopSignal,
     isAccountNotFoundError
 } from './rpc.js';
 import type { RpcBlockResponse } from '@near-js/jsonrpc-types';
+import type { ReceiptExecutionOutcome, NeardataBlockResponse } from './rpc.js';
 
 // Types
 export interface BalanceSnapshot {
@@ -30,12 +32,27 @@ export interface BalanceChanges {
     block?: number;
 }
 
+/**
+ * Transfer detail capturing the counterparty and amount for a balance change
+ */
+export interface TransferDetail {
+    type: 'near' | 'ft' | 'mt';  // NEAR native, Fungible Token, Multi-Token (intents)
+    direction: 'in' | 'out';
+    amount: string;
+    counterparty: string;  // The other account involved in the transfer
+    tokenId?: string;  // For FT: contract address, for MT: token identifier
+    memo?: string;
+    txHash?: string;
+    receiptId?: string;
+}
+
 export interface TransactionInfo {
     transactions: any[];
     transactionHashes: string[];
     transactionBlock: number | null;
     receiptBlock: number;
     blockTimestamp: number | null;
+    transfers: TransferDetail[];  // Detailed transfer information
 }
 
 // Cache for balance snapshots to avoid redundant RPC calls
@@ -454,7 +471,181 @@ export async function findLatestBalanceChangingBlock(
 }
 
 /**
+ * Parse NEP-141 FT transfer events from logs
+ */
+function parseFtTransferEvents(
+    logs: string[],
+    targetAccountId: string,
+    contractId: string,
+    txHash: string,
+    receiptId: string
+): TransferDetail[] {
+    const transfers: TransferDetail[] = [];
+    
+    for (const log of logs) {
+        if (!log.startsWith('EVENT_JSON:')) continue;
+        
+        try {
+            const eventData = JSON.parse(log.substring('EVENT_JSON:'.length));
+            
+            // NEP-141 ft_transfer event
+            if (eventData.standard === 'nep141' && eventData.event === 'ft_transfer') {
+                for (const transfer of eventData.data || []) {
+                    const oldOwner = transfer.old_owner_id;
+                    const newOwner = transfer.new_owner_id;
+                    const amount = transfer.amount;
+                    const memo = transfer.memo;
+                    
+                    if (oldOwner === targetAccountId) {
+                        transfers.push({
+                            type: 'ft',
+                            direction: 'out',
+                            amount,
+                            counterparty: newOwner,
+                            tokenId: contractId,
+                            memo,
+                            txHash,
+                            receiptId
+                        });
+                    } else if (newOwner === targetAccountId) {
+                        transfers.push({
+                            type: 'ft',
+                            direction: 'in',
+                            amount,
+                            counterparty: oldOwner,
+                            tokenId: contractId,
+                            memo,
+                            txHash,
+                            receiptId
+                        });
+                    }
+                }
+            }
+        } catch (e) {
+            // Skip invalid JSON
+        }
+    }
+    
+    return transfers;
+}
+
+/**
+ * Parse NEP-245 Multi-Token (intents) transfer events from logs
+ */
+function parseMtTransferEvents(
+    logs: string[],
+    targetAccountId: string,
+    contractId: string,
+    txHash: string,
+    receiptId: string
+): TransferDetail[] {
+    const transfers: TransferDetail[] = [];
+    
+    for (const log of logs) {
+        if (!log.startsWith('EVENT_JSON:')) continue;
+        
+        try {
+            const eventData = JSON.parse(log.substring('EVENT_JSON:'.length));
+            
+            // NEP-245 mt_transfer event
+            if (eventData.standard === 'nep245' && eventData.event === 'mt_transfer') {
+                for (const transfer of eventData.data || []) {
+                    const oldOwner = transfer.old_owner_id;
+                    const newOwner = transfer.new_owner_id;
+                    const tokenIds = transfer.token_ids || [];
+                    const amounts = transfer.amounts || [];
+                    const memo = transfer.memo;
+                    
+                    for (let i = 0; i < tokenIds.length; i++) {
+                        const tokenId = tokenIds[i];
+                        const amount = amounts[i] || '0';
+                        
+                        if (oldOwner === targetAccountId) {
+                            transfers.push({
+                                type: 'mt',
+                                direction: 'out',
+                                amount,
+                                counterparty: newOwner,
+                                tokenId,
+                                memo,
+                                txHash,
+                                receiptId
+                            });
+                        } else if (newOwner === targetAccountId) {
+                            transfers.push({
+                                type: 'mt',
+                                direction: 'in',
+                                amount,
+                                counterparty: oldOwner,
+                                tokenId,
+                                memo,
+                                txHash,
+                                receiptId
+                            });
+                        }
+                    }
+                }
+            }
+            
+            // Also check for mt_mint and mt_burn events
+            if (eventData.standard === 'nep245' && eventData.event === 'mt_mint') {
+                for (const mint of eventData.data || []) {
+                    const owner = mint.owner_id;
+                    const tokenIds = mint.token_ids || [];
+                    const amounts = mint.amounts || [];
+                    const memo = mint.memo;
+                    
+                    if (owner === targetAccountId) {
+                        for (let i = 0; i < tokenIds.length; i++) {
+                            transfers.push({
+                                type: 'mt',
+                                direction: 'in',
+                                amount: amounts[i] || '0',
+                                counterparty: contractId, // Minted from contract
+                                tokenId: tokenIds[i],
+                                memo,
+                                txHash,
+                                receiptId
+                            });
+                        }
+                    }
+                }
+            }
+            
+            if (eventData.standard === 'nep245' && eventData.event === 'mt_burn') {
+                for (const burn of eventData.data || []) {
+                    const owner = burn.owner_id;
+                    const tokenIds = burn.token_ids || [];
+                    const amounts = burn.amounts || [];
+                    const memo = burn.memo;
+                    
+                    if (owner === targetAccountId) {
+                        for (let i = 0; i < tokenIds.length; i++) {
+                            transfers.push({
+                                type: 'mt',
+                                direction: 'out',
+                                amount: amounts[i] || '0',
+                                counterparty: contractId, // Burned to contract
+                                tokenId: tokenIds[i],
+                                memo,
+                                txHash,
+                                receiptId
+                            });
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            // Skip invalid JSON
+        }
+    }
+    
+    return transfers;
+}
+
+/**
  * Find transaction that caused a balance change
+ * Uses neardata.xyz API to get complete block data with execution outcomes and logs
  */
 export async function findBalanceChangingTransaction(
     targetAccountId: string,
@@ -464,101 +655,175 @@ export async function findBalanceChangingTransaction(
         throw new Error('Operation cancelled by user');
     }
 
+    const transfers: TransferDetail[] = [];
+
     try {
+        // First try neardata.xyz which provides complete execution outcomes with logs
+        const neardataBlock = await fetchNeardataBlock(balanceChangeBlock);
+        
+        if (neardataBlock) {
+            const blockTimestamp = neardataBlock.block?.header?.timestamp;
+            const matchingTxHashes = new Set<string>();
+            const processedReceipts = new Set<string>();
+
+            // Check all shards for receipt execution outcomes
+            for (const shard of neardataBlock.shards || []) {
+                for (const receiptExecution of shard.receipt_execution_outcomes || []) {
+                    const receipt = receiptExecution.receipt;
+                    const executionOutcome = receiptExecution.execution_outcome;
+                    const txHash = receiptExecution.tx_hash;
+                    const receiptId = receipt?.receipt_id || executionOutcome?.id;
+
+                    const receiverId = receipt?.receiver_id;
+                    const predecessorId = receipt?.predecessor_id;
+                    const logs = executionOutcome?.outcome?.logs || [];
+
+                    let affectsTargetAccount = false;
+
+                    // Check if this is a direct transfer to/from the account
+                    if (receiverId === targetAccountId || predecessorId === targetAccountId) {
+                        affectsTargetAccount = true;
+                        
+                        // Check for NEAR transfer action
+                        const actions = receipt?.receipt?.Action?.actions || [];
+                        for (const action of actions) {
+                            if (action.Transfer) {
+                                const amount = action.Transfer.deposit;
+                                if (receiverId === targetAccountId) {
+                                    transfers.push({
+                                        type: 'near',
+                                        direction: 'in',
+                                        amount: String(amount),
+                                        counterparty: predecessorId,
+                                        txHash,
+                                        receiptId
+                                    });
+                                } else if (predecessorId === targetAccountId) {
+                                    transfers.push({
+                                        type: 'near',
+                                        direction: 'out',
+                                        amount: String(amount),
+                                        counterparty: receiverId,
+                                        txHash,
+                                        receiptId
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Parse FT transfer events from logs
+                    if (!processedReceipts.has(receiptId)) {
+                        const ftTransfers = parseFtTransferEvents(logs, targetAccountId, receiverId, txHash, receiptId);
+                        if (ftTransfers.length > 0) {
+                            transfers.push(...ftTransfers);
+                            affectsTargetAccount = true;
+                        }
+                        
+                        // Parse MT (intents) transfer events from logs
+                        const mtTransfers = parseMtTransferEvents(logs, targetAccountId, receiverId, txHash, receiptId);
+                        if (mtTransfers.length > 0) {
+                            transfers.push(...mtTransfers);
+                            affectsTargetAccount = true;
+                        }
+                        
+                        processedReceipts.add(receiptId);
+                    }
+
+                    // Check receipt logs for EVENT_JSON entries mentioning the account (fallback)
+                    if (!affectsTargetAccount) {
+                        for (const log of logs) {
+                            if (log.startsWith('EVENT_JSON:')) {
+                                try {
+                                    const eventData = JSON.parse(log.substring('EVENT_JSON:'.length));
+                                    const eventStr = JSON.stringify(eventData);
+                                    if (eventStr.includes(targetAccountId)) {
+                                        affectsTargetAccount = true;
+                                        break;
+                                    }
+                                } catch (e) {
+                                    // Skip invalid JSON
+                                }
+                            }
+                        }
+                    }
+
+                    if (affectsTargetAccount && txHash && !matchingTxHashes.has(txHash)) {
+                        matchingTxHashes.add(txHash);
+                    }
+                }
+            }
+
+            if (matchingTxHashes.size > 0) {
+                // Fetch full transaction details for each matching tx
+                const fetchedTransactions: any[] = [];
+                
+                for (const shard of neardataBlock.shards || []) {
+                    for (const receiptExecution of shard.receipt_execution_outcomes || []) {
+                        const txHash = receiptExecution.tx_hash;
+                        const signerId = receiptExecution.receipt?.receipt?.Action?.signer_id;
+
+                        if (matchingTxHashes.has(txHash) && signerId && 
+                            !fetchedTransactions.find(t => t.hash === txHash)) {
+                            try {
+                                const txResult = await getTransactionStatusWithReceipts(txHash, signerId);
+
+                                if (txResult?.transaction) {
+                                    const txInfo = txResult.transaction;
+                                    fetchedTransactions.push({
+                                        hash: txHash,
+                                        signerId: txInfo.signer_id,
+                                        receiverId: txInfo.receiver_id,
+                                        actions: txInfo.actions || []
+                                    });
+                                }
+                            } catch (error: any) {
+                                console.error(`Error fetching transaction ${txHash}:`, error.message);
+                            }
+                        }
+                    }
+                }
+
+                return {
+                    transactions: fetchedTransactions,
+                    transactionHashes: Array.from(matchingTxHashes),
+                    transactionBlock: balanceChangeBlock,
+                    receiptBlock: balanceChangeBlock,
+                    blockTimestamp: blockTimestamp || null,
+                    transfers
+                };
+            }
+        }
+
+        // Fallback to standard RPC if neardata.xyz fails
         const blockData: RpcBlockResponse = await fetchBlockData(balanceChangeBlock);
         const blockTimestamp = blockData.header?.timestamp;
 
+        // With standard RPC, we can only get basic block data without logs
+        // Try to find receipts mentioning the target account
         const matchingTxHashes = new Set<string>();
-        const transactions: any[] = [];
 
-        // Check all shards for receipt execution outcomes
-        for (const shard of blockData.chunks || []) {
-            for (const receiptOutcome of (shard as any).receipt_execution_outcomes || []) {
-                const receipt = receiptOutcome.receipt;
-                const executionOutcome = receiptOutcome.execution_outcome;
-                const txHash = receiptOutcome.tx_hash;
-
-                const receiverId = receipt.receiver_id;
-                const predecessorId = receipt.predecessor_id;
-                const logs = executionOutcome?.outcome?.logs || [];
-
-                let affectsTargetAccount = false;
-
-                if (receiverId === targetAccountId || predecessorId === targetAccountId) {
-                    affectsTargetAccount = true;
-                }
-
-                // Check receipt logs for EVENT_JSON entries mentioning the account
-                if (!affectsTargetAccount) {
-                    for (const log of logs) {
-                        if (log.startsWith('EVENT_JSON:')) {
-                            try {
-                                const eventData = JSON.parse(log.substring('EVENT_JSON:'.length));
-                                const eventStr = JSON.stringify(eventData);
-                                if (eventStr.includes(targetAccountId)) {
-                                    affectsTargetAccount = true;
-                                    break;
-                                }
-                            } catch (e) {
-                                // Skip invalid JSON
-                            }
-                        }
-                    }
-                }
-
-                if (affectsTargetAccount && txHash && !matchingTxHashes.has(txHash)) {
-                    matchingTxHashes.add(txHash);
-
-                    for (const txShard of blockData.chunks || []) {
-                        for (const tx of (txShard as any).transactions || []) {
-                            if (tx.hash === txHash) {
-                                transactions.push(tx);
-                                break;
-                            }
-                        }
+        for (const chunk of blockData.chunks || []) {
+            for (const receipt of (chunk as any).receipts || []) {
+                const receiptStr = JSON.stringify(receipt);
+                if (receiptStr.includes(targetAccountId)) {
+                    const signerId = receipt.receipt?.Action?.signerId;
+                    if (signerId) {
+                        // We found a receipt but don't have the tx_hash from standard RPC
+                        // We'd need to use tx status to get more info
                     }
                 }
             }
         }
 
-        if (transactions.length > 0 || matchingTxHashes.size > 0) {
-            const fetchedTransactions: any[] = [];
-
-            for (const shard of blockData.chunks || []) {
-                for (const receiptOutcome of (shard as any).receipt_execution_outcomes || []) {
-                    const txHash = receiptOutcome.tx_hash;
-                    const receipt = receiptOutcome.receipt;
-
-                    if (matchingTxHashes.has(txHash) && receipt.Action?.signer_id) {
-                        const signerId = receipt.Action.signer_id;
-
-                        try {
-                            const txResult = await getTransactionStatusWithReceipts(txHash, signerId);
-
-                            if (txResult?.transaction) {
-                                const txInfo = txResult.transaction;
-                                fetchedTransactions.push({
-                                    hash: txHash,
-                                    signerId: txInfo.signer_id,
-                                    receiverId: txInfo.receiver_id,
-                                    actions: txInfo.actions || []
-                                });
-                            }
-                        } catch (error: any) {
-                            console.error(`Error fetching transaction ${txHash}:`, error.message);
-                        }
-                    }
-                }
-            }
-
-            return {
-                transactions: fetchedTransactions.length > 0 ? fetchedTransactions : transactions,
-                transactionHashes: Array.from(matchingTxHashes),
-                transactionBlock: balanceChangeBlock,
-                receiptBlock: balanceChangeBlock,
-                blockTimestamp: blockTimestamp || null
-            };
-        }
+        return {
+            transactions: [],
+            transactionHashes: Array.from(matchingTxHashes),
+            transactionBlock: matchingTxHashes.size > 0 ? balanceChangeBlock : null,
+            receiptBlock: balanceChangeBlock,
+            blockTimestamp: blockTimestamp || null,
+            transfers
+        };
     } catch (error: any) {
         console.error(`Error fetching block data:`, error.message);
     }
@@ -568,7 +833,8 @@ export async function findBalanceChangingTransaction(
         transactionHashes: [],
         transactionBlock: null,
         receiptBlock: balanceChangeBlock,
-        blockTimestamp: null
+        blockTimestamp: null,
+        transfers
     };
 }
 

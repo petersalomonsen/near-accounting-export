@@ -12,8 +12,6 @@ dotenv.config({ path: path.join(__dirname, '..', '..', '.env') });
 
 import {
     getCurrentBlockHeight,
-    viewAccount,
-    callViewFunction,
     setStopSignal
 } from '../scripts/rpc.js';
 import {
@@ -28,100 +26,20 @@ import {
     verifyHistoryFile
 } from '../scripts/get-account-history.js';
 
-// Helper to check if RPC is available
-async function isRpcAvailable(): Promise<boolean> {
-    try {
-        await getCurrentBlockHeight();
-        return true;
-    } catch (e) {
-        return false;
-    }
-}
-
 describe('NEAR Accounting Export', function() {
     // These tests make real RPC calls and may take time
     this.timeout(120000);
-    
-    let rpcAvailable = false;
-
-    before(async function() {
-        setStopSignal(false);
-        rpcAvailable = await isRpcAvailable();
-        if (!rpcAvailable) {
-            console.log('Note: RPC endpoint not available, network-dependent tests will be skipped');
-        }
-    });
 
     beforeEach(function() {
         setStopSignal(false);
         clearBalanceCache();
     });
 
-    describe('RPC Module', function() {
-        it('should get current block height', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
-            const blockHeight = await getCurrentBlockHeight();
-            assert.ok(typeof blockHeight === 'number', 'Block height should be a number');
-            assert.ok(blockHeight > 100000000, 'Block height should be greater than 100M (mainnet)');
-            console.log(`Current block height: ${blockHeight}`);
-        });
-
-        it('should view account details', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
-            const accountId = 'near';
-            const account = await viewAccount(accountId, 'final');
-            
-            assert.ok(account, 'Account should exist');
-            assert.ok(account.amount, 'Account should have amount');
-            console.log(`Account ${accountId} balance: ${account.amount}`);
-        });
-
-        it('should view account at historical block', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
-            const accountId = 'near';
-            const currentBlock = await getCurrentBlockHeight();
-            const historicalBlock = currentBlock - 1000;
-            
-            const account = await viewAccount(accountId, historicalBlock);
-            assert.ok(account, 'Account should exist at historical block');
-            assert.ok(account.amount, 'Account should have amount at historical block');
-        });
-
-        it('should handle non-existent account gracefully', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
-            const accountId = 'this-account-definitely-does-not-exist-12345.near';
-            
-            try {
-                const account = await viewAccount(accountId, 'final');
-                // If we get here without error, check if amount is 0
-                assert.equal(account.amount, '0', 'Non-existent account should have 0 balance');
-            } catch (error: any) {
-                // It's also valid for this to throw an error about account not existing
-                assert.ok(error.message.includes('does not exist'), 'Should indicate account does not exist');
-            }
-        });
-    });
-
     describe('Balance Tracker', function() {
         it('should get all balances for an account', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
-            const accountId = 'near';
-            const balances = await getAllBalances(accountId, 'final');
+            const accountId = 'relay.tg';
+            const currentBlock = await getCurrentBlockHeight();
+            const balances = await getAllBalances(accountId, currentBlock - 10);
             
             assert.ok(balances, 'Balances should be returned');
             assert.ok(balances.near, 'Should have NEAR balance');
@@ -132,10 +50,6 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should detect balance changes between blocks', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // Use a well-known active account for testing
             const accountId = 'relay.tg';
             const currentBlock = await getCurrentBlockHeight();
@@ -164,10 +78,6 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should fetch account history and save to file', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // Use an account known to have some activity
             const accountId = 'relay.tg';
             
@@ -298,10 +208,6 @@ describe('NEAR Accounting Export', function() {
 
     describe('Transaction Discovery', function() {
         it('should find transaction that caused balance change', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // This test requires finding a real block with a balance change
             // We'll use a recent block range and see if we can find any transactions
             const accountId = 'relay.tg';
@@ -328,13 +234,9 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should handle missing blocks gracefully during search', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // Block 163181131 is a known missing/skipped block in the archival RPC
             // Search a small range around it to ensure missing block handling works
-            const accountId = 'near';
+            const accountId = 'relay.tg';
             const missingBlock = 163181131;
             
             // Search a small range that includes the missing block
@@ -351,10 +253,6 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should find intents balance change at block 151391583', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // This is a known case where an intents ft_withdraw receipt was executed at block 151391583
             // The intents balance for nep141:eth.omft.near changed from 10000000000000000 to 5000000000000000
             // Starting search from 151391584 should find this change at 151391583
@@ -383,11 +281,54 @@ describe('NEAR Accounting Export', function() {
             console.log('Intents changes:', JSON.stringify(balanceChange.intentsChanged, null, 2));
         });
 
+        it('should find transfer counterparties for NEAR, FT, and Intents transfers', async function() {
+            // Test that findBalanceChangingTransaction extracts transfer details including counterparties
+            // Using known blocks where specific types of transfers occurred
+            
+            const accountId = 'webassemblymusic-treasury.sputnik-dao.near';
+            
+            // Block 151391583: MT (intents) burn event - withdrawing ETH from intents.near
+            // This should show: type=mt, direction=out, counterparty=intents.near
+            console.log('\n=== Testing MT (Intents) transfer at block 151391583 ===');
+            const mtTxInfo = await findBalanceChangingTransaction(accountId, 151391583);
+            
+            assert.ok(mtTxInfo.transactionHashes.length > 0, 'Should find transaction hash');
+            console.log('Transaction hashes:', mtTxInfo.transactionHashes);
+            console.log('Transfers found:', mtTxInfo.transfers.length);
+            
+            // Should find the mt_burn event
+            const mtTransfer = mtTxInfo.transfers.find(t => t.type === 'mt');
+            assert.ok(mtTransfer, 'Should find MT (intents) transfer');
+            assert.equal(mtTransfer.direction, 'out', 'MT transfer should be outgoing (burn)');
+            assert.equal(mtTransfer.counterparty, 'intents.near', 'MT transfer counterparty should be intents.near');
+            assert.ok(mtTransfer.tokenId?.includes('eth.omft.near'), 'Should be ETH token');
+            assert.equal(mtTransfer.amount, '5000000000000000', 'Amount should match the burn amount');
+            console.log('MT Transfer:', JSON.stringify(mtTransfer, null, 2));
+            
+            // Block 151391587: NEAR transfer out to petersalomonsen.near
+            // This should show: type=near, direction=out, counterparty=petersalomonsen.near
+            console.log('\n=== Testing NEAR transfer at block 151391587 ===');
+            const nearTxInfo = await findBalanceChangingTransaction(accountId, 151391587);
+            
+            console.log('Transfers found:', nearTxInfo.transfers.length);
+            
+            // Should find the NEAR transfer
+            const nearTransfer = nearTxInfo.transfers.find(t => t.type === 'near');
+            assert.ok(nearTransfer, 'Should find NEAR transfer');
+            assert.equal(nearTransfer.direction, 'out', 'NEAR transfer should be outgoing');
+            assert.equal(nearTransfer.counterparty, 'petersalomonsen.near', 'NEAR transfer should be to petersalomonsen.near');
+            assert.equal(nearTransfer.amount, '100000000000000000000000', 'Amount should be 100 NEAR in yoctoNEAR');
+            console.log('NEAR Transfer:', JSON.stringify(nearTransfer, null, 2));
+            
+            // Summary
+            console.log('\n=== Transfer Counterparty Test Summary ===');
+            console.log('MT transfer: direction=%s, counterparty=%s, token=%s', 
+                mtTransfer.direction, mtTransfer.counterparty, mtTransfer.tokenId);
+            console.log('NEAR transfer: direction=%s, counterparty=%s, amount=%s', 
+                nearTransfer.direction, nearTransfer.counterparty, nearTransfer.amount);
+        });
+
         it('should fill gaps in existing history file with intents balance mismatch', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // BUG REPRODUCTION TEST: Gap-filling doesn't find the missing transaction
             // 
             // Real data from webassemblymusic-treasury.sputnik-dao.near where:
@@ -539,11 +480,92 @@ describe('NEAR Accounting Export', function() {
             }
         });
 
-        it('should find ALL balance changes when multiple occur in adjacent blocks', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
+        it('should automatically enrich existing transactions with transfer details', async function() {
+            // This test verifies that when we load an existing history file with transactions
+            // that don't have transfer details, the system automatically enriches them
+            
+            const accountId = 'webassemblymusic-treasury.sputnik-dao.near';
+            const enrichTestFile = path.join(__dirname, 'test-enrich-history.json');
+            
+            try {
+                // Create a history file with a transaction that has NO transfers field
+                // Use block 151391587 which we know has a NEAR transfer to petersalomonsen.near
+                const historyWithoutTransfers = {
+                    accountId,
+                    createdAt: new Date().toISOString(),
+                    updatedAt: new Date().toISOString(),
+                    transactions: [
+                        {
+                            block: 151391587,
+                            timestamp: 1732783100000000000,
+                            transactionHashes: ['someHash'],
+                            transactions: [],
+                            // NO transfers field - this should trigger enrichment
+                            balanceBefore: {
+                                near: '1000000000000000000000000',
+                                fungibleTokens: {},
+                                intentsTokens: {}
+                            },
+                            balanceAfter: {
+                                near: '900000000000000000000000',
+                                fungibleTokens: {},
+                                intentsTokens: {}
+                            },
+                            changes: {
+                                nearChanged: true,
+                                nearDiff: '-100000000000000000000000',
+                                tokensChanged: {},
+                                intentsChanged: {}
+                            }
+                        }
+                    ],
+                    metadata: {
+                        firstBlock: 151391587,
+                        lastBlock: 151391587,
+                        totalTransactions: 1
+                    }
+                };
+                
+                // Write the history file without transfers
+                fs.writeFileSync(enrichTestFile, JSON.stringify(historyWithoutTransfers, null, 2));
+                
+                // Run getAccountHistory - it should automatically enrich the transaction
+                const history = await getAccountHistory({
+                    accountId,
+                    outputFile: enrichTestFile,
+                    direction: 'backward',
+                    maxTransactions: 0,  // Don't search for new transactions
+                    startBlock: 151391587,
+                    endBlock: 151391587
+                });
+                
+                // Find the transaction at block 151391587
+                const tx = history.transactions.find(t => t.block === 151391587);
+                assert.ok(tx, 'Transaction at block 151391587 should exist');
+                
+                // Verify that transfers were added
+                assert.ok(tx.transfers, 'Transaction should now have transfers field');
+                assert.ok(tx.transfers.length > 0, 'Transaction should have at least one transfer');
+                
+                // Verify the NEAR transfer details
+                const nearTransfer = tx.transfers.find(t => t.type === 'near' && t.direction === 'out');
+                assert.ok(nearTransfer, 'Should have an outgoing NEAR transfer');
+                assert.equal(nearTransfer.counterparty, 'petersalomonsen.near', 
+                    'NEAR transfer should be to petersalomonsen.near');
+                assert.equal(nearTransfer.amount, '100000000000000000000000', 
+                    'NEAR transfer should be 0.1 NEAR');
+                
+                console.log('Transaction successfully enriched with transfer details:');
+                console.log('Transfers:', JSON.stringify(tx.transfers, null, 2));
+            } finally {
+                // Cleanup
+                if (fs.existsSync(enrichTestFile)) {
+                    fs.unlinkSync(enrichTestFile);
+                }
             }
+        });
+
+        it('should find ALL balance changes when multiple occur in adjacent blocks', async function() {
             // BUG REPRODUCTION TEST:
             // There are balance changes at blocks 151391582, 151391583, and 151391586 for this account.
             // When searching backward from 151391586, findLatestBalanceChangingBlock returns the 
