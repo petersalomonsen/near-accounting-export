@@ -20,7 +20,7 @@ import {
     getAllTransactionBlocks,
     isNearBlocksAvailable
 } from './nearblocks-api.js';
-import type { BalanceSnapshot, BalanceChanges, TransactionInfo } from './balance-tracker.js';
+import type { BalanceSnapshot, BalanceChanges, TransactionInfo, TransferDetail } from './balance-tracker.js';
 import type { TransactionBlock } from './nearblocks-api.js';
 
 // Types
@@ -42,6 +42,7 @@ interface TransactionEntry {
     timestamp: number | null;
     transactionHashes: string[];
     transactions: any[];
+    transfers?: TransferDetail[];  // Detailed transfer information with counterparties
     balanceBefore?: BalanceSnapshot;
     balanceAfter?: BalanceSnapshot;
     changes: {
@@ -355,6 +356,7 @@ async function fillGaps(
                 timestamp: txInfo.blockTimestamp,
                 transactionHashes: txInfo.transactionHashes,
                 transactions: txInfo.transactions,
+                transfers: txInfo.transfers,
                 balanceBefore: balanceChange.startBalance,
                 balanceAfter: balanceChange.endBalance,
                 changes: {
@@ -407,6 +409,66 @@ async function fillGaps(
 }
 
 /**
+ * Enrich existing transactions with transfer details if missing
+ * This fetches transfer counterparty information for transactions that don't have it
+ */
+async function enrichTransactionsWithTransfers(
+    history: AccountHistory,
+    outputFile: string,
+    maxToEnrich: number = 50
+): Promise<number> {
+    // Find transactions without transfer details
+    const transactionsToEnrich = history.transactions.filter(tx => !tx.transfers);
+    
+    if (transactionsToEnrich.length === 0) {
+        return 0;
+    }
+    
+    console.log(`\nFound ${transactionsToEnrich.length} transaction(s) without transfer details`);
+    
+    let enriched = 0;
+    for (const tx of transactionsToEnrich) {
+        if (enriched >= maxToEnrich) {
+            console.log(`Reached max enrichment limit (${maxToEnrich})`);
+            break;
+        }
+        
+        if (getStopSignal()) {
+            break;
+        }
+        
+        try {
+            console.log(`Enriching transaction at block ${tx.block}...`);
+            const txInfo = await findBalanceChangingTransaction(history.accountId, tx.block);
+            
+            if (txInfo && txInfo.transfers) {
+                tx.transfers = txInfo.transfers;
+                enriched++;
+                
+                // Save progress every 5 enrichments
+                if (enriched % 5 === 0) {
+                    history.updatedAt = new Date().toISOString();
+                    saveHistory(outputFile, history);
+                }
+            }
+        } catch (error: any) {
+            if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                console.log(`Error during enrichment: ${error.message}`);
+                break;
+            }
+            console.log(`Warning: Could not enrich transaction at block ${tx.block}: ${error.message}`);
+        }
+    }
+    
+    if (enriched > 0) {
+        history.updatedAt = new Date().toISOString();
+        saveHistory(outputFile, history);
+    }
+    
+    return enriched;
+}
+
+/**
  * Update verification fields on all transactions after sorting
  */
 function updateVerificationFields(history: AccountHistory): void {
@@ -442,7 +504,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         endBlock
     } = options;
     
-    let maxTransactions = options.maxTransactions || 100;
+    let maxTransactions = options.maxTransactions ?? 100;  // Use ?? to allow 0
 
     console.log(`\n=== Getting accounting history for ${accountId} ===`);
     console.log(`Direction: ${direction}`);
@@ -481,6 +543,18 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             // Even if no gaps were filled, update verification fields to fix any stale data
             updateVerificationFields(history);
             saveHistory(outputFile, history);
+        }
+        
+        // Enrich existing transactions with transfer details if missing
+        // Note: Enrichment doesn't count against maxTransactions since it doesn't add new transactions
+        const enriched = await enrichTransactionsWithTransfers(history, outputFile, 50);
+        if (enriched > 0) {
+            console.log(`\nEnriched ${enriched} transaction(s) with transfer details`);
+        }
+        
+        // Early return if maxTransactions was 0 (user only wanted enrichment/gap fill)
+        if (maxTransactions === 0) {
+            return history;
         }
     }
 
@@ -565,6 +639,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                         timestamp: txInfo.blockTimestamp,
                         transactionHashes: txInfo.transactionHashes,
                         transactions: txInfo.transactions,
+                        transfers: txInfo.transfers,
                         balanceBefore: balanceChange.startBalance,
                         balanceAfter: balanceChange.endBalance,
                         changes: {
@@ -795,6 +870,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             timestamp: txInfo.blockTimestamp,
             transactionHashes: txInfo.transactionHashes,
             transactions: txInfo.transactions,
+            transfers: txInfo.transfers,
             balanceBefore: balanceChange.startBalance,
             balanceAfter: balanceChange.endBalance,
             changes: {
@@ -831,6 +907,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                                     timestamp: immTxInfo.blockTimestamp,
                                     transactionHashes: immTxInfo.transactionHashes,
                                     transactions: immTxInfo.transactions,
+                                    transfers: immTxInfo.transfers,
                                     balanceBefore: immediateChange.startBalance,
                                     balanceAfter: immediateChange.endBalance,
                                     changes: {
@@ -870,6 +947,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                                         timestamp: gapTxInfo.blockTimestamp,
                                         transactionHashes: gapTxInfo.transactionHashes,
                                         transactions: gapTxInfo.transactions,
+                                        transfers: gapTxInfo.transfers,
                                         balanceBefore: gapChange.startBalance,
                                         balanceAfter: gapChange.endBalance,
                                         changes: {

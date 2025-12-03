@@ -1,6 +1,6 @@
 // RPC helper module for NEAR blockchain interactions using @near-js/jsonrpc-client
 
-import { NearRpcClient, query, block as getBlock } from '@near-js/jsonrpc-client';
+import { NearRpcClient, query, block as getBlock, chunk as getChunk } from '@near-js/jsonrpc-client';
 import type { 
     AccountView, 
     CallResult,
@@ -8,6 +8,7 @@ import type {
 } from '@near-js/jsonrpc-types';
 
 const DEFAULT_RPC_ENDPOINT = 'https://archival-rpc.mainnet.fastnear.com';
+const NEARDATA_ENDPOINT = 'https://a2.mainnet.neardata.xyz/v0';
 const RPC_DELAY_MS = parseInt(process.env.RPC_DELAY_MS || '50', 10);
 
 /**
@@ -289,7 +290,7 @@ export async function callViewFunction(
 }
 
 /**
- * Fetch detailed block data including receipts
+ * Fetch detailed block data including receipts from all chunks
  */
 export async function fetchBlockData(blockHeight: number): Promise<RpcBlockResponse> {
     if (stopSignal) {
@@ -302,9 +303,30 @@ export async function fetchBlockData(blockHeight: number): Promise<RpcBlockRespo
 
     for (let attempt = 0; attempt < 5; attempt++) {
         try {
-            return await wrapRpcCall(() =>
+            const blockData = await wrapRpcCall(() =>
                 getBlock(getClient(), { blockId: currentBlock })
             );
+            
+            // Fetch full chunk data for each chunk to get receipt_execution_outcomes
+            const chunksWithReceipts: any[] = [];
+            for (const chunkHeader of blockData.chunks || []) {
+                try {
+                    const fullChunk = await wrapRpcCall(() =>
+                        getChunk(getClient(), { chunkId: chunkHeader.chunkHash })
+                    );
+                    chunksWithReceipts.push(fullChunk);
+                } catch (chunkError: any) {
+                    // If we can't fetch a chunk, include the header-only version
+                    console.warn(`Could not fetch chunk ${chunkHeader.chunkHash}: ${chunkError.message}`);
+                    chunksWithReceipts.push(chunkHeader);
+                }
+            }
+            
+            // Replace chunks with full chunk data
+            return {
+                ...blockData,
+                chunks: chunksWithReceipts
+            };
         } catch (error: any) {
             lastError = error;
             if (isUnknownBlockError(error) || error.message?.includes('500') || error.message?.includes('Server error')) {
@@ -317,6 +339,98 @@ export async function fetchBlockData(blockHeight: number): Promise<RpcBlockRespo
     }
 
     throw lastError || new Error(`Failed to fetch block data after 5 attempts`);
+}
+
+/**
+ * Receipt execution outcome from neardata.xyz API
+ */
+export interface ReceiptExecutionOutcome {
+    execution_outcome: {
+        id: string;
+        outcome: {
+            logs: string[];
+            receipt_ids: string[];
+            gas_burnt: number;
+            tokens_burnt: string;
+            executor_id: string;
+            status: { SuccessValue?: string; Failure?: any };
+        };
+        block_hash: string;
+    };
+    receipt: {
+        predecessor_id: string;
+        receiver_id: string;
+        receipt_id: string;
+        receipt: {
+            Action?: {
+                signer_id: string;
+                signer_public_key: string;
+                gas_price: string;
+                output_data_receivers: any[];
+                input_data_ids: string[];
+                actions: any[];
+            };
+        };
+        priority: number;
+    };
+    tx_hash: string;
+}
+
+/**
+ * Shard data from neardata.xyz API
+ */
+export interface NeardataShard {
+    shard_id: number;
+    chunk?: any;
+    receipt_execution_outcomes: ReceiptExecutionOutcome[];
+    state_changes: any[];
+}
+
+/**
+ * Complete block data from neardata.xyz API
+ */
+export interface NeardataBlockResponse {
+    block: {
+        author: string;
+        header: {
+            height: number;
+            prev_height: number;
+            epoch_id: string;
+            hash: string;
+            prev_hash: string;
+            timestamp: number;
+        };
+    };
+    shards: NeardataShard[];
+}
+
+/**
+ * Fetch complete block data from neardata.xyz API
+ * This provides execution outcomes with logs, which are not available from the standard RPC
+ */
+export async function fetchNeardataBlock(blockHeight: number): Promise<NeardataBlockResponse | null> {
+    if (stopSignal) {
+        throw new Error('Operation cancelled by user');
+    }
+
+    try {
+        await delay(RPC_DELAY_MS);
+        const response = await fetch(`${NEARDATA_ENDPOINT}/block/${blockHeight}`);
+        
+        if (!response.ok) {
+            if (response.status === 404) {
+                // Block not found - may be a skipped block
+                return null;
+            }
+            throw new Error(`HTTP error ${response.status}`);
+        }
+        
+        return await response.json() as NeardataBlockResponse;
+    } catch (error: any) {
+        checkRateLimitError(error);
+        console.warn(`Failed to fetch block ${blockHeight} from neardata.xyz: ${error.message}`);
+        return null;
+    }
 }
 
 /**
