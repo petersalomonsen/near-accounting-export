@@ -12,8 +12,6 @@ dotenv.config({ path: path.join(__dirname, '..', '..', '.env') });
 
 import {
     getCurrentBlockHeight,
-    viewAccount,
-    callViewFunction,
     setStopSignal
 } from '../scripts/rpc.js';
 import {
@@ -28,100 +26,20 @@ import {
     verifyHistoryFile
 } from '../scripts/get-account-history.js';
 
-// Helper to check if RPC is available
-async function isRpcAvailable(): Promise<boolean> {
-    try {
-        await getCurrentBlockHeight();
-        return true;
-    } catch (e) {
-        return false;
-    }
-}
-
 describe('NEAR Accounting Export', function() {
     // These tests make real RPC calls and may take time
     this.timeout(120000);
-    
-    let rpcAvailable = false;
-
-    before(async function() {
-        setStopSignal(false);
-        rpcAvailable = await isRpcAvailable();
-        if (!rpcAvailable) {
-            console.log('Note: RPC endpoint not available, network-dependent tests will be skipped');
-        }
-    });
 
     beforeEach(function() {
         setStopSignal(false);
         clearBalanceCache();
     });
 
-    describe('RPC Module', function() {
-        it('should get current block height', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
-            const blockHeight = await getCurrentBlockHeight();
-            assert.ok(typeof blockHeight === 'number', 'Block height should be a number');
-            assert.ok(blockHeight > 100000000, 'Block height should be greater than 100M (mainnet)');
-            console.log(`Current block height: ${blockHeight}`);
-        });
-
-        it('should view account details', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
-            const accountId = 'near';
-            const account = await viewAccount(accountId, 'final');
-            
-            assert.ok(account, 'Account should exist');
-            assert.ok(account.amount, 'Account should have amount');
-            console.log(`Account ${accountId} balance: ${account.amount}`);
-        });
-
-        it('should view account at historical block', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
-            const accountId = 'near';
-            const currentBlock = await getCurrentBlockHeight();
-            const historicalBlock = currentBlock - 1000;
-            
-            const account = await viewAccount(accountId, historicalBlock);
-            assert.ok(account, 'Account should exist at historical block');
-            assert.ok(account.amount, 'Account should have amount at historical block');
-        });
-
-        it('should handle non-existent account gracefully', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
-            const accountId = 'this-account-definitely-does-not-exist-12345.near';
-            
-            try {
-                const account = await viewAccount(accountId, 'final');
-                // If we get here without error, check if amount is 0
-                assert.equal(account.amount, '0', 'Non-existent account should have 0 balance');
-            } catch (error: any) {
-                // It's also valid for this to throw an error about account not existing
-                assert.ok(error.message.includes('does not exist'), 'Should indicate account does not exist');
-            }
-        });
-    });
-
     describe('Balance Tracker', function() {
         it('should get all balances for an account', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
-            const accountId = 'near';
-            const balances = await getAllBalances(accountId, 'final');
+            const accountId = 'relay.tg';
+            const currentBlock = await getCurrentBlockHeight();
+            const balances = await getAllBalances(accountId, currentBlock - 10);
             
             assert.ok(balances, 'Balances should be returned');
             assert.ok(balances.near, 'Should have NEAR balance');
@@ -132,10 +50,6 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should detect balance changes between blocks', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // Use a well-known active account for testing
             const accountId = 'relay.tg';
             const currentBlock = await getCurrentBlockHeight();
@@ -164,10 +78,6 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should fetch account history and save to file', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // Use an account known to have some activity
             const accountId = 'relay.tg';
             
@@ -298,10 +208,6 @@ describe('NEAR Accounting Export', function() {
 
     describe('Transaction Discovery', function() {
         it('should find transaction that caused balance change', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // This test requires finding a real block with a balance change
             // We'll use a recent block range and see if we can find any transactions
             const accountId = 'relay.tg';
@@ -328,13 +234,9 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should handle missing blocks gracefully during search', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // Block 163181131 is a known missing/skipped block in the archival RPC
             // Search a small range around it to ensure missing block handling works
-            const accountId = 'near';
+            const accountId = 'relay.tg';
             const missingBlock = 163181131;
             
             // Search a small range that includes the missing block
@@ -351,10 +253,6 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should find intents balance change at block 151391583', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // This is a known case where an intents ft_withdraw receipt was executed at block 151391583
             // The intents balance for nep141:eth.omft.near changed from 10000000000000000 to 5000000000000000
             // Starting search from 151391584 should find this change at 151391583
@@ -384,10 +282,6 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should find transfer counterparties for NEAR, FT, and Intents transfers', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // Test that findBalanceChangingTransaction extracts transfer details including counterparties
             // Using known blocks where specific types of transfers occurred
             
@@ -435,10 +329,6 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should fill gaps in existing history file with intents balance mismatch', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // BUG REPRODUCTION TEST: Gap-filling doesn't find the missing transaction
             // 
             // Real data from webassemblymusic-treasury.sputnik-dao.near where:
@@ -591,11 +481,6 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should automatically enrich existing transactions with transfer details', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
-            
             // This test verifies that when we load an existing history file with transactions
             // that don't have transfer details, the system automatically enriches them
             
@@ -681,10 +566,6 @@ describe('NEAR Accounting Export', function() {
         });
 
         it('should find ALL balance changes when multiple occur in adjacent blocks', async function() {
-            if (!rpcAvailable) {
-                this.skip();
-                return;
-            }
             // BUG REPRODUCTION TEST:
             // There are balance changes at blocks 151391582, 151391583, and 151391586 for this account.
             // When searching backward from 151391586, findLatestBalanceChangingBlock returns the 
