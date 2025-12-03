@@ -11,6 +11,7 @@
     "build": "tsc",
     "prebuild": "rm -rf dist",
     "start": "npm run build && node dist/scripts/get-account-history.js",
+    "json-to-csv": "npm run build && node dist/scripts/json-to-csv.js",
     "test": "npm run build && mocha --timeout 60000 dist/test/**/*.test.js",
     "dev": "tsx scripts/get-account-history.ts"
   },
