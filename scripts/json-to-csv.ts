@@ -4,6 +4,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 // Types matching the data structures from get-account-history.ts
 interface TransferDetail {
@@ -322,14 +323,15 @@ function main(): void {
 
         console.log(`CSV exported to: ${options.outputFile}`);
         console.log(`Total rows: ${rows.length}`);
-    } catch (error: any) {
-        console.error(`Error: ${error.message}`);
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Error: ${message}`);
         process.exit(1);
     }
 }
 
 // Run if called directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.url.startsWith('file:') && process.argv[1] === fileURLToPath(import.meta.url)) {
     main();
 }
 

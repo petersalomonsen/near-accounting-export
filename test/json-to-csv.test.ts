@@ -1,4 +1,6 @@
-// Test case for the JSON to CSV converter
+/**
+ * Test suite for the JSON to CSV converter functionality
+ */
 import { strict as assert } from 'assert';
 import fs from 'fs';
 import path from 'path';
