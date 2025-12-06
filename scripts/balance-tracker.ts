@@ -684,30 +684,52 @@ export async function findBalanceChangingTransaction(
                     if (receiverId === targetAccountId || predecessorId === targetAccountId) {
                         affectsTargetAccount = true;
                         
-                        // Check for NEAR transfer action
+                        // Check for NEAR transfer actions and other actions with deposits
                         const actions = receipt?.receipt?.Action?.actions || [];
                         for (const action of actions) {
-                            if (action.Transfer) {
-                                const amount = action.Transfer.deposit;
-                                if (receiverId === targetAccountId) {
-                                    transfers.push({
-                                        type: 'near',
-                                        direction: 'in',
-                                        amount: String(amount),
-                                        counterparty: predecessorId,
-                                        txHash,
-                                        receiptId
-                                    });
-                                } else if (predecessorId === targetAccountId) {
-                                    transfers.push({
-                                        type: 'near',
-                                        direction: 'out',
-                                        amount: String(amount),
-                                        counterparty: receiverId,
-                                        txHash,
-                                        receiptId
-                                    });
+                            // Helper to record a NEAR transfer
+                            const recordNearTransfer = (amount: string | bigint, memo?: string) => {
+                                const amountBigInt = typeof amount === 'bigint' ? amount : BigInt(amount);
+                                if (amountBigInt > 0n) {
+                                    if (predecessorId === targetAccountId) {
+                                        transfers.push({
+                                            type: 'near',
+                                            direction: 'out',
+                                            amount: String(amountBigInt),
+                                            counterparty: receiverId,
+                                            memo,
+                                            txHash,
+                                            receiptId
+                                        });
+                                    } else if (receiverId === targetAccountId) {
+                                        transfers.push({
+                                            type: 'near',
+                                            direction: 'in',
+                                            amount: String(amountBigInt),
+                                            counterparty: predecessorId,
+                                            memo,
+                                            txHash,
+                                            receiptId
+                                        });
+                                    }
                                 }
+                            };
+
+                            // Transfer action
+                            if (action.Transfer?.deposit) {
+                                recordNearTransfer(action.Transfer.deposit);
+                            }
+                            // FunctionCall action with attached deposit
+                            if (action.FunctionCall?.deposit) {
+                                recordNearTransfer(action.FunctionCall.deposit, action.FunctionCall.method_name);
+                            }
+                            // Stake action - locks NEAR as stake
+                            if (action.Stake?.stake) {
+                                recordNearTransfer(action.Stake.stake, 'stake');
+                            }
+                            // TransferToGasKey action
+                            if (action.TransferToGasKey?.deposit) {
+                                recordNearTransfer(action.TransferToGasKey.deposit, 'transfer_to_gas_key');
                             }
                         }
                     }
