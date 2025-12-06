@@ -2,7 +2,7 @@
 // Tests the cross-contract call scenario where balance changes at a different block than receipt execution
 import { strict as assert } from 'assert';
 import { describe, it } from 'mocha';
-import { findBalanceChangingTransaction, getAllBalances } from '../scripts/balance-tracker.js';
+import { findBalanceChangingTransaction, getAllBalances, getStakingPoolBalances, findStakingBalanceChanges } from '../scripts/balance-tracker.js';
 
 describe('Staking Balance Tracking', () => {
     /**
@@ -101,6 +101,67 @@ describe('Staking Balance Tracking', () => {
                 txInfo.transactionHashes.includes('7oSsqUsFmrQsQcomd6Tk5V4SghLdZ4FHW9ceFpGGXimU'),
                 'Should include the act_proposal transaction hash'
             );
+        });
+    });
+
+    describe('Staking pool balance queries', () => {
+        it('should get staking pool balance at specific block', async () => {
+            // After the staking transaction at block 161048665, the account should have ~1000 NEAR staked
+            const balances = await getStakingPoolBalances(
+                'webassemblymusic-treasury.sputnik-dao.near',
+                161048665,
+                ['astro-stakers.poolv1.near']
+            );
+
+            console.log('Staking pool balances at 161048665:', balances);
+
+            // Should have ~1000 NEAR staked (1000000000000000000000000000 yoctoNEAR)
+            const stakedBalance = BigInt(balances['astro-stakers.poolv1.near'] || '0');
+            assert.ok(stakedBalance >= BigInt('999000000000000000000000000'), 'Should have >= 999 NEAR staked');
+            assert.ok(stakedBalance <= BigInt('1001000000000000000000000000'), 'Should have <= 1001 NEAR staked');
+        });
+
+        it('should return 0 for pool with no stake', async () => {
+            const balances = await getStakingPoolBalances(
+                'webassemblymusic-treasury.sputnik-dao.near',
+                161048660, // Before the staking transaction
+                ['astro-stakers.poolv1.near']
+            );
+
+            console.log('Staking pool balances at 161048660 (before staking):', balances);
+
+            // Should have 0 staked before the transaction
+            assert.equal(balances['astro-stakers.poolv1.near'], '0');
+        });
+
+        it('should find staking balance changes at epoch boundaries', async () => {
+            // Test a range that spans at least one epoch after staking
+            // Block 161048665 is when staking happened
+            // Epoch length is 43200 blocks, so next epoch boundary after 161048665
+            // is at 161049600 (161049600 / 43200 = 3727.5... -> next is 3728 * 43200 = 161049600)
+            
+            // Let's check a smaller range first - just detect the initial stake
+            const startBlock = 161048660; // Before staking
+            const endBlock = 161048670; // After staking
+            
+            const changes = await findStakingBalanceChanges(
+                'webassemblymusic-treasury.sputnik-dao.near',
+                startBlock,
+                endBlock,
+                ['astro-stakers.poolv1.near']
+            );
+
+            console.log('Staking changes between', startBlock, 'and', endBlock, ':', changes);
+
+            // Should detect the stake at the end of range (since there's no epoch boundary in between)
+            assert.ok(changes.length > 0, 'Should find at least one staking change');
+            
+            const stakingChange = changes.find(c => c.pool === 'astro-stakers.poolv1.near');
+            assert.ok(stakingChange, 'Should have change for astro-stakers.poolv1.near');
+            
+            // Start balance should be 0, end balance should be ~1000 NEAR
+            assert.equal(stakingChange!.startBalance, '0');
+            assert.ok(BigInt(stakingChange!.endBalance) > BigInt('999000000000000000000000000'));
         });
     });
 });
