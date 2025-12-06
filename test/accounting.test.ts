@@ -328,6 +328,36 @@ describe('NEAR Accounting Export', function() {
                 nearTransfer.direction, nearTransfer.counterparty, nearTransfer.amount);
         });
 
+        it('should track FunctionCall actions with attached deposits', async function() {
+            // Test that FunctionCall actions with deposits are tracked as NEAR transfers
+            // Using a known staking transaction: deposit_and_stake to astro-stakers.poolv1.near
+            // Transaction: 7oSsqUsFmrQsQcomd6Tk5V4SghLdZ4FHW9ceFpGGXimU
+            // The FunctionCall receipt executes at block 161048665
+            
+            const accountId = 'webassemblymusic-treasury.sputnik-dao.near';
+            
+            console.log('\n=== Testing FunctionCall with deposit at block 161048665 ===');
+            const txInfo = await findBalanceChangingTransaction(accountId, 161048665);
+            
+            console.log('Transaction hashes:', txInfo.transactionHashes);
+            console.log('Transfers found:', txInfo.transfers.length);
+            console.log('All transfers:', JSON.stringify(txInfo.transfers, null, 2));
+            
+            // Should find the staking deposit as a NEAR transfer
+            const stakingTransfer = txInfo.transfers.find(t => 
+                t.type === 'near' && 
+                t.counterparty === 'astro-stakers.poolv1.near'
+            );
+            
+            assert.ok(stakingTransfer, 'Should find NEAR transfer to staking pool');
+            assert.equal(stakingTransfer.direction, 'out', 'Staking should be outgoing');
+            assert.equal(stakingTransfer.counterparty, 'astro-stakers.poolv1.near', 'Should be to staking pool');
+            assert.equal(stakingTransfer.amount, '1000000000000000000000000000', 'Amount should be 1000 NEAR');
+            assert.equal(stakingTransfer.memo, 'deposit_and_stake', 'Memo should be the method name');
+            
+            console.log('Staking Transfer:', JSON.stringify(stakingTransfer, null, 2));
+        });
+
         it('should fill gaps in existing history file with intents balance mismatch', async function() {
             // BUG REPRODUCTION TEST: Gap-filling doesn't find the missing transaction
             // 

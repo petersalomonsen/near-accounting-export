@@ -8,7 +8,7 @@ import { fileURLToPath } from 'url';
 
 // Types matching the data structures from get-account-history.ts
 interface TransferDetail {
-    type: 'near' | 'ft' | 'mt';
+    type: 'near' | 'ft' | 'mt' | 'staking_reward';
     direction: 'in' | 'out';
     amount: string;
     counterparty: string;
@@ -22,6 +22,7 @@ interface BalanceSnapshot {
     near: string;
     fungibleTokens: Record<string, string>;
     intentsTokens: Record<string, string>;
+    stakingPools?: Record<string, string>;
 }
 
 interface TransactionEntry {
@@ -93,6 +94,9 @@ function getAssetName(transfer: TransferDetail): string {
     if (transfer.type === 'near') {
         return 'NEAR';
     }
+    if (transfer.type === 'staking_reward') {
+        return `STAKING:${transfer.tokenId || transfer.counterparty}`;
+    }
     // For FT and MT transfers, use the tokenId
     return transfer.tokenId || 'unknown';
 }
@@ -115,6 +119,10 @@ function getTokenBalance(transfer: TransferDetail, balanceAfter: BalanceSnapshot
 
     if (transfer.type === 'mt' && transfer.tokenId) {
         return balanceAfter.intentsTokens?.[transfer.tokenId] || '0';
+    }
+
+    if (transfer.type === 'staking_reward' && transfer.tokenId) {
+        return balanceAfter.stakingPools?.[transfer.tokenId] || '0';
     }
 
     return '';
