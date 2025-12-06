@@ -420,10 +420,20 @@ async function enrichTransactionsWithTransfers(
     outputFile: string,
     maxToEnrich: number = 50
 ): Promise<number> {
-    // Find transactions without transfer details
-    const transactionsToEnrich = history.transactions.filter(tx => !tx.transfers);
+    // Find transactions without transfer details or with empty transfers array
+    // Only enrich transactions that have balance changes (otherwise there's nothing to find)
+    const transactionsToEnrich = history.transactions.filter(tx => {
+        const hasNoTransfers = !tx.transfers || tx.transfers.length === 0;
+        const hasBalanceChanges = tx.changes && (
+            tx.changes.nearChanged ||
+            Object.keys(tx.changes.tokensChanged || {}).length > 0 ||
+            Object.keys(tx.changes.intentsChanged || {}).length > 0
+        );
+        return hasNoTransfers && hasBalanceChanges;
+    });
     
     if (transactionsToEnrich.length === 0) {
+        console.log('All transactions with balance changes already have transfer details');
         return 0;
     }
     
@@ -1246,7 +1256,7 @@ Options:
   --end-block <number>    Ending block height
   -v, --verify            Verify an existing history file
   --fill-gaps-only        Only fill gaps in existing history, don't search for new transactions
-  --enrich                Enrich existing history with missing timestamps
+  --enrich                Enrich existing history with missing timestamps and transfer details
   -h, --help              Show this help message
 
 Environment Variables:
@@ -1360,9 +1370,15 @@ async function main(): Promise<void> {
         });
         
         try {
-            const enriched = await enrichTimestamps(history, options.outputFile);
+            const timestampsAdded = await enrichTimestamps(history, options.outputFile);
+            console.log(`Total timestamps added: ${timestampsAdded}`);
+            
+            // Also enrich transfer details
+            console.log(`\nEnriching transfer details...`);
+            const transfersEnriched = await enrichTransactionsWithTransfers(history, options.outputFile, options.maxTransactions);
+            console.log(`Total transfers enriched: ${transfersEnriched}`);
+            
             console.log(`\n=== Enrichment complete ===`);
-            console.log(`Total timestamps added: ${enriched}`);
             process.exit(0);
         } catch (error: any) {
             console.error('Error:', error.message);
