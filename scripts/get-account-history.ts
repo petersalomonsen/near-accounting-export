@@ -7,7 +7,9 @@ import path from 'path';
 import {
     getCurrentBlockHeight,
     setStopSignal,
-    getStopSignal
+    getStopSignal,
+    fetchNeardataBlock,
+    fetchBlockData
 } from './rpc.js';
 import {
     findLatestBalanceChangingBlock,
@@ -85,6 +87,7 @@ interface ParsedArgs {
     endBlock: number | null;
     verify: boolean;
     fillGapsOnly: boolean;
+    enrich: boolean;
     help: boolean;
 }
 
@@ -1075,6 +1078,86 @@ export function verifyHistoryFile(filePath: string): VerificationResults {
 }
 
 /**
+ * Fetch block timestamp from the blockchain
+ * Tries neardata.xyz first, then falls back to standard RPC
+ */
+async function fetchBlockTimestamp(blockHeight: number): Promise<number | null> {
+    try {
+        // Try neardata.xyz first (faster and provides more data)
+        const neardataBlock = await fetchNeardataBlock(blockHeight);
+        if (neardataBlock?.block?.header?.timestamp) {
+            return neardataBlock.block.header.timestamp;
+        }
+
+        // Fallback to standard RPC
+        const blockData = await fetchBlockData(blockHeight);
+        if (blockData?.header?.timestamp) {
+            return blockData.header.timestamp;
+        }
+    } catch (error: any) {
+        console.warn(`Could not fetch timestamp for block ${blockHeight}: ${error.message}`);
+    }
+    return null;
+}
+
+/**
+ * Enrich existing history with missing timestamps
+ * Fetches timestamps from the blockchain for transactions that don't have them
+ */
+async function enrichTimestamps(
+    history: AccountHistory,
+    outputFile: string
+): Promise<number> {
+    // Find transactions with missing timestamps
+    const transactionsNeedingTimestamps = history.transactions.filter(t => t.timestamp === null);
+    
+    if (transactionsNeedingTimestamps.length === 0) {
+        console.log('All transactions already have timestamps');
+        return 0;
+    }
+
+    console.log(`Found ${transactionsNeedingTimestamps.length} transactions with missing timestamps`);
+    
+    let enrichedCount = 0;
+    
+    for (let i = 0; i < transactionsNeedingTimestamps.length; i++) {
+        if (getStopSignal()) {
+            console.log('Stop signal received, saving progress...');
+            break;
+        }
+
+        const transaction = transactionsNeedingTimestamps[i];
+        if (!transaction) continue;
+
+        console.log(`Fetching timestamp for block ${transaction.block} (${i + 1}/${transactionsNeedingTimestamps.length})...`);
+        
+        const timestamp = await fetchBlockTimestamp(transaction.block);
+        
+        if (timestamp !== null) {
+            transaction.timestamp = timestamp;
+            enrichedCount++;
+            
+            // Save progress periodically
+            if (enrichedCount % 10 === 0) {
+                history.updatedAt = new Date().toISOString();
+                saveHistory(outputFile, history);
+                console.log(`Progress saved (${enrichedCount} timestamps fetched)`);
+            }
+        } else {
+            console.warn(`Could not fetch timestamp for block ${transaction.block}`);
+        }
+    }
+
+    // Final save
+    if (enrichedCount > 0) {
+        history.updatedAt = new Date().toISOString();
+        saveHistory(outputFile, history);
+    }
+
+    return enrichedCount;
+}
+
+/**
  * Parse command line arguments
  */
 function parseArgs(): ParsedArgs {
@@ -1088,6 +1171,7 @@ function parseArgs(): ParsedArgs {
         endBlock: null,
         verify: false,
         fillGapsOnly: false,
+        enrich: false,
         help: false
     };
 
@@ -1125,6 +1209,9 @@ function parseArgs(): ParsedArgs {
             case '--fill-gaps-only':
                 options.fillGapsOnly = true;
                 break;
+            case '--enrich':
+                options.enrich = true;
+                break;
             case '--help':
             case '-h':
                 options.help = true;
@@ -1159,6 +1246,7 @@ Options:
   --end-block <number>    Ending block height
   -v, --verify            Verify an existing history file
   --fill-gaps-only        Only fill gaps in existing history, don't search for new transactions
+  --enrich                Enrich existing history with missing timestamps
   -h, --help              Show this help message
 
 Environment Variables:
@@ -1244,6 +1332,37 @@ async function main(): Promise<void> {
             const filled = await fillGaps(history, options.outputFile, options.maxTransactions);
             console.log(`\n=== Gap filling complete ===`);
             console.log(`Total gaps filled: ${filled}`);
+            process.exit(0);
+        } catch (error: any) {
+            console.error('Error:', error.message);
+            process.exit(1);
+        }
+    }
+
+    if (options.enrich && options.outputFile) {
+        console.log(`Enriching history file with timestamps: ${options.outputFile}`);
+        
+        const history = loadExistingHistory(options.outputFile);
+        if (!history) {
+            console.error('Error: No existing history file found');
+            process.exit(1);
+        }
+        
+        // Handle graceful shutdown
+        process.on('SIGINT', () => {
+            console.log('\nReceived SIGINT, stopping gracefully...');
+            setStopSignal(true);
+        });
+
+        process.on('SIGTERM', () => {
+            console.log('\nReceived SIGTERM, stopping gracefully...');
+            setStopSignal(true);
+        });
+        
+        try {
+            const enriched = await enrichTimestamps(history, options.outputFile);
+            console.log(`\n=== Enrichment complete ===`);
+            console.log(`Total timestamps added: ${enriched}`);
             process.exit(0);
         } catch (error: any) {
             console.error('Error:', error.message);

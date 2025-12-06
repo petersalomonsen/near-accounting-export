@@ -8,6 +8,9 @@ test/test-output.json
 !package-lock.json
 !tsconfig*.json
 
+# Data exports
+*.csv
+
 # IDE
 .idea/
 .vscode/
