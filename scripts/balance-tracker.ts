@@ -38,11 +38,11 @@ export interface BalanceChanges {
  * Transfer detail capturing the counterparty and amount for a balance change
  */
 export interface TransferDetail {
-    type: 'near' | 'ft' | 'mt';  // NEAR native, Fungible Token, Multi-Token (intents)
+    type: 'near' | 'ft' | 'mt' | 'staking_reward';  // NEAR native, Fungible Token, Multi-Token (intents), Staking Reward
     direction: 'in' | 'out';
     amount: string;
     counterparty: string;  // The other account involved in the transfer
-    tokenId?: string;  // For FT: contract address, for MT: token identifier
+    tokenId?: string;  // For FT: contract address, for MT: token identifier, for staking_reward: pool address
     memo?: string;
     txHash?: string;
     receiptId?: string;
@@ -271,12 +271,19 @@ export async function findStakingBalanceChanges(
     // Calculate the first epoch boundary after startBlock
     // Epoch boundaries occur at blocks that are multiples of EPOCH_LENGTH
     const firstEpochBoundary = Math.ceil(startBlock / EPOCH_LENGTH) * EPOCH_LENGTH;
+    
+    // Calculate total epochs to check for progress reporting
+    const totalEpochs = Math.ceil((endBlock - firstEpochBoundary) / EPOCH_LENGTH) + 1;
+    let epochsChecked = 0;
 
     // Check at each epoch boundary
     for (let block = firstEpochBoundary; block <= endBlock; block += EPOCH_LENGTH) {
         if (getStopSignal()) {
             throw new Error('Operation cancelled by user');
         }
+        
+        epochsChecked++;
+        console.log(`  Checking epoch ${epochsChecked}/${totalEpochs} at block ${block}...`);
 
         const currentBalances = await getStakingPoolBalances(accountId, block, stakingPools);
 

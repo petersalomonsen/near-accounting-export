@@ -4,6 +4,11 @@
 
 import fs from 'fs';
 import path from 'path';
+import dotenv from 'dotenv';
+
+// Load environment variables from .env file
+dotenv.config();
+
 import {
     getCurrentBlockHeight,
     setStopSignal,
@@ -16,13 +21,15 @@ import {
     findBalanceChangingTransaction,
     clearBalanceCache,
     getBalanceChangesAtBlock,
-    accountExistsAtBlock
+    accountExistsAtBlock,
+    getStakingPoolBalances,
+    findStakingBalanceChanges
 } from './balance-tracker.js';
 import {
     getAllTransactionBlocks,
     isNearBlocksAvailable
 } from './nearblocks-api.js';
-import type { BalanceSnapshot, BalanceChanges, TransactionInfo, TransferDetail } from './balance-tracker.js';
+import type { BalanceSnapshot, BalanceChanges, TransactionInfo, TransferDetail, StakingBalanceChange } from './balance-tracker.js';
 import type { TransactionBlock } from './nearblocks-api.js';
 
 // Types
@@ -52,6 +59,7 @@ interface TransactionEntry {
         nearDiff?: string;
         tokensChanged: Record<string, { start: string; end: string; diff: string }>;
         intentsChanged: Record<string, { start: string; end: string; diff: string }>;
+        stakingChanged?: Record<string, { start: string; end: string; diff: string }>;
     };
     verificationWithNext?: VerificationResult;
     verificationWithPrevious?: VerificationResult;
@@ -62,6 +70,7 @@ interface AccountHistory {
     createdAt: string;
     updatedAt: string;
     transactions: TransactionEntry[];
+    stakingPools?: string[];  // Discovered staking pool contracts
     metadata: {
         firstBlock: number | null;
         lastBlock: number | null;
@@ -128,6 +137,181 @@ function saveHistory(filePath: string, history: AccountHistory): void {
         fs.mkdirSync(dir, { recursive: true });
     }
     fs.writeFileSync(filePath, JSON.stringify(history, null, 2));
+}
+
+/**
+ * Discover staking pools from transaction transfers
+ * Looks for transfers to contracts that match staking pool patterns
+ * (e.g., deposit_and_stake, unstake, withdraw operations)
+ */
+function discoverStakingPools(history: AccountHistory): string[] {
+    const stakingPools = new Set<string>(history.stakingPools || []);
+    
+    // Common staking pool contract patterns
+    const stakingPoolPatterns = [
+        /\.poolv1\.near$/,
+        /\.pool\.near$/,
+        /\.poolv2\.near$/
+    ];
+    
+    // Common staking method names that indicate a staking pool
+    const stakingMethods = ['deposit_and_stake', 'stake', 'unstake', 'unstake_all', 'withdraw_from_staking_pool'];
+    
+    for (const tx of history.transactions) {
+        if (!tx.transfers) continue;
+        
+        for (const transfer of tx.transfers) {
+            const counterparty = transfer.counterparty;
+            if (!counterparty) continue;
+            
+            // Check if the counterparty matches a staking pool pattern
+            const isStakingPool = stakingPoolPatterns.some(pattern => pattern.test(counterparty));
+            
+            // Or if the method name indicates staking
+            const isStakingMethod = transfer.memo && stakingMethods.includes(transfer.memo);
+            
+            if (isStakingPool || isStakingMethod) {
+                stakingPools.add(counterparty);
+            }
+        }
+    }
+    
+    return Array.from(stakingPools);
+}
+
+/**
+ * Collect staking reward entries between transactions
+ * Creates synthetic transaction entries for staking balance changes at epoch boundaries
+ */
+async function collectStakingRewards(
+    accountId: string,
+    history: AccountHistory,
+    outputFile: string
+): Promise<number> {
+    const stakingPools = discoverStakingPools(history);
+    
+    if (stakingPools.length === 0) {
+        console.log('No staking pools discovered from transaction history');
+        return 0;
+    }
+    
+    console.log(`\nDiscovered staking pools: ${stakingPools.join(', ')}`);
+    history.stakingPools = stakingPools;
+    
+    // Sort transactions by block (ascending)
+    const sortedTxs = [...history.transactions].sort((a, b) => a.block - b.block);
+    if (sortedTxs.length < 2) {
+        console.log('Not enough transactions to check for staking rewards between');
+        return 0;
+    }
+    
+    const firstTx = sortedTxs[0];
+    const lastTx = sortedTxs[sortedTxs.length - 1];
+    if (!firstTx || !lastTx) {
+        return 0;
+    }
+    const firstBlock = firstTx.block;
+    const lastBlock = lastTx.block;
+    
+    console.log(`Checking for staking balance changes between blocks ${firstBlock} and ${lastBlock}...`);
+    
+    // Find all staking balance changes at epoch boundaries
+    const stakingChanges = await findStakingBalanceChanges(
+        accountId,
+        firstBlock,
+        lastBlock,
+        stakingPools
+    );
+    
+    if (stakingChanges.length === 0) {
+        console.log('No staking balance changes found');
+        return 0;
+    }
+    
+    console.log(`Found ${stakingChanges.length} staking balance change(s)`);
+    
+    // Filter out changes that occur at the same block as existing transactions
+    // (those are deposits/withdrawals, not rewards)
+    const existingBlocks = new Set(history.transactions.map(tx => tx.block));
+    const rewardChanges = stakingChanges.filter(change => !existingBlocks.has(change.block));
+    
+    if (rewardChanges.length === 0) {
+        console.log('All staking changes coincide with existing transactions (deposits/withdrawals)');
+        return 0;
+    }
+    
+    console.log(`Creating ${rewardChanges.length} staking reward entries...`);
+    
+    // Create synthetic transaction entries for staking rewards
+    let addedCount = 0;
+    for (const change of rewardChanges) {
+        if (getStopSignal()) {
+            break;
+        }
+        
+        // Get all staking pool balances at this block and the previous
+        const balancesBefore = await getStakingPoolBalances(accountId, change.block - 1, stakingPools);
+        const balancesAfter = await getStakingPoolBalances(accountId, change.block, stakingPools);
+        
+        // Create the synthetic transaction entry
+        const entry: TransactionEntry = {
+            block: change.block,
+            timestamp: null, // Will be enriched later
+            transactionHashes: [], // No actual transaction
+            transactions: [], // No actual transaction
+            transfers: [{
+                type: 'staking_reward',
+                direction: BigInt(change.diff) >= 0 ? 'in' : 'out',
+                amount: change.diff.replace('-', ''), // Absolute value
+                counterparty: change.pool,
+                tokenId: change.pool,
+                memo: 'staking_reward'
+            } as TransferDetail],
+            balanceBefore: {
+                near: '0', // Not tracked for staking-only entries
+                fungibleTokens: {},
+                intentsTokens: {},
+                stakingPools: balancesBefore
+            },
+            balanceAfter: {
+                near: '0',
+                fungibleTokens: {},
+                intentsTokens: {},
+                stakingPools: balancesAfter
+            },
+            changes: {
+                nearChanged: false,
+                tokensChanged: {},
+                intentsChanged: {},
+                stakingChanged: {
+                    [change.pool]: {
+                        start: change.startBalance,
+                        end: change.endBalance,
+                        diff: change.diff
+                    }
+                }
+            }
+        };
+        
+        history.transactions.push(entry);
+        addedCount++;
+        
+        // Save periodically
+        if (addedCount % 10 === 0) {
+            history.updatedAt = new Date().toISOString();
+            history.metadata.totalTransactions = history.transactions.length;
+            saveHistory(outputFile, history);
+            console.log(`  Added ${addedCount} staking reward entries...`);
+        }
+    }
+    
+    // Final sort and save
+    history.transactions.sort((a, b) => b.block - a.block); // Sort descending by block
+    history.updatedAt = new Date().toISOString();
+    history.metadata.totalTransactions = history.transactions.length;
+    saveHistory(outputFile, history);
+    
+    return addedCount;
 }
 
 /**
@@ -563,6 +747,12 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         const enriched = await enrichTransactionsWithTransfers(history, outputFile, 50);
         if (enriched > 0) {
             console.log(`\nEnriched ${enriched} transaction(s) with transfer details`);
+        }
+        
+        // Collect staking rewards at epoch boundaries
+        const stakingRewards = await collectStakingRewards(accountId, history, outputFile);
+        if (stakingRewards > 0) {
+            console.log(`\nAdded ${stakingRewards} staking reward entries`);
         }
         
         // Early return if maxTransactions was 0 (user only wanted enrichment/gap fill)
