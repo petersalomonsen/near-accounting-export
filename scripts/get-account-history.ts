@@ -14,7 +14,8 @@ import {
     setStopSignal,
     getStopSignal,
     fetchNeardataBlock,
-    fetchBlockData
+    fetchBlockData,
+    getBlockTimestamp
 } from './rpc.js';
 import {
     findLatestBalanceChangingBlock,
@@ -364,10 +365,13 @@ async function collectStakingRewards(
         const balancesBefore = await getStakingPoolBalances(accountId, change.block - 1, stakingPools);
         const balancesAfter = await getStakingPoolBalances(accountId, change.block, stakingPools);
         
+        // Fetch block timestamp
+        const blockTimestamp = await getBlockTimestamp(change.block);
+        
         // Create the synthetic transaction entry
         const entry: TransactionEntry = {
             block: change.block,
-            timestamp: null, // Will be enriched later
+            timestamp: blockTimestamp,
             transactionHashes: [], // No actual transaction
             transactions: [], // No actual transaction
             transfers: [{

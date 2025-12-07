@@ -290,6 +290,25 @@ export async function callViewFunction(
 }
 
 /**
+ * Get block timestamp for a specific block height
+ */
+export async function getBlockTimestamp(blockHeight: number): Promise<number | null> {
+    if (stopSignal) {
+        throw new Error('Operation cancelled by user');
+    }
+
+    try {
+        const blockData = await wrapRpcCall(() =>
+            getBlock(getClient(), { blockId: blockHeight })
+        );
+        return blockData.header?.timestamp || null;
+    } catch (error: any) {
+        console.warn(`Could not fetch timestamp for block ${blockHeight}: ${error.message}`);
+        return null;
+    }
+}
+
+/**
  * Fetch detailed block data including receipts from all chunks
  */
 export async function fetchBlockData(blockHeight: number): Promise<RpcBlockResponse> {
