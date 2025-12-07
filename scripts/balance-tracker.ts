@@ -70,6 +70,15 @@ export interface StakingBalanceChange {
 // Mainnet epoch length in blocks (roughly 12 hours)
 const EPOCH_LENGTH = 43200;
 
+// Contract creation blocks - skip querying contracts before they existed
+// For intents.near, we use the block when mt_tokens_for_owner became available
+const CONTRACT_CREATION_BLOCKS: Record<string, number> = {
+    'intents.near': 148600000,  // mt_tokens_for_owner available from around this block
+    '17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1': 79039276,  // USDC - Created Nov 22, 2022
+    'usdt.tether-token.near': 91079307,  // USDT - estimate, created around March 2023
+    'wrap.near': 34550000,  // wNEAR - one of the earliest FTs
+};
+
 // Cache for balance snapshots to avoid redundant RPC calls
 const balanceCache = new Map<string, BalanceSnapshot>();
 
@@ -107,6 +116,18 @@ export async function accountExistsAtBlock(
 }
 
 /**
+ * Check if a contract existed at a given block height
+ */
+function contractExistsAtBlock(contractId: string, blockId: number | string): boolean {
+    const blockNum = typeof blockId === 'string' ? parseInt(blockId) : blockId;
+    const creationBlock = CONTRACT_CREATION_BLOCKS[contractId];
+    if (creationBlock && blockNum < creationBlock) {
+        return false;
+    }
+    return true;
+}
+
+/**
  * Get fungible token balances for account
  */
 async function getFungibleTokenBalances(
@@ -115,10 +136,17 @@ async function getFungibleTokenBalances(
     tokenContracts: string[] = []
 ): Promise<Record<string, string>> {
     const balances: Record<string, string> = {};
+    const blockNum = typeof blockId === 'string' ? parseInt(blockId) : blockId;
 
     for (const token of tokenContracts) {
         if (getStopSignal()) {
             throw new Error('Operation cancelled by user');
+        }
+
+        // Skip tokens that didn't exist yet at this block
+        if (!contractExistsAtBlock(token, blockNum)) {
+            balances[token] = '0';
+            continue;
         }
 
         try {
@@ -146,6 +174,12 @@ async function getIntentsBalances(
     blockId: number | string
 ): Promise<Record<string, string>> {
     const balances: Record<string, string> = {};
+    const blockNum = typeof blockId === 'string' ? parseInt(blockId) : blockId;
+
+    // Skip if intents.near didn't exist yet at this block
+    if (!contractExistsAtBlock('intents.near', blockNum)) {
+        return balances;
+    }
 
     if (getStopSignal()) {
         throw new Error('Operation cancelled by user');

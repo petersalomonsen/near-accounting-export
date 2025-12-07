@@ -942,7 +942,10 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         
         let currentSearchEnd = searchEnd;
         let currentSearchStart = searchStart;
-        const rangeSize = searchEnd - searchStart;
+        const initialRangeSize = searchEnd - searchStart;
+        let currentRangeSize = initialRangeSize;
+        const maxRangeSize = initialRangeSize * 32; // Cap at 32x the initial range (~32M blocks max)
+        let consecutiveEmptyRanges = 0;
 
     while (transactionsFound < maxTransactions) {
         if (getStopSignal()) {
@@ -1027,17 +1030,25 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         }
 
         if (!balanceChange.hasChanges) {
-            console.log('No balance changes found in current range');
+            consecutiveEmptyRanges++;
             
-            // Move to adjacent range of equal size
+            // Expand range size when we find no changes (double it each time, up to max)
+            if (currentRangeSize < maxRangeSize) {
+                currentRangeSize = Math.min(currentRangeSize * 2, maxRangeSize);
+                console.log(`No balance changes found. Expanding search range to ${currentRangeSize.toLocaleString()} blocks`);
+            } else {
+                console.log('No balance changes found in current range');
+            }
+            
+            // Move to adjacent range with (potentially expanded) size
             if (direction === 'backward') {
                 currentSearchEnd = currentSearchStart - 1;
-                currentSearchStart = Math.max(0, currentSearchEnd - rangeSize);
-                console.log(`Moving to previous range: ${currentSearchStart} - ${currentSearchEnd}`);
+                currentSearchStart = Math.max(0, currentSearchEnd - currentRangeSize);
+                console.log(`Moving to previous range: ${currentSearchStart.toLocaleString()} - ${currentSearchEnd.toLocaleString()}`);
             } else {
                 currentSearchStart = currentSearchEnd + 1;
-                currentSearchEnd = Math.min(currentBlock, currentSearchStart + rangeSize);
-                console.log(`Moving to next range: ${currentSearchStart} - ${currentSearchEnd}`);
+                currentSearchEnd = Math.min(currentBlock, currentSearchStart + currentRangeSize);
+                console.log(`Moving to next range: ${currentSearchStart.toLocaleString()} - ${currentSearchEnd.toLocaleString()}`);
             }
             
             // Save progress even when no transactions found
@@ -1047,6 +1058,13 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             
             continue;
         }
+
+        // Found a balance change - reset range size to initial for more precise searching
+        if (currentRangeSize !== initialRangeSize) {
+            console.log(`Found balance change - resetting search range to ${initialRangeSize.toLocaleString()} blocks`);
+            currentRangeSize = initialRangeSize;
+        }
+        consecutiveEmptyRanges = 0;
 
         console.log(`Found balance change at block ${balanceChange.block}`);
 
