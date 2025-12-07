@@ -537,6 +537,14 @@ async function fillGaps(
                 continue;
             }
             
+            // Check for duplicate before adding
+            const existingEntry = history.transactions.find(t => t.block === balanceChange.block);
+            if (existingEntry) {
+                console.log(`Skipping duplicate entry at block ${balanceChange.block}`);
+                currentEnd = balanceChange.block - 1;
+                continue;
+            }
+            
             // Create transaction entry
             const entry: TransactionEntry = {
                 block: balanceChange.block,
@@ -1119,33 +1127,39 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                     if (immediateNextBlock < nextTransaction.block && transactionsFound < maxTransactions) {
                         console.log(`Checking for immediate balance change at block ${immediateNextBlock}`);
                         try {
-                            const immediateChange = await getBalanceChangesAtBlock(accountId, immediateNextBlock);
-                            if (immediateChange.hasChanges) {
-                                // Found a missing transaction right after
-                                const immTxInfo = await findBalanceChangingTransaction(accountId, immediateNextBlock);
-                                const immEntry: TransactionEntry = {
-                                    block: immediateNextBlock,
-                                    timestamp: immTxInfo.blockTimestamp,
-                                    transactionHashes: immTxInfo.transactionHashes,
-                                    transactions: immTxInfo.transactions,
-                                    transfers: immTxInfo.transfers,
-                                    balanceBefore: immediateChange.startBalance,
-                                    balanceAfter: immediateChange.endBalance,
-                                    changes: {
-                                        nearChanged: immediateChange.nearChanged,
-                                        nearDiff: immediateChange.nearDiff,
-                                        tokensChanged: immediateChange.tokensChanged,
-                                        intentsChanged: immediateChange.intentsChanged
-                                    }
-                                };
-                                // Insert after the current entry (before nextTransaction)
-                                history.transactions.splice(1, 0, immEntry);
-                                transactionsFound++;
-                                console.log(`Immediate gap transaction added at block ${immediateNextBlock}`);
-                                
-                                // Re-verify the chain
-                                const newVerification = verifyTransactionConnectivity(immEntry, entry);
-                                entry.verificationWithNext = newVerification;
+                            // Skip if we already have this block
+                            const existingImmediate = history.transactions.find(t => t.block === immediateNextBlock);
+                            if (existingImmediate) {
+                                console.log(`Skipping duplicate immediate gap entry at block ${immediateNextBlock}`);
+                            } else {
+                                const immediateChange = await getBalanceChangesAtBlock(accountId, immediateNextBlock);
+                                if (immediateChange.hasChanges) {
+                                    // Found a missing transaction right after
+                                    const immTxInfo = await findBalanceChangingTransaction(accountId, immediateNextBlock);
+                                    const immEntry: TransactionEntry = {
+                                        block: immediateNextBlock,
+                                        timestamp: immTxInfo.blockTimestamp,
+                                        transactionHashes: immTxInfo.transactionHashes,
+                                        transactions: immTxInfo.transactions,
+                                        transfers: immTxInfo.transfers,
+                                        balanceBefore: immediateChange.startBalance,
+                                        balanceAfter: immediateChange.endBalance,
+                                        changes: {
+                                            nearChanged: immediateChange.nearChanged,
+                                            nearDiff: immediateChange.nearDiff,
+                                            tokensChanged: immediateChange.tokensChanged,
+                                            intentsChanged: immediateChange.intentsChanged
+                                        }
+                                    };
+                                    // Insert after the current entry (before nextTransaction)
+                                    history.transactions.splice(1, 0, immEntry);
+                                    transactionsFound++;
+                                    console.log(`Immediate gap transaction added at block ${immediateNextBlock}`);
+                                    
+                                    // Re-verify the chain
+                                    const newVerification = verifyTransactionConnectivity(immEntry, entry);
+                                    entry.verificationWithNext = newVerification;
+                                }
                             }
                         } catch (gapError: any) {
                             console.warn(`Could not check immediate block: ${gapError.message}`);
@@ -1178,16 +1192,21 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                                             intentsChanged: gapChange.intentsChanged
                                         }
                                     };
-                                    // Insert in the right position
+                                    // Insert in the right position if not duplicate
                                     const gapBlock = gapChange.block!;
-                                    const insertPos = history.transactions.findIndex(t => t.block > gapBlock);
-                                    if (insertPos >= 0) {
-                                        history.transactions.splice(insertPos, 0, gapEntry);
+                                    const existingGapEntry = history.transactions.find(t => t.block === gapBlock);
+                                    if (!existingGapEntry) {
+                                        const insertPos = history.transactions.findIndex(t => t.block > gapBlock);
+                                        if (insertPos >= 0) {
+                                            history.transactions.splice(insertPos, 0, gapEntry);
+                                        } else {
+                                            history.transactions.push(gapEntry);
+                                        }
+                                        transactionsFound++;
+                                        console.log(`Gap transaction added at block ${gapBlock}`);
                                     } else {
-                                        history.transactions.push(gapEntry);
+                                        console.log(`Skipping duplicate gap entry at block ${gapBlock}`);
                                     }
-                                    transactionsFound++;
-                                    console.log(`Gap transaction added at block ${gapBlock}`);
                                 }
                             } catch (gapError: any) {
                                 console.warn(`Could not search gap: ${gapError.message}`);
@@ -1207,6 +1226,19 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                     verification.errors.forEach(err => console.warn(`  - ${err.message}`));
                 }
             }
+        }
+
+        // Check for duplicate block before adding
+        const existingAtBlock = history.transactions.find(t => t.block === entry.block);
+        if (existingAtBlock) {
+            console.log(`Skipping duplicate entry at block ${entry.block}`);
+            // Still update search range to move past this block
+            if (direction === 'backward') {
+                currentSearchEnd = entry.block - 1;
+            } else {
+                currentSearchStart = entry.block + 1;
+            }
+            continue;
         }
 
         // Add to history in correct order

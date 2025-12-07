@@ -1068,25 +1068,106 @@ export async function findBalanceChangingTransaction(
         const blockData: RpcBlockResponse = await fetchBlockData(balanceChangeBlock);
         const blockTimestamp = blockData.header?.timestamp;
 
-        // With standard RPC, we can only get basic block data without logs
-        // Try to find receipts mentioning the target account
+        // With standard RPC, we need to:
+        // 1. Find transactions in chunks that involve the target account
+        // 2. Use tx RPC to get full transaction details with receipts
         const matchingTxHashes = new Set<string>();
+        const fetchedTransactions: any[] = [];
 
         for (const chunk of blockData.chunks || []) {
+            // Check transactions in this chunk
+            for (const tx of (chunk as any).transactions || []) {
+                const txStr = JSON.stringify(tx);
+                if (txStr.includes(targetAccountId)) {
+                    const txHash = tx.hash;
+                    const signerId = tx.signer_id;
+                    
+                    if (txHash && signerId && !matchingTxHashes.has(txHash)) {
+                        matchingTxHashes.add(txHash);
+                        
+                        try {
+                            // Get full transaction status with receipts
+                            const txResult = await getTransactionStatusWithReceipts(txHash, signerId);
+                            
+                            if (txResult?.transaction) {
+                                fetchedTransactions.push({
+                                    hash: txHash,
+                                    signerId: txResult.transaction.signer_id,
+                                    receiverId: txResult.transaction.receiver_id,
+                                    actions: txResult.transaction.actions || []
+                                });
+                                
+                                // Extract transfers from receipts_outcome
+                                for (const receiptOutcome of txResult.receipts_outcome || []) {
+                                    const outcome = receiptOutcome.outcome;
+                                    const receiptId = receiptOutcome.id;
+                                    const logs = outcome?.logs || [];
+                                    
+                                    // Parse logs for FT transfers using existing function
+                                    // We need to determine the contract ID from the receipt
+                                    // For now, we'll extract it from receipt executor_id if available
+                                    const contractId = (receiptOutcome as any).executor_id || '';
+                                    const ftTransfers = parseFtTransferEvents(logs, targetAccountId, contractId, txHash, receiptId);
+                                    transfers.push(...ftTransfers);
+                                }
+                            }
+                        } catch (txError: any) {
+                            console.warn(`Could not fetch transaction ${txHash}: ${txError.message}`);
+                        }
+                    }
+                }
+            }
+            
+            // Also check receipts for incoming transfers
             for (const receipt of (chunk as any).receipts || []) {
                 const receiptStr = JSON.stringify(receipt);
                 if (receiptStr.includes(targetAccountId)) {
-                    const signerId = receipt.receipt?.Action?.signerId;
-                    if (signerId) {
-                        // We found a receipt but don't have the tx_hash from standard RPC
-                        // We'd need to use tx status to get more info
+                    // Try to get the predecessor (origin tx hash is not directly available in receipt)
+                    const predecessorId = receipt.predecessor_id;
+                    const receiverId = receipt.receiver_id;
+                    
+                    // Check for Transfer action
+                    const actions = receipt.receipt?.Action?.actions || [];
+                    for (const action of actions) {
+                        if (action.Transfer) {
+                            const deposit = action.Transfer.deposit;
+                            if (deposit && BigInt(deposit) > 0n) {
+                                const direction = receiverId === targetAccountId ? 'in' : 'out';
+                                const counterparty = direction === 'in' ? predecessorId : receiverId;
+                                
+                                transfers.push({
+                                    type: 'near',
+                                    direction,
+                                    amount: deposit,
+                                    counterparty: counterparty || 'unknown',
+                                    receiptId: receipt.receipt_id
+                                });
+                            }
+                        }
+                        
+                        // Check for FunctionCall with deposit
+                        if (action.FunctionCall) {
+                            const deposit = action.FunctionCall.deposit;
+                            if (deposit && BigInt(deposit) > 0n) {
+                                const direction = receiverId === targetAccountId ? 'in' : 'out';
+                                const counterparty = direction === 'in' ? predecessorId : receiverId;
+                                
+                                transfers.push({
+                                    type: 'near',
+                                    direction,
+                                    amount: deposit,
+                                    counterparty: counterparty || 'unknown',
+                                    receiptId: receipt.receipt_id
+                                });
+                            }
+                        }
                     }
                 }
             }
         }
 
         return {
-            transactions: [],
+            transactions: fetchedTransactions,
             transactionHashes: Array.from(matchingTxHashes),
             transactionBlock: matchingTxHashes.size > 0 ? balanceChangeBlock : null,
             receiptBlock: balanceChangeBlock,
