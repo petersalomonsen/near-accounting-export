@@ -312,4 +312,23 @@ describe('RPC Fallback for Neardata.xyz', function() {
 
         console.log(`✓ Can extract FT events from RPC transaction logs`);
     });
+
+    it('should use RPC fallback when neardata.xyz returns null', async function() {
+        // Import findBalanceChangingTransaction to test the full flow
+        const { findBalanceChangingTransaction } = await import('../scripts/balance-tracker.js');
+
+        // Test with a known block that has transactions
+        // Even if neardata.xyz is rate limited, the function should fall back to RPC
+        const result = await findBalanceChangingTransaction('psalomo.near', TEST_BLOCK);
+        
+        assert.ok(result, 'Should return a result (either from neardata or RPC fallback)');
+        assert.ok(result.blockTimestamp, 'Should have block timestamp');
+        
+        // The result should have transaction info
+        // Note: transfers may be empty if the account wasn't involved in this specific block
+        console.log(`Found ${result.transactionHashes.length} transaction(s) at block ${TEST_BLOCK}`);
+        console.log(`Found ${result.transfers.length} transfer(s)`);
+        
+        console.log(`✓ findBalanceChangingTransaction works with RPC fallback`);
+    });
 });

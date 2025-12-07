@@ -85,6 +85,7 @@ interface GetAccountHistoryOptions {
     maxTransactions?: number;
     startBlock?: number;
     endBlock?: number;
+    stakingOnly?: boolean;
 }
 
 interface ParsedArgs {
@@ -97,6 +98,7 @@ interface ParsedArgs {
     verify: boolean;
     fillGapsOnly: boolean;
     enrich: boolean;
+    stakingOnly: boolean;
     help: boolean;
 }
 
@@ -144,6 +146,82 @@ function saveHistory(filePath: string, history: AccountHistory): void {
  * Looks for transfers to contracts that match staking pool patterns
  * (e.g., deposit_and_stake, unstake, withdraw operations)
  */
+interface StakingPoolRange {
+    pool: string;
+    firstDepositBlock: number;
+    lastWithdrawalBlock: number | null; // null if still has balance
+}
+
+function discoverStakingPoolsWithRanges(history: AccountHistory): StakingPoolRange[] {
+    const poolData = new Map<string, { deposits: number[], withdrawals: number[] }>();
+    
+    // Common staking pool contract patterns
+    const stakingPoolPatterns = [
+        /\.poolv1\.near$/,
+        /\.pool\.near$/,
+        /\.poolv2\.near$/
+    ];
+    
+    // Method names for deposits vs withdrawals
+    const depositMethods = ['deposit_and_stake', 'stake'];
+    const withdrawMethods = ['unstake', 'unstake_all', 'withdraw_all', 'withdraw'];
+    
+    // Sort transactions by block
+    const sortedTxs = [...history.transactions].sort((a, b) => a.block - b.block);
+    
+    for (const tx of sortedTxs) {
+        if (!tx.transfers) continue;
+        
+        for (const transfer of tx.transfers) {
+            const counterparty = transfer.counterparty;
+            if (!counterparty) continue;
+            
+            // Check if the counterparty matches a staking pool pattern
+            const isStakingPool = stakingPoolPatterns.some(pattern => pattern.test(counterparty));
+            if (!isStakingPool) continue;
+            
+            if (!poolData.has(counterparty)) {
+                poolData.set(counterparty, { deposits: [], withdrawals: [] });
+            }
+            
+            const data = poolData.get(counterparty)!;
+            
+            // Determine if this is a deposit or withdrawal based on direction and method
+            if (transfer.direction === 'out') {
+                // Outgoing NEAR to pool = deposit
+                const isDeposit = !transfer.memo || depositMethods.includes(transfer.memo);
+                if (isDeposit) {
+                    data.deposits.push(tx.block);
+                }
+            } else if (transfer.direction === 'in') {
+                // Incoming NEAR from pool = withdrawal
+                data.withdrawals.push(tx.block);
+            }
+        }
+    }
+    
+    const result: StakingPoolRange[] = [];
+    
+    for (const [pool, data] of poolData) {
+        if (data.deposits.length === 0) continue;
+        
+        const firstDepositBlock = Math.min(...data.deposits);
+        // Last withdrawal is the latest block where we received NEAR from the pool
+        // This might not be a "full withdrawal" - we'll check the balance to confirm
+        const lastWithdrawalBlock = data.withdrawals.length > 0 
+            ? Math.max(...data.withdrawals) 
+            : null;
+        
+        result.push({
+            pool,
+            firstDepositBlock,
+            lastWithdrawalBlock
+        });
+    }
+    
+    return result;
+}
+
 function discoverStakingPools(history: AccountHistory): string[] {
     const stakingPools = new Set<string>(history.stakingPools || []);
     
@@ -182,58 +260,91 @@ function discoverStakingPools(history: AccountHistory): string[] {
 /**
  * Collect staking reward entries between transactions
  * Creates synthetic transaction entries for staking balance changes at epoch boundaries
+ * Only checks epochs where staking was active (between first deposit and full withdrawal)
  */
 async function collectStakingRewards(
     accountId: string,
     history: AccountHistory,
     outputFile: string
 ): Promise<number> {
-    const stakingPools = discoverStakingPools(history);
+    const poolRanges = discoverStakingPoolsWithRanges(history);
     
-    if (stakingPools.length === 0) {
+    if (poolRanges.length === 0) {
         console.log('No staking pools discovered from transaction history');
         return 0;
     }
     
+    const stakingPools = poolRanges.map(r => r.pool);
     console.log(`\nDiscovered staking pools: ${stakingPools.join(', ')}`);
     history.stakingPools = stakingPools;
     
-    // Sort transactions by block (ascending)
-    const sortedTxs = [...history.transactions].sort((a, b) => a.block - b.block);
-    if (sortedTxs.length < 2) {
-        console.log('Not enough transactions to check for staking rewards between');
-        return 0;
+    // For each pool, determine the actual active staking range
+    // Check balance at last withdrawal to see if it was a full withdrawal
+    const activeRanges: { pool: string, startBlock: number, endBlock: number }[] = [];
+    
+    for (const range of poolRanges) {
+        let endBlock: number;
+        
+        if (range.lastWithdrawalBlock) {
+            // Check if balance is 0 after the last withdrawal
+            const balanceAfterWithdrawal = await getStakingPoolBalances(
+                accountId, 
+                range.lastWithdrawalBlock + 10, // Check slightly after to ensure receipt processed
+                [range.pool]
+            );
+            
+            if (BigInt(balanceAfterWithdrawal[range.pool] || '0') === 0n) {
+                // Full withdrawal - only check epochs up to the withdrawal
+                endBlock = range.lastWithdrawalBlock;
+                console.log(`  ${range.pool}: active from block ${range.firstDepositBlock} to ${endBlock} (fully withdrawn)`);
+            } else {
+                // Partial withdrawal - still active, check to current latest transaction
+                const sortedTxs = [...history.transactions].sort((a, b) => b.block - a.block);
+                endBlock = sortedTxs[0]?.block || range.lastWithdrawalBlock;
+                console.log(`  ${range.pool}: active from block ${range.firstDepositBlock} to ${endBlock} (still staking)`);
+            }
+        } else {
+            // No withdrawals yet - check to current latest transaction
+            const sortedTxs = [...history.transactions].sort((a, b) => b.block - a.block);
+            endBlock = sortedTxs[0]?.block || range.firstDepositBlock;
+            console.log(`  ${range.pool}: active from block ${range.firstDepositBlock} to ${endBlock} (no withdrawals)`);
+        }
+        
+        activeRanges.push({
+            pool: range.pool,
+            startBlock: range.firstDepositBlock,
+            endBlock
+        });
     }
     
-    const firstTx = sortedTxs[0];
-    const lastTx = sortedTxs[sortedTxs.length - 1];
-    if (!firstTx || !lastTx) {
-        return 0;
+    // Find all staking balance changes at epoch boundaries for each pool's active range
+    let allChanges: StakingBalanceChange[] = [];
+    
+    for (const range of activeRanges) {
+        console.log(`\nChecking staking balance changes for ${range.pool}...`);
+        console.log(`  Block range: ${range.startBlock} - ${range.endBlock}`);
+        
+        const poolChanges = await findStakingBalanceChanges(
+            accountId,
+            range.startBlock,
+            range.endBlock,
+            [range.pool]
+        );
+        
+        allChanges = allChanges.concat(poolChanges);
     }
-    const firstBlock = firstTx.block;
-    const lastBlock = lastTx.block;
     
-    console.log(`Checking for staking balance changes between blocks ${firstBlock} and ${lastBlock}...`);
-    
-    // Find all staking balance changes at epoch boundaries
-    const stakingChanges = await findStakingBalanceChanges(
-        accountId,
-        firstBlock,
-        lastBlock,
-        stakingPools
-    );
-    
-    if (stakingChanges.length === 0) {
+    if (allChanges.length === 0) {
         console.log('No staking balance changes found');
         return 0;
     }
     
-    console.log(`Found ${stakingChanges.length} staking balance change(s)`);
+    console.log(`\nFound ${allChanges.length} staking balance change(s) total`);
     
     // Filter out changes that occur at the same block as existing transactions
     // (those are deposits/withdrawals, not rewards)
     const existingBlocks = new Set(history.transactions.map(tx => tx.block));
-    const rewardChanges = stakingChanges.filter(change => !existingBlocks.has(change.block));
+    const rewardChanges = allChanges.filter(change => !existingBlocks.has(change.block));
     
     if (rewardChanges.length === 0) {
         console.log('All staking changes coincide with existing transactions (deposits/withdrawals)');
@@ -261,7 +372,7 @@ async function collectStakingRewards(
             transactions: [], // No actual transaction
             transfers: [{
                 type: 'staking_reward',
-                direction: BigInt(change.diff) >= 0 ? 'in' : 'out',
+                direction: BigInt(change.diff) >= 0n ? 'in' : 'out',
                 amount: change.diff.replace('-', ''), // Absolute value
                 counterparty: change.pool,
                 tokenId: change.pool,
@@ -706,7 +817,8 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         outputFile,
         direction = 'backward',
         startBlock,
-        endBlock
+        endBlock,
+        stakingOnly = false
     } = options;
     
     let maxTransactions = options.maxTransactions ?? 100;  // Use ?? to allow 0
@@ -714,6 +826,9 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
     console.log(`\n=== Getting accounting history for ${accountId} ===`);
     console.log(`Direction: ${direction}`);
     console.log(`Output file: ${outputFile}`);
+    if (stakingOnly) {
+        console.log(`Mode: staking rewards collection only`);
+    }
 
     // Load existing history
     let history = loadExistingHistory(outputFile);
@@ -750,11 +865,14 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             saveHistory(outputFile, history);
         }
         
-        // Enrich existing transactions with transfer details if missing
-        // Note: Enrichment doesn't count against maxTransactions since it doesn't add new transactions
-        const enriched = await enrichTransactionsWithTransfers(history, outputFile, 50);
-        if (enriched > 0) {
-            console.log(`\nEnriched ${enriched} transaction(s) with transfer details`);
+        // Skip enrichment if stakingOnly mode
+        if (!stakingOnly) {
+            // Enrich existing transactions with transfer details if missing
+            // Note: Enrichment doesn't count against maxTransactions since it doesn't add new transactions
+            const enriched = await enrichTransactionsWithTransfers(history, outputFile, 50);
+            if (enriched > 0) {
+                console.log(`\nEnriched ${enriched} transaction(s) with transfer details`);
+            }
         }
         
         // Collect staking rewards at epoch boundaries
@@ -763,8 +881,8 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             console.log(`\nAdded ${stakingRewards} staking reward entries`);
         }
         
-        // Early return if maxTransactions was 0 (user only wanted enrichment/gap fill)
-        if (maxTransactions === 0) {
+        // Early return if maxTransactions was 0 (user only wanted enrichment/gap fill) or stakingOnly
+        if (maxTransactions === 0 || stakingOnly) {
             return history;
         }
     }
@@ -1422,6 +1540,7 @@ function parseArgs(): ParsedArgs {
         verify: false,
         fillGapsOnly: false,
         enrich: false,
+        stakingOnly: false,
         help: false
     };
 
@@ -1462,6 +1581,9 @@ function parseArgs(): ParsedArgs {
             case '--enrich':
                 options.enrich = true;
                 break;
+            case '--staking':
+                options.stakingOnly = true;
+                break;
             case '--help':
             case '-h':
                 options.help = true;
@@ -1497,6 +1619,7 @@ Options:
   -v, --verify            Verify an existing history file
   --fill-gaps-only        Only fill gaps in existing history, don't search for new transactions
   --enrich                Enrich existing history with missing timestamps and transfer details
+  --staking               Only collect staking reward entries (no enrichment or new transactions)
   -h, --help              Show this help message
 
 Environment Variables:
