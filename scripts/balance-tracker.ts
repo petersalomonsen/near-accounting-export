@@ -19,6 +19,7 @@ export interface BalanceSnapshot {
     near: string;
     fungibleTokens: Record<string, string>;
     intentsTokens: Record<string, string>;
+    stakingPools?: Record<string, string>;  // Staking pool contract -> total balance (staked + unstaked)
 }
 
 export interface BalanceChanges {
@@ -26,6 +27,7 @@ export interface BalanceChanges {
     nearChanged: boolean;
     tokensChanged: Record<string, { start: string; end: string; diff: string }>;
     intentsChanged: Record<string, { start: string; end: string; diff: string }>;
+    stakingChanged?: Record<string, { start: string; end: string; diff: string }>;
     nearDiff?: string;
     startBalance?: BalanceSnapshot;
     endBalance?: BalanceSnapshot;
@@ -36,11 +38,11 @@ export interface BalanceChanges {
  * Transfer detail capturing the counterparty and amount for a balance change
  */
 export interface TransferDetail {
-    type: 'near' | 'ft' | 'mt';  // NEAR native, Fungible Token, Multi-Token (intents)
+    type: 'near' | 'ft' | 'mt' | 'staking_reward';  // NEAR native, Fungible Token, Multi-Token (intents), Staking Reward
     direction: 'in' | 'out';
     amount: string;
     counterparty: string;  // The other account involved in the transfer
-    tokenId?: string;  // For FT: contract address, for MT: token identifier
+    tokenId?: string;  // For FT: contract address, for MT: token identifier, for staking_reward: pool address
     memo?: string;
     txHash?: string;
     receiptId?: string;
@@ -54,6 +56,28 @@ export interface TransactionInfo {
     blockTimestamp: number | null;
     transfers: TransferDetail[];  // Detailed transfer information
 }
+
+export interface StakingBalanceChange {
+    block: number;
+    epochId?: string;
+    timestamp?: number;
+    pool: string;
+    startBalance: string;
+    endBalance: string;
+    diff: string;
+}
+
+// Mainnet epoch length in blocks (roughly 12 hours)
+const EPOCH_LENGTH = 43200;
+
+// Contract creation blocks - skip querying contracts before they existed
+// For intents.near, we use the block when mt_tokens_for_owner became available
+const CONTRACT_CREATION_BLOCKS: Record<string, number> = {
+    'intents.near': 148600000,  // mt_tokens_for_owner available from around this block
+    '17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1': 79039276,  // USDC - Created Nov 22, 2022
+    'usdt.tether-token.near': 91079307,  // USDT - estimate, created around March 2023
+    'wrap.near': 34550000,  // wNEAR - one of the earliest FTs
+};
 
 // Cache for balance snapshots to avoid redundant RPC calls
 const balanceCache = new Map<string, BalanceSnapshot>();
@@ -92,6 +116,18 @@ export async function accountExistsAtBlock(
 }
 
 /**
+ * Check if a contract existed at a given block height
+ */
+function contractExistsAtBlock(contractId: string, blockId: number | string): boolean {
+    const blockNum = typeof blockId === 'string' ? parseInt(blockId) : blockId;
+    const creationBlock = CONTRACT_CREATION_BLOCKS[contractId];
+    if (creationBlock && blockNum < creationBlock) {
+        return false;
+    }
+    return true;
+}
+
+/**
  * Get fungible token balances for account
  */
 async function getFungibleTokenBalances(
@@ -100,10 +136,17 @@ async function getFungibleTokenBalances(
     tokenContracts: string[] = []
 ): Promise<Record<string, string>> {
     const balances: Record<string, string> = {};
+    const blockNum = typeof blockId === 'string' ? parseInt(blockId) : blockId;
 
     for (const token of tokenContracts) {
         if (getStopSignal()) {
             throw new Error('Operation cancelled by user');
+        }
+
+        // Skip tokens that didn't exist yet at this block
+        if (!contractExistsAtBlock(token, blockNum)) {
+            balances[token] = '0';
+            continue;
         }
 
         try {
@@ -131,6 +174,12 @@ async function getIntentsBalances(
     blockId: number | string
 ): Promise<Record<string, string>> {
     const balances: Record<string, string> = {};
+    const blockNum = typeof blockId === 'string' ? parseInt(blockId) : blockId;
+
+    // Skip if intents.near didn't exist yet at this block
+    if (!contractExistsAtBlock('intents.near', blockNum)) {
+        return balances;
+    }
 
     if (getStopSignal()) {
         throw new Error('Operation cancelled by user');
@@ -189,16 +238,144 @@ async function getIntentsBalances(
 }
 
 /**
- * Get all balances (NEAR, fungible tokens, intents) for an account at a specific block
+ * Get staking pool balances for account
+ * Uses get_account_total_balance which returns the sum of staked and unstaked balance
+ * 
+ * Note: Staking pool balances change per epoch (roughly every 12 hours) due to rewards,
+ * or when there's a deposit/withdrawal. These should be tracked separately from 
+ * transaction-based balance changes.
+ */
+export async function getStakingPoolBalances(
+    accountId: string,
+    blockId: number | string,
+    stakingPools: string[] = []
+): Promise<Record<string, string>> {
+    const balances: Record<string, string> = {};
+
+    for (const pool of stakingPools) {
+        if (getStopSignal()) {
+            throw new Error('Operation cancelled by user');
+        }
+
+        try {
+            const balance = await callViewFunction(
+                pool,
+                'get_account_total_balance',
+                { account_id: accountId },
+                blockId
+            );
+            // Balance is returned as a quoted string like "1000000000000000000000000000"
+            balances[pool] = typeof balance === 'string' ? balance.replace(/"/g, '') : String(balance || '0');
+        } catch (e) {
+            // Pool might not exist at this block or account has no stake
+            balances[pool] = '0';
+        }
+    }
+
+    return balances;
+}
+
+/**
+ * Find staking balance changes between two blocks by checking at epoch boundaries.
+ * Staking rewards accrue per epoch (~12 hours / 43200 blocks), so we only need to
+ * check at epoch boundaries rather than every block.
+ * 
+ * @param accountId - The account to check
+ * @param startBlock - Start of the range
+ * @param endBlock - End of the range  
+ * @param stakingPools - List of staking pool contract IDs to check
+ * @returns Array of staking balance changes found at epoch boundaries
+ */
+export async function findStakingBalanceChanges(
+    accountId: string,
+    startBlock: number,
+    endBlock: number,
+    stakingPools: string[]
+): Promise<StakingBalanceChange[]> {
+    if (stakingPools.length === 0) {
+        return [];
+    }
+
+    const changes: StakingBalanceChange[] = [];
+    
+    // Get initial balances
+    let prevBalances = await getStakingPoolBalances(accountId, startBlock, stakingPools);
+    let prevBlock = startBlock;
+
+    // Calculate the first epoch boundary after startBlock
+    // Epoch boundaries occur at blocks that are multiples of EPOCH_LENGTH
+    const firstEpochBoundary = Math.ceil(startBlock / EPOCH_LENGTH) * EPOCH_LENGTH;
+    
+    // Calculate total epochs to check for progress reporting
+    const totalEpochs = Math.ceil((endBlock - firstEpochBoundary) / EPOCH_LENGTH) + 1;
+    let epochsChecked = 0;
+
+    // Check at each epoch boundary
+    for (let block = firstEpochBoundary; block <= endBlock; block += EPOCH_LENGTH) {
+        if (getStopSignal()) {
+            throw new Error('Operation cancelled by user');
+        }
+        
+        epochsChecked++;
+        console.log(`  Checking epoch ${epochsChecked}/${totalEpochs} at block ${block}...`);
+
+        const currentBalances = await getStakingPoolBalances(accountId, block, stakingPools);
+
+        // Check each pool for changes
+        for (const pool of stakingPools) {
+            const prevBalance = BigInt(prevBalances[pool] || '0');
+            const currentBalance = BigInt(currentBalances[pool] || '0');
+
+            if (prevBalance !== currentBalance) {
+                changes.push({
+                    block,
+                    pool,
+                    startBalance: prevBalance.toString(),
+                    endBalance: currentBalance.toString(),
+                    diff: (currentBalance - prevBalance).toString()
+                });
+            }
+        }
+
+        prevBalances = currentBalances;
+        prevBlock = block;
+    }
+
+    // Check final block if it's not an epoch boundary
+    if (endBlock > prevBlock) {
+        const finalBalances = await getStakingPoolBalances(accountId, endBlock, stakingPools);
+
+        for (const pool of stakingPools) {
+            const prevBalance = BigInt(prevBalances[pool] || '0');
+            const finalBalance = BigInt(finalBalances[pool] || '0');
+
+            if (prevBalance !== finalBalance) {
+                changes.push({
+                    block: endBlock,
+                    pool,
+                    startBalance: prevBalance.toString(),
+                    endBalance: finalBalance.toString(),
+                    diff: (finalBalance - prevBalance).toString()
+                });
+            }
+        }
+    }
+
+    return changes;
+}
+
+/**
+ * Get all balances (NEAR, fungible tokens, intents, staking pools) for an account at a specific block
  */
 export async function getAllBalances(
     accountId: string,
     blockId: number | string,
     tokenContracts: string[] | null | undefined = undefined,
     intentsTokens: string[] | null | undefined = undefined,
-    checkNear = true
+    checkNear = true,
+    stakingPools: string[] | null | undefined = undefined
 ): Promise<BalanceSnapshot> {
-    const cacheKey = `${accountId}:${blockId}:${JSON.stringify(tokenContracts)}:${JSON.stringify(intentsTokens)}:${checkNear}`;
+    const cacheKey = `${accountId}:${blockId}:${JSON.stringify(tokenContracts)}:${JSON.stringify(intentsTokens)}:${checkNear}:${JSON.stringify(stakingPools)}`;
 
     if (balanceCache.has(cacheKey)) {
         return balanceCache.get(cacheKey)!;
@@ -207,7 +384,8 @@ export async function getAllBalances(
     const result: BalanceSnapshot = {
         near: '0',
         fungibleTokens: {},
-        intentsTokens: {}
+        intentsTokens: {},
+        stakingPools: {}
     };
 
     // Get NEAR balance
@@ -275,6 +453,15 @@ export async function getAllBalances(
         result.intentsTokens = await getIntentsBalances(accountId, blockId);
     }
 
+    // Get staking pool balances if specified
+    if (stakingPools === null) {
+        result.stakingPools = {};
+    } else if (stakingPools !== undefined && stakingPools.length > 0) {
+        result.stakingPools = await getStakingPoolBalances(accountId, blockId, stakingPools);
+    } else {
+        result.stakingPools = {};
+    }
+
     balanceCache.set(cacheKey, result);
     return result;
 }
@@ -287,15 +474,16 @@ export async function getBalanceChangesAtBlock(
     accountId: string,
     blockHeight: number,
     tokenContracts: string[] | null | undefined = undefined,
-    intentsTokens: string[] | null | undefined = undefined
+    intentsTokens: string[] | null | undefined = undefined,
+    stakingPools: string[] | null | undefined = undefined
 ): Promise<BalanceChanges> {
     if (getStopSignal()) {
         throw new Error('Operation cancelled by user');
     }
 
     // Get balances before and after the block
-    const balanceBefore = await getAllBalances(accountId, blockHeight - 1, tokenContracts, intentsTokens, true);
-    const balanceAfter = await getAllBalances(accountId, blockHeight, tokenContracts, intentsTokens, true);
+    const balanceBefore = await getAllBalances(accountId, blockHeight - 1, tokenContracts, intentsTokens, true, stakingPools);
+    const balanceAfter = await getAllBalances(accountId, blockHeight, tokenContracts, intentsTokens, true, stakingPools);
 
     const changes = detectBalanceChanges(balanceBefore, balanceAfter);
     changes.block = blockHeight;
@@ -316,7 +504,8 @@ function detectBalanceChanges(
         hasChanges: false,
         nearChanged: false,
         tokensChanged: {},
-        intentsChanged: {}
+        intentsChanged: {},
+        stakingChanged: {}
     };
 
     // Check NEAR balance
@@ -366,6 +555,28 @@ function detectBalanceChanges(
         }
     }
 
+    // Check staking pools
+    const allStakingPools = new Set([
+        ...Object.keys(startBalance.stakingPools || {}),
+        ...Object.keys(endBalance.stakingPools || {})
+    ]);
+
+    for (const pool of allStakingPools) {
+        const startAmount = BigInt(startBalance.stakingPools?.[pool] || '0');
+        const endAmount = BigInt(endBalance.stakingPools?.[pool] || '0');
+        if (startAmount !== endAmount) {
+            changes.hasChanges = true;
+            if (!changes.stakingChanged) {
+                changes.stakingChanged = {};
+            }
+            changes.stakingChanged[pool] = {
+                start: startAmount.toString(),
+                end: endAmount.toString(),
+                diff: (endAmount - startAmount).toString()
+            };
+        }
+    }
+
     return changes;
 }
 
@@ -384,6 +595,7 @@ export async function findLatestBalanceChangingBlock(
         throw new Error('Operation cancelled by user');
     }
 
+    // Note: stakingPools not included in binary search - staking rewards are tracked at epoch boundaries
     const startBalance = await getAllBalances(accountId, firstBlock, tokenContracts, intentsTokens, checkNear);
     const endBalance = await getAllBalances(accountId, lastBlock, tokenContracts, intentsTokens, checkNear);
 
@@ -644,8 +856,130 @@ function parseMtTransferEvents(
 }
 
 /**
+ * Helper to process receipts from a block and extract transfers
+ */
+function processBlockReceipts(
+    neardataBlock: NeardataBlockResponse,
+    targetAccountId: string,
+    transfers: TransferDetail[],
+    matchingTxHashes: Set<string>,
+    processedReceipts: Set<string>
+): void {
+    // Check all shards for receipt execution outcomes
+    for (const shard of neardataBlock.shards || []) {
+        for (const receiptExecution of shard.receipt_execution_outcomes || []) {
+            const receipt = receiptExecution.receipt;
+            const executionOutcome = receiptExecution.execution_outcome;
+            const txHash = receiptExecution.tx_hash;
+            const receiptId = receipt?.receipt_id || executionOutcome?.id;
+
+            const receiverId = receipt?.receiver_id;
+            const predecessorId = receipt?.predecessor_id;
+            const logs = executionOutcome?.outcome?.logs || [];
+
+            let affectsTargetAccount = false;
+
+            // Check if this is a direct transfer to/from the account
+            if (receiverId === targetAccountId || predecessorId === targetAccountId) {
+                affectsTargetAccount = true;
+                
+                // Check for NEAR transfer actions and other actions with deposits
+                const actions = receipt?.receipt?.Action?.actions || [];
+                for (const action of actions) {
+                    // Helper to record a NEAR transfer
+                    const recordNearTransfer = (amount: string | bigint, memo?: string) => {
+                        const amountBigInt = typeof amount === 'bigint' ? amount : BigInt(amount);
+                        if (amountBigInt > 0n) {
+                            if (predecessorId === targetAccountId) {
+                                transfers.push({
+                                    type: 'near',
+                                    direction: 'out',
+                                    amount: String(amountBigInt),
+                                    counterparty: receiverId,
+                                    memo,
+                                    txHash,
+                                    receiptId
+                                });
+                            } else if (receiverId === targetAccountId) {
+                                transfers.push({
+                                    type: 'near',
+                                    direction: 'in',
+                                    amount: String(amountBigInt),
+                                    counterparty: predecessorId,
+                                    memo,
+                                    txHash,
+                                    receiptId
+                                });
+                            }
+                        }
+                    };
+
+                    // Transfer action
+                    if (action.Transfer?.deposit) {
+                        recordNearTransfer(action.Transfer.deposit);
+                    }
+                    // FunctionCall action with attached deposit
+                    if (action.FunctionCall?.deposit) {
+                        recordNearTransfer(action.FunctionCall.deposit, action.FunctionCall.method_name);
+                    }
+                    // Stake action - locks NEAR as stake
+                    if (action.Stake?.stake) {
+                        recordNearTransfer(action.Stake.stake, 'stake');
+                    }
+                    // TransferToGasKey action
+                    if (action.TransferToGasKey?.deposit) {
+                        recordNearTransfer(action.TransferToGasKey.deposit, 'transfer_to_gas_key');
+                    }
+                }
+            }
+
+            // Parse FT transfer events from logs
+            if (!processedReceipts.has(receiptId)) {
+                const ftTransfers = parseFtTransferEvents(logs, targetAccountId, receiverId, txHash, receiptId);
+                if (ftTransfers.length > 0) {
+                    transfers.push(...ftTransfers);
+                    affectsTargetAccount = true;
+                }
+                
+                // Parse MT (intents) transfer events from logs
+                const mtTransfers = parseMtTransferEvents(logs, targetAccountId, receiverId, txHash, receiptId);
+                if (mtTransfers.length > 0) {
+                    transfers.push(...mtTransfers);
+                    affectsTargetAccount = true;
+                }
+                
+                processedReceipts.add(receiptId);
+            }
+
+            // Check receipt logs for EVENT_JSON entries mentioning the account (fallback)
+            if (!affectsTargetAccount) {
+                for (const log of logs) {
+                    if (log.startsWith('EVENT_JSON:')) {
+                        try {
+                            const eventData = JSON.parse(log.substring('EVENT_JSON:'.length));
+                            const eventStr = JSON.stringify(eventData);
+                            if (eventStr.includes(targetAccountId)) {
+                                affectsTargetAccount = true;
+                                break;
+                            }
+                        } catch (e) {
+                            // Skip invalid JSON
+                        }
+                    }
+                }
+            }
+
+            if (affectsTargetAccount && txHash && !matchingTxHashes.has(txHash)) {
+                matchingTxHashes.add(txHash);
+            }
+        }
+    }
+}
+
+/**
  * Find transaction that caused a balance change
  * Uses neardata.xyz API to get complete block data with execution outcomes and logs
+ * Also checks subsequent blocks for cross-contract call receipts
  */
 export async function findBalanceChangingTransaction(
     targetAccountId: string,
@@ -666,91 +1000,26 @@ export async function findBalanceChangingTransaction(
             const matchingTxHashes = new Set<string>();
             const processedReceipts = new Set<string>();
 
-            // Check all shards for receipt execution outcomes
-            for (const shard of neardataBlock.shards || []) {
-                for (const receiptExecution of shard.receipt_execution_outcomes || []) {
-                    const receipt = receiptExecution.receipt;
-                    const executionOutcome = receiptExecution.execution_outcome;
-                    const txHash = receiptExecution.tx_hash;
-                    const receiptId = receipt?.receipt_id || executionOutcome?.id;
+            // Process the main block
+            processBlockReceipts(neardataBlock, targetAccountId, transfers, matchingTxHashes, processedReceipts);
 
-                    const receiverId = receipt?.receiver_id;
-                    const predecessorId = receipt?.predecessor_id;
-                    const logs = executionOutcome?.outcome?.logs || [];
-
-                    let affectsTargetAccount = false;
-
-                    // Check if this is a direct transfer to/from the account
-                    if (receiverId === targetAccountId || predecessorId === targetAccountId) {
-                        affectsTargetAccount = true;
-                        
-                        // Check for NEAR transfer action
-                        const actions = receipt?.receipt?.Action?.actions || [];
-                        for (const action of actions) {
-                            if (action.Transfer) {
-                                const amount = action.Transfer.deposit;
-                                if (receiverId === targetAccountId) {
-                                    transfers.push({
-                                        type: 'near',
-                                        direction: 'in',
-                                        amount: String(amount),
-                                        counterparty: predecessorId,
-                                        txHash,
-                                        receiptId
-                                    });
-                                } else if (predecessorId === targetAccountId) {
-                                    transfers.push({
-                                        type: 'near',
-                                        direction: 'out',
-                                        amount: String(amount),
-                                        counterparty: receiverId,
-                                        txHash,
-                                        receiptId
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    // Parse FT transfer events from logs
-                    if (!processedReceipts.has(receiptId)) {
-                        const ftTransfers = parseFtTransferEvents(logs, targetAccountId, receiverId, txHash, receiptId);
-                        if (ftTransfers.length > 0) {
-                            transfers.push(...ftTransfers);
-                            affectsTargetAccount = true;
-                        }
-                        
-                        // Parse MT (intents) transfer events from logs
-                        const mtTransfers = parseMtTransferEvents(logs, targetAccountId, receiverId, txHash, receiptId);
-                        if (mtTransfers.length > 0) {
-                            transfers.push(...mtTransfers);
-                            affectsTargetAccount = true;
-                        }
-                        
-                        processedReceipts.add(receiptId);
-                    }
-
-                    // Check receipt logs for EVENT_JSON entries mentioning the account (fallback)
-                    if (!affectsTargetAccount) {
-                        for (const log of logs) {
-                            if (log.startsWith('EVENT_JSON:')) {
-                                try {
-                                    const eventData = JSON.parse(log.substring('EVENT_JSON:'.length));
-                                    const eventStr = JSON.stringify(eventData);
-                                    if (eventStr.includes(targetAccountId)) {
-                                        affectsTargetAccount = true;
-                                        break;
-                                    }
-                                } catch (e) {
-                                    // Skip invalid JSON
-                                }
-                            }
-                        }
-                    }
-
-                    if (affectsTargetAccount && txHash && !matchingTxHashes.has(txHash)) {
-                        matchingTxHashes.add(txHash);
-                    }
+            // Also check subsequent blocks for cross-contract call receipts.
+            // This is needed because NEAR deducts the deposit from sender's balance when
+            // the OUTGOING receipt is CREATED, not when it EXECUTES on the receiver.
+            // 
+            // Example: DAO staking via act_proposal
+            // - Block N: act_proposal executes, creates receipt to staking pool with deposit
+            //   Sender's balance is immediately reduced by the deposit amount
+            // - Block N+1: deposit_and_stake receipt executes on staking pool
+            //   The receipt with deposit details (counterparty, amount, method) is here
+            //
+            // So when we detect a balance change at block N, we need to check block N+1
+            // (and possibly N+2, N+3) to find the receipt that shows where the funds went.
+            const MAX_SUBSEQUENT_BLOCKS = 3;
+            for (let i = 1; i <= MAX_SUBSEQUENT_BLOCKS && transfers.length === 0; i++) {
+                const subsequentBlock = await fetchNeardataBlock(balanceChangeBlock + i);
+                if (subsequentBlock) {
+                    processBlockReceipts(subsequentBlock, targetAccountId, transfers, matchingTxHashes, processedReceipts);
                 }
             }
 
@@ -799,25 +1068,106 @@ export async function findBalanceChangingTransaction(
         const blockData: RpcBlockResponse = await fetchBlockData(balanceChangeBlock);
         const blockTimestamp = blockData.header?.timestamp;
 
-        // With standard RPC, we can only get basic block data without logs
-        // Try to find receipts mentioning the target account
+        // With standard RPC, we need to:
+        // 1. Find transactions in chunks that involve the target account
+        // 2. Use tx RPC to get full transaction details with receipts
         const matchingTxHashes = new Set<string>();
+        const fetchedTransactions: any[] = [];
 
         for (const chunk of blockData.chunks || []) {
+            // Check transactions in this chunk
+            for (const tx of (chunk as any).transactions || []) {
+                const txStr = JSON.stringify(tx);
+                if (txStr.includes(targetAccountId)) {
+                    const txHash = tx.hash;
+                    const signerId = tx.signer_id;
+                    
+                    if (txHash && signerId && !matchingTxHashes.has(txHash)) {
+                        matchingTxHashes.add(txHash);
+                        
+                        try {
+                            // Get full transaction status with receipts
+                            const txResult = await getTransactionStatusWithReceipts(txHash, signerId);
+                            
+                            if (txResult?.transaction) {
+                                fetchedTransactions.push({
+                                    hash: txHash,
+                                    signerId: txResult.transaction.signer_id,
+                                    receiverId: txResult.transaction.receiver_id,
+                                    actions: txResult.transaction.actions || []
+                                });
+                                
+                                // Extract transfers from receipts_outcome
+                                for (const receiptOutcome of txResult.receipts_outcome || []) {
+                                    const outcome = receiptOutcome.outcome;
+                                    const receiptId = receiptOutcome.id;
+                                    const logs = outcome?.logs || [];
+                                    
+                                    // Parse logs for FT transfers using existing function
+                                    // We need to determine the contract ID from the receipt
+                                    // For now, we'll extract it from receipt executor_id if available
+                                    const contractId = (receiptOutcome as any).executor_id || '';
+                                    const ftTransfers = parseFtTransferEvents(logs, targetAccountId, contractId, txHash, receiptId);
+                                    transfers.push(...ftTransfers);
+                                }
+                            }
+                        } catch (txError: any) {
+                            console.warn(`Could not fetch transaction ${txHash}: ${txError.message}`);
+                        }
+                    }
+                }
+            }
+            
+            // Also check receipts for incoming transfers
             for (const receipt of (chunk as any).receipts || []) {
                 const receiptStr = JSON.stringify(receipt);
                 if (receiptStr.includes(targetAccountId)) {
-                    const signerId = receipt.receipt?.Action?.signerId;
-                    if (signerId) {
-                        // We found a receipt but don't have the tx_hash from standard RPC
-                        // We'd need to use tx status to get more info
+                    // Try to get the predecessor (origin tx hash is not directly available in receipt)
+                    const predecessorId = receipt.predecessor_id;
+                    const receiverId = receipt.receiver_id;
+                    
+                    // Check for Transfer action
+                    const actions = receipt.receipt?.Action?.actions || [];
+                    for (const action of actions) {
+                        if (action.Transfer) {
+                            const deposit = action.Transfer.deposit;
+                            if (deposit && BigInt(deposit) > 0n) {
+                                const direction = receiverId === targetAccountId ? 'in' : 'out';
+                                const counterparty = direction === 'in' ? predecessorId : receiverId;
+                                
+                                transfers.push({
+                                    type: 'near',
+                                    direction,
+                                    amount: deposit,
+                                    counterparty: counterparty || 'unknown',
+                                    receiptId: receipt.receipt_id
+                                });
+                            }
+                        }
+                        
+                        // Check for FunctionCall with deposit
+                        if (action.FunctionCall) {
+                            const deposit = action.FunctionCall.deposit;
+                            if (deposit && BigInt(deposit) > 0n) {
+                                const direction = receiverId === targetAccountId ? 'in' : 'out';
+                                const counterparty = direction === 'in' ? predecessorId : receiverId;
+                                
+                                transfers.push({
+                                    type: 'near',
+                                    direction,
+                                    amount: deposit,
+                                    counterparty: counterparty || 'unknown',
+                                    receiptId: receipt.receipt_id
+                                });
+                            }
+                        }
                     }
                 }
             }
         }
 
         return {
-            transactions: [],
+            transactions: fetchedTransactions,
             transactionHashes: Array.from(matchingTxHashes),
             transactionBlock: matchingTxHashes.size > 0 ? balanceChangeBlock : null,
             receiptBlock: balanceChangeBlock,

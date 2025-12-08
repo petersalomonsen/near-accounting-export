@@ -290,6 +290,25 @@ export async function callViewFunction(
 }
 
 /**
+ * Get block timestamp for a specific block height
+ */
+export async function getBlockTimestamp(blockHeight: number): Promise<number | null> {
+    if (stopSignal) {
+        throw new Error('Operation cancelled by user');
+    }
+
+    try {
+        const blockData = await wrapRpcCall(() =>
+            getBlock(getClient(), { blockId: blockHeight })
+        );
+        return blockData.header?.timestamp || null;
+    } catch (error: any) {
+        console.warn(`Could not fetch timestamp for block ${blockHeight}: ${error.message}`);
+        return null;
+    }
+}
+
+/**
  * Fetch detailed block data including receipts from all chunks
  */
 export async function fetchBlockData(blockHeight: number): Promise<RpcBlockResponse> {
@@ -422,12 +441,17 @@ export async function fetchNeardataBlock(blockHeight: number): Promise<NeardataB
                 // Block not found - may be a skipped block
                 return null;
             }
+            if (response.status === 429) {
+                // Rate limited - return null to fall back to RPC
+                console.warn(`Neardata.xyz rate limited, falling back to RPC for block ${blockHeight}`);
+                return null;
+            }
             throw new Error(`HTTP error ${response.status}`);
         }
         
         return await response.json() as NeardataBlockResponse;
     } catch (error: any) {
-        checkRateLimitError(error);
+        // Don't set stop signal for neardata failures - just return null and fall back to RPC
         console.warn(`Failed to fetch block ${blockHeight} from neardata.xyz: ${error.message}`);
         return null;
     }
