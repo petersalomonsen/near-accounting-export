@@ -91,14 +91,39 @@ export async function getTokenMetadata(
     }
     
     // For MT (multi-token/intents), extract the underlying contract
-    // MT tokens are formatted as "nep141:contract.near"
-    if (tokenType === 'mt' && tokenId.startsWith('nep141:')) {
-        const contractId = tokenId.substring(7); // Remove "nep141:" prefix
-        const ftMetadata = await fetchFTMetadata(contractId);
-        if (ftMetadata) {
-            // Cache with the full MT token ID
-            setCachedMetadata(tokenId, ftMetadata);
-            return ftMetadata;
+    // MT tokens can be formatted as:
+    // - "nep141:contract.near" - NEP-141 token via intents
+    // - "nep245:contract.near:token_id" - NEP-245 multi-token via intents
+    if (tokenType === 'mt') {
+        if (tokenId.startsWith('nep141:')) {
+            const contractId = tokenId.substring(7); // Remove "nep141:" prefix
+            
+            // Check if the underlying contract is in known tokens
+            const knownContract = KNOWN_TOKENS[contractId];
+            if (knownContract) {
+                setCachedMetadata(tokenId, knownContract);
+                return knownContract;
+            }
+            
+            const ftMetadata = await fetchFTMetadata(contractId);
+            if (ftMetadata) {
+                // Cache with the full MT token ID
+                setCachedMetadata(tokenId, ftMetadata);
+                return ftMetadata;
+            }
+        } else if (tokenId.startsWith('nep245:')) {
+            // For nep245 tokens, extract the contract part (before the second colon)
+            // Format: "nep245:contract.near:token_id"
+            const withoutPrefix = tokenId.substring(7); // Remove "nep245:" prefix
+            const contractId = withoutPrefix.split(':')[0]; // Get contract before token_id
+            if (contractId) {
+                const ftMetadata = await fetchFTMetadata(contractId);
+                if (ftMetadata) {
+                    // Cache with the full MT token ID
+                    setCachedMetadata(tokenId, ftMetadata);
+                    return ftMetadata;
+                }
+            }
         }
     }
     
@@ -112,7 +137,14 @@ export async function getTokenMetadata(
     }
     
     // Fallback: use first part of contract ID as symbol
-    const fallbackSymbol = tokenId.split('.')[0]?.toUpperCase() || 'UNKNOWN';
+    // For MT tokens, strip the prefix first
+    let fallbackTokenId = tokenId;
+    if (tokenId.startsWith('nep141:')) {
+        fallbackTokenId = tokenId.substring(7);
+    } else if (tokenId.startsWith('nep245:')) {
+        fallbackTokenId = tokenId.substring(7).split(':')[0] || tokenId;
+    }
+    const fallbackSymbol = fallbackTokenId.split('.')[0]?.toUpperCase() || 'UNKNOWN';
     const fallback: TokenMetadata = { symbol: fallbackSymbol, decimals: 24 };
     setCachedMetadata(tokenId, fallback);
     return fallback;
