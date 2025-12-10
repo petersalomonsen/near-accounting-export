@@ -47,7 +47,7 @@ interface VerificationResult {
     errors: VerificationError[];
 }
 
-interface TransactionEntry {
+export interface TransactionEntry {
     block: number;
     timestamp: number | null;
     transactionHashes: string[];
@@ -503,6 +503,24 @@ function verifyTransactionConnectivity(
 }
 
 /**
+ * Check if a transaction entry is a staking-only entry (synthetic staking reward)
+ * Staking-only entries don't track NEAR/FT/intents balances and should be excluded from gap detection
+ */
+export function isStakingOnlyEntry(tx: TransactionEntry): boolean {
+    // Staking-only entries have:
+    // - No transaction hashes (synthetic entry)
+    // - stakingChanged in changes
+    // - near balance of '0' (not tracked)
+    const hasNoTxHashes = !tx.transactionHashes || tx.transactionHashes.length === 0;
+    const hasStakingChanges = Boolean(tx.changes?.stakingChanged && Object.keys(tx.changes.stakingChanged).length > 0);
+    const hasNoOtherChanges = !tx.changes?.nearChanged && 
+        Object.keys(tx.changes?.tokensChanged || {}).length === 0 &&
+        Object.keys(tx.changes?.intentsChanged || {}).length === 0;
+    
+    return hasNoTxHashes && hasStakingChanges && hasNoOtherChanges;
+}
+
+/**
  * Detect gaps in transaction history where balance connectivity is broken
  */
 function detectGaps(history: AccountHistory): Array<{ prevBlock: number; nextBlock: number; prevTx: TransactionEntry; nextTx: TransactionEntry }> {
@@ -512,8 +530,11 @@ function detectGaps(history: AccountHistory): Array<{ prevBlock: number; nextBlo
         return gaps;
     }
     
-    // Sort transactions by block
-    const sortedTransactions = [...history.transactions].sort((a, b) => a.block - b.block);
+    // Sort transactions by block and filter out staking-only entries
+    // Staking-only entries are synthetic (no actual on-chain tx) and don't track NEAR/FT/intents balances
+    const sortedTransactions = [...history.transactions]
+        .filter(tx => !isStakingOnlyEntry(tx))
+        .sort((a, b) => a.block - b.block);
     
     for (let i = 1; i < sortedTransactions.length; i++) {
         const prevTx = sortedTransactions[i - 1];
@@ -727,20 +748,23 @@ async function enrichTransactionsWithTransfers(
     outputFile: string,
     maxToEnrich: number = 50
 ): Promise<number> {
-    // Find transactions without transfer details or with empty transfers array
+    // Find transactions that haven't been attempted for enrichment yet
+    // tx.transfers === undefined means never attempted
+    // tx.transfers === [] means attempted but found nothing (don't retry)
+    // tx.transfers.length > 0 means has transfers (don't retry)
     // Only enrich transactions that have balance changes (otherwise there's nothing to find)
     const transactionsToEnrich = history.transactions.filter(tx => {
-        const hasNoTransfers = !tx.transfers || tx.transfers.length === 0;
+        const neverAttempted = tx.transfers === undefined;
         const hasBalanceChanges = tx.changes && (
             tx.changes.nearChanged ||
             Object.keys(tx.changes.tokensChanged || {}).length > 0 ||
             Object.keys(tx.changes.intentsChanged || {}).length > 0
         );
-        return hasNoTransfers && hasBalanceChanges;
+        return neverAttempted && hasBalanceChanges;
     });
     
     if (transactionsToEnrich.length === 0) {
-        console.log('All transactions with balance changes already have transfer details');
+        console.log('All transactions with balance changes already have transfer details (or attempted)');
         return 0;
     }
     
@@ -761,7 +785,7 @@ async function enrichTransactionsWithTransfers(
             console.log(`Enriching transaction at block ${tx.block}...`);
             const txInfo = await findBalanceChangingTransaction(history.accountId, tx.block);
             
-            if (txInfo && txInfo.transfers) {
+            if (txInfo && txInfo.transfers && txInfo.transfers.length > 0) {
                 tx.transfers = txInfo.transfers;
                 enriched++;
                 
@@ -769,6 +793,12 @@ async function enrichTransactionsWithTransfers(
                 if (enriched % 5 === 0) {
                     history.updatedAt = new Date().toISOString();
                     saveHistory(outputFile, history);
+                }
+            } else {
+                // Mark as attempted even if no transfers found to avoid retrying
+                // Set to empty array to indicate we tried but found nothing
+                if (!tx.transfers) {
+                    tx.transfers = [];
                 }
             }
         } catch (error: any) {
@@ -1423,8 +1453,11 @@ export function verifyHistoryFile(filePath: string): VerificationResults {
         errors: []
     };
 
-    // Sort transactions by block
-    const sortedTransactions = [...history.transactions].sort((a, b) => a.block - b.block);
+    // Sort transactions by block and filter out staking-only entries
+    // Staking-only entries don't track NEAR/FT/intents balances, so they shouldn't affect connectivity verification
+    const sortedTransactions = [...history.transactions]
+        .filter(tx => !isStakingOnlyEntry(tx))
+        .sort((a, b) => a.block - b.block);
 
     for (let i = 1; i < sortedTransactions.length; i++) {
         const prevTx = sortedTransactions[i - 1];

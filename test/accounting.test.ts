@@ -23,8 +23,10 @@ import {
 import type { BalanceSnapshot } from '../scripts/balance-tracker.js';
 import {
     getAccountHistory,
-    verifyHistoryFile
+    verifyHistoryFile,
+    isStakingOnlyEntry
 } from '../scripts/get-account-history.js';
+import type { TransactionEntry } from '../scripts/get-account-history.js';
 
 describe('NEAR Accounting Export', function() {
     // These tests make real RPC calls and may take time
@@ -203,6 +205,203 @@ describe('NEAR Accounting Export', function() {
             assert.ok(results.errorCount > 0, 'Should have errors');
             assert.ok(results.errors.some(e => e.errors.some(err => err.type === 'near_balance_mismatch')), 
                 'Should detect NEAR balance mismatch');
+        });
+
+        it('should correctly identify staking-only entries', function() {
+            // A staking-only entry has:
+            // - No transaction hashes (synthetic entry)
+            // - stakingChanged in changes
+            // - No other balance changes (nearChanged=false, empty tokensChanged/intentsChanged)
+            const stakingOnlyEntry: TransactionEntry = {
+                block: 171676800,
+                timestamp: 1234567890000000000,
+                transactionHashes: [], // Empty - synthetic entry
+                transactions: [],
+                transfers: [{
+                    type: 'staking_reward',
+                    direction: 'in',
+                    amount: '100003640615630982726047',
+                    counterparty: 'figment.poolv1.near',
+                    tokenId: 'figment.poolv1.near',
+                    memo: 'staking_reward'
+                }],
+                balanceBefore: {
+                    near: '0', // Not tracked for staking-only entries
+                    fungibleTokens: {},
+                    intentsTokens: {},
+                    stakingPools: { 'figment.poolv1.near': '0' }
+                },
+                balanceAfter: {
+                    near: '0',
+                    fungibleTokens: {},
+                    intentsTokens: {},
+                    stakingPools: { 'figment.poolv1.near': '100003640615630982726047' }
+                },
+                changes: {
+                    nearChanged: false,
+                    tokensChanged: {},
+                    intentsChanged: {},
+                    stakingChanged: {
+                        'figment.poolv1.near': {
+                            start: '0',
+                            end: '100003640615630982726047',
+                            diff: '100003640615630982726047'
+                        }
+                    }
+                }
+            };
+
+            // Regular transaction entry (with actual transaction hash)
+            const regularEntry: TransactionEntry = {
+                block: 171644630,
+                timestamp: 1234567890000000000,
+                transactionHashes: ['ABC123'], // Has transaction hash
+                transactions: [{ hash: 'ABC123' }],
+                balanceBefore: {
+                    near: '7000000000000000000000000',
+                    fungibleTokens: {},
+                    intentsTokens: {}
+                },
+                balanceAfter: {
+                    near: '7020415054971903699999984',
+                    fungibleTokens: {},
+                    intentsTokens: {}
+                },
+                changes: {
+                    nearChanged: true,
+                    nearDiff: '20415054971903699999984',
+                    tokensChanged: {},
+                    intentsChanged: {}
+                }
+            };
+
+            // Entry with both staking and NEAR changes (not staking-only)
+            const mixedEntry: TransactionEntry = {
+                block: 171700000,
+                timestamp: 1234567890000000000,
+                transactionHashes: ['DEF456'],
+                transactions: [{ hash: 'DEF456' }],
+                balanceBefore: {
+                    near: '7020415054971903699999984',
+                    fungibleTokens: {},
+                    intentsTokens: {},
+                    stakingPools: { 'figment.poolv1.near': '100000000000000000000000' }
+                },
+                balanceAfter: {
+                    near: '6020415054971903699999984',
+                    fungibleTokens: {},
+                    intentsTokens: {},
+                    stakingPools: { 'figment.poolv1.near': '200000000000000000000000' }
+                },
+                changes: {
+                    nearChanged: true,
+                    nearDiff: '-1000000000000000000000000',
+                    tokensChanged: {},
+                    intentsChanged: {},
+                    stakingChanged: {
+                        'figment.poolv1.near': {
+                            start: '100000000000000000000000',
+                            end: '200000000000000000000000',
+                            diff: '100000000000000000000000'
+                        }
+                    }
+                }
+            };
+
+            assert.ok(isStakingOnlyEntry(stakingOnlyEntry), 'Should identify staking-only entry');
+            assert.ok(!isStakingOnlyEntry(regularEntry), 'Should not identify regular entry as staking-only');
+            assert.ok(!isStakingOnlyEntry(mixedEntry), 'Should not identify mixed entry as staking-only');
+        });
+
+        it('should not report gaps caused by staking-only entries', function() {
+            // This test verifies that when we have:
+            // 1. Regular transaction with balanceAfter.near = X
+            // 2. Staking-only entry with balanceBefore.near = 0 (not tracked)
+            // 3. Regular transaction with balanceBefore.near = X
+            // We should NOT detect a gap between 1 and 3, even though 2 has different balances
+
+            // Mock history with interleaved staking and regular entries
+            const mockHistory = {
+                accountId: 'test.near',
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                transactions: [
+                    // Regular transaction
+                    {
+                        block: 100,
+                        timestamp: null,
+                        transactionHashes: ['TX1'],
+                        transactions: [{ hash: 'TX1' }],
+                        balanceBefore: { near: '1000', fungibleTokens: {}, intentsTokens: {} },
+                        balanceAfter: { near: '900', fungibleTokens: {}, intentsTokens: {} },
+                        changes: {
+                            nearChanged: true,
+                            nearDiff: '-100',
+                            tokensChanged: {},
+                            intentsChanged: {}
+                        }
+                    },
+                    // Staking-only entry - has near: '0' but should be excluded from gap detection
+                    {
+                        block: 150,
+                        timestamp: null,
+                        transactionHashes: [], // Empty - staking-only
+                        transactions: [],
+                        balanceBefore: { 
+                            near: '0', // Not tracked
+                            fungibleTokens: {}, 
+                            intentsTokens: {},
+                            stakingPools: { 'pool.near': '0' }
+                        },
+                        balanceAfter: { 
+                            near: '0', 
+                            fungibleTokens: {}, 
+                            intentsTokens: {},
+                            stakingPools: { 'pool.near': '1000000' }
+                        },
+                        changes: {
+                            nearChanged: false,
+                            tokensChanged: {},
+                            intentsChanged: {},
+                            stakingChanged: {
+                                'pool.near': { start: '0', end: '1000000', diff: '1000000' }
+                            }
+                        }
+                    },
+                    // Another regular transaction - balanceBefore matches first entry's balanceAfter
+                    {
+                        block: 200,
+                        timestamp: null,
+                        transactionHashes: ['TX2'],
+                        transactions: [{ hash: 'TX2' }],
+                        balanceBefore: { near: '900', fungibleTokens: {}, intentsTokens: {} },
+                        balanceAfter: { near: '800', fungibleTokens: {}, intentsTokens: {} },
+                        changes: {
+                            nearChanged: true,
+                            nearDiff: '-100',
+                            tokensChanged: {},
+                            intentsChanged: {}
+                        }
+                    }
+                ],
+                metadata: {
+                    firstBlock: 100,
+                    lastBlock: 200,
+                    totalTransactions: 3
+                }
+            };
+
+            fs.writeFileSync(testOutputFile, JSON.stringify(mockHistory, null, 2));
+            
+            // Verify should pass because staking-only entries are excluded from connectivity check
+            const results = verifyHistoryFile(testOutputFile);
+            
+            // The verification should be valid - no gaps detected between regular transactions
+            // because staking-only entries are filtered out before gap detection
+            assert.ok(results.valid, 
+                `History should be valid (staking-only entries excluded from gap detection). ` +
+                `Errors: ${JSON.stringify(results.errors)}`);
+            assert.equal(results.errorCount, 0, 'Should have no errors');
         });
     });
 

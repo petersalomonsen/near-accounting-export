@@ -169,6 +169,37 @@ The output JSON file contains:
 npm test
 ```
 
+## CSV Export
+
+Convert the JSON accounting history to CSV format for import into spreadsheet software:
+
+```bash
+# Convert JSON to CSV (output file will be myaccount.near.csv)
+node dist/scripts/json-to-csv.js myaccount.near.json
+
+# Specify custom output file
+node dist/scripts/json-to-csv.js -i myaccount.near.json -o accounting.csv
+
+# Using long options
+node dist/scripts/json-to-csv.js --input myaccount.near.json --output accounting.csv
+```
+
+### CSV Columns
+
+| Column | Description |
+|--------|-------------|
+| `block_height` | Block number where the transfer occurred |
+| `timestamp` | ISO 8601 timestamp of the transfer |
+| `asset` | Token identifier (NEAR for native, contract address for FT/MT, STAKING:pool for staking rewards) |
+| `counterparty` | The other account involved in the transfer |
+| `direction` | "in" for incoming, "out" for outgoing transfers |
+| `amount` | Amount transferred (in smallest units) |
+| `transaction_hash` | Hash of the transaction |
+| `receipt_id` | Receipt ID of the transfer |
+| `token_balance` | Balance of the token after the block |
+
+**Note:** If timestamps are missing in the JSON, re-run `get-account-history.js` with the `--enrich` flag to fetch missing timestamps before converting to CSV.
+
 ## License
 
 ISC
