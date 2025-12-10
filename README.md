@@ -186,19 +186,36 @@ node dist/scripts/json-to-csv.js --input myaccount.near.json --output accounting
 
 ### CSV Columns
 
+The CSV export provides both **human-friendly columns** (on the left) for easy readability and **technical columns** (on the right) for programmatic use:
+
+#### Human-Friendly Columns
+
 | Column | Description |
 |--------|-------------|
-| `block_height` | Block number where the transfer occurred |
+| `receipt_block_height` | Block where the balance change occurred (used for sorting) |
 | `timestamp` | ISO 8601 timestamp of the transfer |
-| `asset` | Token identifier (NEAR for native, contract address for FT/MT, STAKING:pool for staking rewards) |
 | `counterparty` | The other account involved in the transfer |
 | `direction` | "in" for incoming, "out" for outgoing transfers |
-| `amount` | Amount transferred (in smallest units) |
+| `transaction_block_height` | Block where transaction was submitted (explorer-friendly) |
+| `token_symbol` | Human-readable token symbol (NEAR, USDT, wNEAR, etc.) |
+| `amount_whole_units` | Amount transferred in whole units (with decimals applied) |
+| `balance_whole_units` | Token balance after transfer (with decimals applied) |
+
+#### Technical Columns
+
+| Column | Description |
+|--------|-------------|
+| `asset` | Token contract ID (NEAR for native, contract address for FT/MT, STAKING:pool for staking rewards) |
+| `amount_raw` | Amount transferred in base units (as string to prevent Excel scientific notation) |
+| `token_balance_raw` | Token balance in base units (as string) |
 | `transaction_hash` | Hash of the transaction |
 | `receipt_id` | Receipt ID of the transfer |
-| `token_balance` | Balance of the token after the block |
 
-**Note:** If timestamps are missing in the JSON, re-run `get-account-history.js` with the `--enrich` flag to fetch missing timestamps before converting to CSV.
+**Note:** 
+- Raw values are exported as strings (wrapped in quotes) to prevent Excel from converting them to scientific notation.
+- Rows are sorted by `receipt_block_height` in ascending order, reflecting the actual sequence of balance-changing events.
+- `transaction_block_height` enables verification in block explorers (e.g., NearBlocks), which typically don't show receipt details.
+- If timestamps are missing in the JSON, re-run `get-account-history.js` with the `--enrich` flag to fetch missing timestamps before converting to CSV.
 
 ## License
 
