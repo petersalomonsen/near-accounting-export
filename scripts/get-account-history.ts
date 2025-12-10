@@ -822,6 +822,74 @@ async function enrichTransactionsWithTransfers(
 }
 
 /**
+ * Enrich existing transactions with transaction block if missing
+ * This fetches the transaction block for transactions that have transactionBlock as null
+ */
+async function enrichTransactionsWithTransactionBlock(
+    history: AccountHistory,
+    outputFile: string,
+    maxToEnrich: number = 100
+): Promise<number> {
+    // Find transactions that need transaction block enrichment
+    // Only enrich transactions that have actual transaction hashes (not synthetic staking entries)
+    const transactionsToEnrich = history.transactions.filter(tx => {
+        const needsEnrichment = tx.transactionBlock === null || tx.transactionBlock === undefined;
+        const hasTransactionHashes = tx.transactionHashes && tx.transactionHashes.length > 0;
+        return needsEnrichment && hasTransactionHashes;
+    });
+    
+    if (transactionsToEnrich.length === 0) {
+        console.log('All transactions already have transaction block information');
+        return 0;
+    }
+    
+    console.log(`\nFound ${transactionsToEnrich.length} transaction(s) without transaction block information`);
+    
+    let enriched = 0;
+    for (const tx of transactionsToEnrich) {
+        if (enriched >= maxToEnrich) {
+            console.log(`Reached max enrichment limit (${maxToEnrich})`);
+            break;
+        }
+        
+        if (getStopSignal()) {
+            break;
+        }
+        
+        try {
+            console.log(`Enriching transaction block for block ${tx.block}...`);
+            const txInfo = await findBalanceChangingTransaction(history.accountId, tx.block);
+            
+            if (txInfo && txInfo.transactionBlock !== null && txInfo.transactionBlock !== undefined) {
+                tx.transactionBlock = txInfo.transactionBlock;
+                enriched++;
+                
+                // Save progress every 5 enrichments
+                if (enriched % 5 === 0) {
+                    history.updatedAt = new Date().toISOString();
+                    saveHistory(outputFile, history);
+                    console.log(`  Saved progress: ${enriched} transactions enriched...`);
+                }
+            }
+        } catch (error: any) {
+            if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                console.log(`Error during enrichment: ${error.message}`);
+                break;
+            }
+            console.log(`Warning: Could not enrich transaction at block ${tx.block}: ${error.message}`);
+        }
+    }
+    
+    if (enriched > 0) {
+        history.updatedAt = new Date().toISOString();
+        saveHistory(outputFile, history);
+        console.log(`\nEnriched ${enriched} transaction(s) with transaction block information`);
+    }
+    
+    return enriched;
+}
+
+/**
  * Update verification fields on all transactions after sorting
  */
 function updateVerificationFields(history: AccountHistory): void {
@@ -904,6 +972,20 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         
         // Skip enrichment if stakingOnly mode
         if (!stakingOnly) {
+            // Enrich existing transactions with transaction blocks if missing
+            const missingTransactionBlocks = history.transactions.filter(tx => 
+                (tx.transactionBlock === null || tx.transactionBlock === undefined) && 
+                tx.transactionHashes && tx.transactionHashes.length > 0
+            ).length;
+            
+            if (missingTransactionBlocks > 0) {
+                console.log(`\nFound ${missingTransactionBlocks} transaction(s) without transaction block information`);
+                const txBlocksEnriched = await enrichTransactionsWithTransactionBlock(history, outputFile, 10);
+                if (txBlocksEnriched > 0) {
+                    console.log(`Enriched ${txBlocksEnriched} transaction blocks. Run again to enrich more.`);
+                }
+            }
+            
             // Enrich existing transactions with transfer details if missing
             // Note: Enrichment doesn't count against maxTransactions since it doesn't add new transactions
             const enriched = await enrichTransactionsWithTransfers(history, outputFile, 50);
@@ -1777,6 +1859,11 @@ async function main(): Promise<void> {
         try {
             const timestampsAdded = await enrichTimestamps(history, options.outputFile);
             console.log(`Total timestamps added: ${timestampsAdded}`);
+            
+            // Enrich transaction blocks
+            console.log(`\nEnriching transaction blocks...`);
+            const transactionBlocksEnriched = await enrichTransactionsWithTransactionBlock(history, options.outputFile, options.maxTransactions);
+            console.log(`Total transaction blocks enriched: ${transactionBlocksEnriched}`);
             
             // Also enrich transfer details
             console.log(`\nEnriching transfer details...`);
