@@ -49,6 +49,7 @@ interface VerificationResult {
 
 export interface TransactionEntry {
     block: number;
+    transactionBlock?: number | null;  // Block where transaction was submitted (may be null for synthetic entries or older data)
     timestamp: number | null;
     transactionHashes: string[];
     transactions: any[];
@@ -371,6 +372,7 @@ async function collectStakingRewards(
         // Create the synthetic transaction entry
         const entry: TransactionEntry = {
             block: change.block,
+            transactionBlock: null, // Synthetic entry, no transaction block
             timestamp: blockTimestamp,
             transactionHashes: [], // No actual transaction
             transactions: [], // No actual transaction
@@ -684,6 +686,7 @@ async function fillGaps(
             // Create transaction entry
             const entry: TransactionEntry = {
                 block: balanceChange.block,
+                transactionBlock: txInfo.transactionBlock,
                 timestamp: txInfo.blockTimestamp,
                 transactionHashes: txInfo.transactionHashes,
                 transactions: txInfo.transactions,
@@ -999,6 +1002,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                     // Create transaction entry
                     const entry: TransactionEntry = {
                         block: txBlock.blockHeight,
+                        transactionBlock: txInfo.transactionBlock,
                         timestamp: txInfo.blockTimestamp,
                         transactionHashes: txInfo.transactionHashes,
                         transactions: txInfo.transactions,
@@ -1248,6 +1252,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         // Create transaction entry
         const entry: TransactionEntry = {
             block: balanceChange.block!,
+            transactionBlock: txInfo.transactionBlock,
             timestamp: txInfo.blockTimestamp,
             transactionHashes: txInfo.transactionHashes,
             transactions: txInfo.transactions,

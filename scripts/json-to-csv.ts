@@ -5,6 +5,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { getTokenMetadata, formatTokenAmount } from './token-metadata.js';
 
 // Types matching the data structures from get-account-history.ts
 interface TransferDetail {
@@ -27,6 +28,7 @@ interface BalanceSnapshot {
 
 interface TransactionEntry {
     block: number;
+    transactionBlock?: number | null;
     timestamp: number | null;
     transactionHashes: string[];
     transfers?: TransferDetail[];
@@ -46,15 +48,19 @@ interface AccountHistory {
 }
 
 interface CSVRow {
-    blockHeight: number;
+    receiptBlockHeight: number;
     timestamp: string;
-    asset: string;
     counterparty: string;
     direction: 'in' | 'out';
-    amount: string;
+    transactionBlockHeight: string;
+    tokenSymbol: string;
+    amountWholeUnits: string;
+    balanceWholeUnits: string;
+    asset: string;
+    amountRaw: string;
+    tokenBalanceRaw: string;
     transactionHash: string;
     receiptId: string;
-    tokenBalance: string;
 }
 
 interface ParsedArgs {
@@ -131,7 +137,7 @@ function getTokenBalance(transfer: TransferDetail, balanceAfter: BalanceSnapshot
 /**
  * Convert account history to CSV rows
  */
-function convertToCSVRows(history: AccountHistory): CSVRow[] {
+async function convertToCSVRows(history: AccountHistory): Promise<CSVRow[]> {
     const rows: CSVRow[] = [];
 
     for (const transaction of history.transactions) {
@@ -140,16 +146,34 @@ function convertToCSVRows(history: AccountHistory): CSVRow[] {
         }
 
         for (const transfer of transaction.transfers) {
+            // Get asset name (contract ID or "NEAR")
+            const asset = getAssetName(transfer);
+            
+            // Get token metadata for symbol and decimals
+            const metadata = await getTokenMetadata(
+                asset === 'NEAR' ? 'NEAR' : (transfer.tokenId || asset),
+                transfer.type
+            );
+            
+            // Format amount and balance with decimals
+            const amountWholeUnits = formatTokenAmount(transfer.amount || '0', metadata.decimals);
+            const tokenBalanceRaw = getTokenBalance(transfer, transaction.balanceAfter);
+            const balanceWholeUnits = formatTokenAmount(tokenBalanceRaw, metadata.decimals);
+            
             const row: CSVRow = {
-                blockHeight: transaction.block,
+                receiptBlockHeight: transaction.block,
                 timestamp: formatTimestamp(transaction.timestamp),
-                asset: getAssetName(transfer),
                 counterparty: transfer.counterparty || '',
                 direction: transfer.direction,
-                amount: transfer.amount || '',
+                transactionBlockHeight: transaction.transactionBlock?.toString() || '',
+                tokenSymbol: metadata.symbol,
+                amountWholeUnits,
+                balanceWholeUnits,
+                asset: asset,
+                amountRaw: transfer.amount || '',
+                tokenBalanceRaw,
                 transactionHash: transfer.txHash || (transaction.transactionHashes.length > 0 ? transaction.transactionHashes[0] || '' : ''),
-                receiptId: transfer.receiptId || '',
-                tokenBalance: getTokenBalance(transfer, transaction.balanceAfter)
+                receiptId: transfer.receiptId || ''
             };
             rows.push(row);
         }
@@ -160,33 +184,46 @@ function convertToCSVRows(history: AccountHistory): CSVRow[] {
 
 /**
  * Generate CSV content from rows
+ * Sorts rows by receipt_block_height (ascending)
  */
 function generateCSV(rows: CSVRow[]): string {
+    // Sort by receipt block height (ascending order)
+    const sortedRows = [...rows].sort((a, b) => a.receiptBlockHeight - b.receiptBlockHeight);
+    
     const headers = [
-        'block_height',
+        'receipt_block_height',
         'timestamp',
-        'asset',
         'counterparty',
         'direction',
-        'amount',
+        'transaction_block_height',
+        'token_symbol',
+        'amount_whole_units',
+        'balance_whole_units',
+        'asset',
+        'amount_raw',
+        'token_balance_raw',
         'transaction_hash',
-        'receipt_id',
-        'token_balance'
+        'receipt_id'
     ];
 
     const lines: string[] = [headers.join(',')];
 
-    for (const row of rows) {
+    for (const row of sortedRows) {
         const values = [
-            String(row.blockHeight),
+            String(row.receiptBlockHeight),
             escapeCSV(row.timestamp),
-            escapeCSV(row.asset),
             escapeCSV(row.counterparty),
             escapeCSV(row.direction),
-            escapeCSV(row.amount),
+            escapeCSV(row.transactionBlockHeight),
+            escapeCSV(row.tokenSymbol),
+            escapeCSV(row.amountWholeUnits),
+            escapeCSV(row.balanceWholeUnits),
+            escapeCSV(row.asset),
+            // Wrap raw values in quotes to preserve as strings (prevent Excel scientific notation)
+            `"${row.amountRaw}"`,
+            `"${row.tokenBalanceRaw}"`,
             escapeCSV(row.transactionHash),
-            escapeCSV(row.receiptId),
-            escapeCSV(row.tokenBalance)
+            escapeCSV(row.receiptId)
         ];
         lines.push(values.join(','));
     }
@@ -255,16 +292,20 @@ Description:
   re-run the data collection script (get-account-history.js) with the --enrich flag
   to fetch missing timestamps.
 
-  The CSV file contains the following columns:
-    - block_height: Block number where the transfer occurred
+  The CSV file contains the following columns (human-friendly on left, technical on right):
+    - receipt_block_height: Block where balance change occurred (used for sorting)
     - timestamp: ISO 8601 timestamp of the transfer
-    - asset: Token identifier (NEAR for native transfers, contract address for FT/MT)
     - counterparty: The other account involved in the transfer
     - direction: "in" for incoming transfers, "out" for outgoing transfers
-    - amount: Amount transferred (in smallest units)
+    - transaction_block_height: Block where transaction was submitted (explorer-friendly)
+    - token_symbol: Human-readable token symbol (NEAR, USDT, wNEAR, etc.)
+    - amount_whole_units: Amount transferred in whole units (with decimals applied)
+    - balance_whole_units: Token balance after transfer (with decimals applied)
+    - asset: Token contract ID (NEAR for native, contract address for FT/MT)
+    - amount_raw: Amount transferred in base units (as string to prevent Excel issues)
+    - token_balance_raw: Token balance in base units (as string)
     - transaction_hash: Hash of the transaction
     - receipt_id: Receipt ID of the transfer
-    - token_balance: Balance of the token after the block
 
 Examples:
   # Convert a JSON file to CSV
@@ -281,7 +322,7 @@ Examples:
 /**
  * Main execution
  */
-function main(): void {
+async function main(): Promise<void> {
     const options = parseArgs();
 
     if (options.help) {
@@ -327,8 +368,9 @@ function main(): void {
             console.warn(`Run 'npm start -- --account ${history.accountId} --enrich' to fetch missing timestamps.`);
         }
 
-        // Convert to CSV rows
-        const rows = convertToCSVRows(history);
+        // Convert to CSV rows (now async)
+        console.log('Fetching token metadata and converting to CSV...');
+        const rows = await convertToCSVRows(history);
         console.log(`Found ${rows.length} transfers to export`);
 
         // Generate CSV content

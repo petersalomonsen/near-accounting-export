@@ -169,7 +169,7 @@ describe('JSON to CSV Converter', function() {
     });
 
     describe('convertToCSVRows', function() {
-        it('should convert account history to CSV rows', function() {
+        it('should convert account history to CSV rows', async function() {
             const history: AccountHistory = {
                 accountId: 'test.near',
                 createdAt: '2024-01-01T00:00:00Z',
@@ -177,6 +177,7 @@ describe('JSON to CSV Converter', function() {
                 transactions: [
                     {
                         block: 100,
+                        transactionBlock: 99,
                         timestamp: 1705314600000000000,
                         transactionHashes: ['hash1'],
                         transfers: [
@@ -203,19 +204,23 @@ describe('JSON to CSV Converter', function() {
                 }
             };
 
-            const rows = convertToCSVRows(history);
+            const rows = await convertToCSVRows(history);
             assert.equal(rows.length, 1);
-            assert.equal(rows[0]?.blockHeight, 100);
-            assert.equal(rows[0]?.asset, 'NEAR');
+            assert.equal(rows[0]?.receiptBlockHeight, 100);
+            assert.equal(rows[0]?.transactionBlockHeight, '99');
+            assert.equal(rows[0]?.tokenSymbol, 'NEAR');
             assert.equal(rows[0]?.counterparty, 'receiver.near');
             assert.equal(rows[0]?.direction, 'out');
-            assert.equal(rows[0]?.amount, '1000000000000000000000000');
+            assert.equal(rows[0]?.amountWholeUnits, '1');
+            assert.equal(rows[0]?.balanceWholeUnits, '4');
+            assert.equal(rows[0]?.asset, 'NEAR');
+            assert.equal(rows[0]?.amountRaw, '1000000000000000000000000');
             assert.equal(rows[0]?.transactionHash, 'hash1');
             assert.equal(rows[0]?.receiptId, 'receipt1');
-            assert.equal(rows[0]?.tokenBalance, '4000000000000000000000000');
+            assert.equal(rows[0]?.tokenBalanceRaw, '4000000000000000000000000');
         });
 
-        it('should handle multiple transfers in one transaction', function() {
+        it('should handle multiple transfers in one transaction', async function() {
             const history: AccountHistory = {
                 accountId: 'test.near',
                 createdAt: '2024-01-01T00:00:00Z',
@@ -223,6 +228,7 @@ describe('JSON to CSV Converter', function() {
                 transactions: [
                     {
                         block: 200,
+                        transactionBlock: 199,
                         timestamp: 1705314700000000000,
                         transactionHashes: ['hash2'],
                         transfers: [
@@ -258,13 +264,13 @@ describe('JSON to CSV Converter', function() {
                 }
             };
 
-            const rows = convertToCSVRows(history);
+            const rows = await convertToCSVRows(history);
             assert.equal(rows.length, 2);
             assert.equal(rows[0]?.asset, 'NEAR');
             assert.equal(rows[1]?.asset, 'usdc.near');
         });
 
-        it('should skip transactions without transfers', function() {
+        it('should skip transactions without transfers', async function() {
             const history: AccountHistory = {
                 accountId: 'test.near',
                 createdAt: '2024-01-01T00:00:00Z',
@@ -272,6 +278,7 @@ describe('JSON to CSV Converter', function() {
                 transactions: [
                     {
                         block: 100,
+                        transactionBlock: 99,
                         timestamp: 1705314600000000000,
                         transactionHashes: ['hash1'],
                         balanceAfter: {
@@ -282,6 +289,7 @@ describe('JSON to CSV Converter', function() {
                     },
                     {
                         block: 200,
+                        transactionBlock: 199,
                         timestamp: 1705314700000000000,
                         transactionHashes: ['hash2'],
                         transfers: [],
@@ -299,11 +307,11 @@ describe('JSON to CSV Converter', function() {
                 }
             };
 
-            const rows = convertToCSVRows(history);
+            const rows = await convertToCSVRows(history);
             assert.equal(rows.length, 0);
         });
 
-        it('should use transactionHashes[0] if transfer.txHash is missing', function() {
+        it('should use transactionHashes[0] if transfer.txHash is missing', async function() {
             const history: AccountHistory = {
                 accountId: 'test.near',
                 createdAt: '2024-01-01T00:00:00Z',
@@ -311,6 +319,7 @@ describe('JSON to CSV Converter', function() {
                 transactions: [
                     {
                         block: 100,
+                        transactionBlock: 99,
                         timestamp: 1705314600000000000,
                         transactionHashes: ['fallback_hash'],
                         transfers: [
@@ -336,7 +345,7 @@ describe('JSON to CSV Converter', function() {
                 }
             };
 
-            const rows = convertToCSVRows(history);
+            const rows = await convertToCSVRows(history);
             assert.equal(rows.length, 1);
             assert.equal(rows[0]?.transactionHash, 'fallback_hash');
         });
@@ -346,15 +355,19 @@ describe('JSON to CSV Converter', function() {
         it('should generate valid CSV with headers', function() {
             const rows = [
                 {
-                    blockHeight: 100,
+                    receiptBlockHeight: 100,
                     timestamp: '2024-01-15T10:30:00.000Z',
-                    asset: 'NEAR',
                     counterparty: 'test.near',
                     direction: 'out' as const,
-                    amount: '1000000000000000000000000',
+                    transactionBlockHeight: '99',
+                    tokenSymbol: 'NEAR',
+                    amountWholeUnits: '1',
+                    balanceWholeUnits: '5',
+                    asset: 'NEAR',
+                    amountRaw: '1000000000000000000000000',
+                    tokenBalanceRaw: '5000000000000000000000000',
                     transactionHash: 'abc123',
-                    receiptId: 'receipt123',
-                    tokenBalance: '5000000000000000000000000'
+                    receiptId: 'receipt123'
                 }
             ];
 
@@ -362,7 +375,7 @@ describe('JSON to CSV Converter', function() {
             const lines = csv.split('\n');
             
             assert.equal(lines.length, 2);
-            assert.equal(lines[0], 'block_height,timestamp,asset,counterparty,direction,amount,transaction_hash,receipt_id,token_balance');
+            assert.equal(lines[0], 'receipt_block_height,timestamp,counterparty,direction,transaction_block_height,token_symbol,amount_whole_units,balance_whole_units,asset,amount_raw,token_balance_raw,transaction_hash,receipt_id');
             assert.ok(lines[1]?.includes('100'));
             assert.ok(lines[1]?.includes('NEAR'));
             assert.ok(lines[1]?.includes('test.near'));
@@ -373,21 +386,25 @@ describe('JSON to CSV Converter', function() {
             const lines = csv.split('\n');
             
             assert.equal(lines.length, 1);
-            assert.equal(lines[0], 'block_height,timestamp,asset,counterparty,direction,amount,transaction_hash,receipt_id,token_balance');
+            assert.equal(lines[0], 'receipt_block_height,timestamp,counterparty,direction,transaction_block_height,token_symbol,amount_whole_units,balance_whole_units,asset,amount_raw,token_balance_raw,transaction_hash,receipt_id');
         });
 
         it('should properly escape special characters in CSV', function() {
             const rows = [
                 {
-                    blockHeight: 100,
+                    receiptBlockHeight: 100,
                     timestamp: '2024-01-15T10:30:00.000Z',
-                    asset: 'token,with,commas',
                     counterparty: 'test"quote".near',
                     direction: 'in' as const,
-                    amount: '1000',
+                    transactionBlockHeight: '99',
+                    tokenSymbol: 'TOKEN',
+                    amountWholeUnits: '1',
+                    balanceWholeUnits: '2',
+                    asset: 'token,with,commas',
+                    amountRaw: '1000',
+                    tokenBalanceRaw: '2000',
                     transactionHash: 'hash',
-                    receiptId: 'receipt',
-                    tokenBalance: '2000'
+                    receiptId: 'receipt'
                 }
             ];
 
@@ -413,7 +430,7 @@ describe('JSON to CSV Converter', function() {
             }
         });
 
-        it('should convert a complete JSON file to CSV', function() {
+        it('should convert a complete JSON file to CSV', async function() {
             // Create sample input file
             const sampleHistory: AccountHistory = {
                 accountId: 'myaccount.near',
@@ -422,6 +439,7 @@ describe('JSON to CSV Converter', function() {
                 transactions: [
                     {
                         block: 151391583,
+                        transactionBlock: 151391582,
                         timestamp: 1732783100000000000,
                         transactionHashes: ['tx1hash'],
                         transfers: [
@@ -445,6 +463,7 @@ describe('JSON to CSV Converter', function() {
                     },
                     {
                         block: 151391587,
+                        transactionBlock: 151391586,
                         timestamp: 1732783104000000000,
                         transactionHashes: ['tx2hash'],
                         transfers: [
@@ -476,7 +495,7 @@ describe('JSON to CSV Converter', function() {
             fs.writeFileSync(testInputFile, JSON.stringify(sampleHistory, null, 2));
 
             // Convert to CSV rows
-            const rows = convertToCSVRows(sampleHistory);
+            const rows = await convertToCSVRows(sampleHistory);
             assert.equal(rows.length, 2);
 
             // Generate CSV
@@ -489,7 +508,7 @@ describe('JSON to CSV Converter', function() {
             const lines = csvContent.split('\n');
 
             assert.equal(lines.length, 3); // header + 2 data rows
-            assert.ok(lines[0]?.includes('block_height'));
+            assert.ok(lines[0]?.includes('receipt_block_height'));
             assert.ok(lines[1]?.includes('151391583'));
             assert.ok(lines[1]?.includes('nep141:eth.omft.near'));
             assert.ok(lines[2]?.includes('151391587'));
