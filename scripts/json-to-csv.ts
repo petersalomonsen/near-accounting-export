@@ -48,11 +48,10 @@ interface AccountHistory {
 }
 
 interface CSVRow {
-    receiptBlockHeight: number;
+    changeBlockHeight: number;
     timestamp: string;
     counterparty: string;
     direction: 'in' | 'out';
-    transactionBlockHeight: string;
     tokenSymbol: string;
     amountWholeUnits: string;
     balanceWholeUnits: string;
@@ -161,11 +160,10 @@ async function convertToCSVRows(history: AccountHistory): Promise<CSVRow[]> {
             const balanceWholeUnits = formatTokenAmount(tokenBalanceRaw, metadata.decimals);
             
             const row: CSVRow = {
-                receiptBlockHeight: transaction.block,
+                changeBlockHeight: transaction.block,
                 timestamp: formatTimestamp(transaction.timestamp),
                 counterparty: transfer.counterparty || '',
                 direction: transfer.direction,
-                transactionBlockHeight: transaction.transactionBlock?.toString() || '',
                 tokenSymbol: metadata.symbol,
                 amountWholeUnits,
                 balanceWholeUnits,
@@ -184,18 +182,17 @@ async function convertToCSVRows(history: AccountHistory): Promise<CSVRow[]> {
 
 /**
  * Generate CSV content from rows
- * Sorts rows by receipt_block_height (ascending)
+ * Sorts rows by change_block_height (ascending)
  */
 function generateCSV(rows: CSVRow[]): string {
-    // Sort by receipt block height (ascending order)
-    const sortedRows = [...rows].sort((a, b) => a.receiptBlockHeight - b.receiptBlockHeight);
+    // Sort by change block height (ascending order)
+    const sortedRows = [...rows].sort((a, b) => a.changeBlockHeight - b.changeBlockHeight);
     
     const headers = [
-        'receipt_block_height',
+        'change_block_height',
         'timestamp',
         'counterparty',
         'direction',
-        'transaction_block_height',
         'token_symbol',
         'amount_whole_units',
         'balance_whole_units',
@@ -210,11 +207,10 @@ function generateCSV(rows: CSVRow[]): string {
 
     for (const row of sortedRows) {
         const values = [
-            String(row.receiptBlockHeight),
+            String(row.changeBlockHeight),
             escapeCSV(row.timestamp),
             escapeCSV(row.counterparty),
             escapeCSV(row.direction),
-            escapeCSV(row.transactionBlockHeight),
             escapeCSV(row.tokenSymbol),
             escapeCSV(row.amountWholeUnits),
             escapeCSV(row.balanceWholeUnits),
@@ -293,18 +289,17 @@ Description:
   to fetch missing timestamps.
 
   The CSV file contains the following columns (human-friendly on left, technical on right):
-    - receipt_block_height: Block where balance change occurred (used for sorting)
+    - change_block_height: Block where balance change occurred (used for sorting)
     - timestamp: ISO 8601 timestamp of the transfer
     - counterparty: The other account involved in the transfer
     - direction: "in" for incoming transfers, "out" for outgoing transfers
-    - transaction_block_height: Block where transaction was submitted (explorer-friendly)
     - token_symbol: Human-readable token symbol (NEAR, USDT, wNEAR, etc.)
     - amount_whole_units: Amount transferred in whole units (with decimals applied)
     - balance_whole_units: Token balance after transfer (with decimals applied)
     - asset: Token contract ID (NEAR for native, contract address for FT/MT)
     - amount_raw: Amount transferred in base units (as string to prevent Excel issues)
     - token_balance_raw: Token balance in base units (as string)
-    - transaction_hash: Hash of the transaction
+    - transaction_hash: Transaction hash (can be used to look up transaction in explorers)
     - receipt_id: Receipt ID of the transfer
 
 Examples:

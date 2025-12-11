@@ -206,8 +206,7 @@ describe('JSON to CSV Converter', function() {
 
             const rows = await convertToCSVRows(history);
             assert.equal(rows.length, 1);
-            assert.equal(rows[0]?.receiptBlockHeight, 100);
-            assert.equal(rows[0]?.transactionBlockHeight, '99');
+            assert.equal(rows[0]?.changeBlockHeight, 100);
             assert.equal(rows[0]?.tokenSymbol, 'NEAR');
             assert.equal(rows[0]?.counterparty, 'receiver.near');
             assert.equal(rows[0]?.direction, 'out');
@@ -355,11 +354,10 @@ describe('JSON to CSV Converter', function() {
         it('should generate valid CSV with headers', function() {
             const rows = [
                 {
-                    receiptBlockHeight: 100,
+                    changeBlockHeight: 100,
                     timestamp: '2024-01-15T10:30:00.000Z',
                     counterparty: 'test.near',
                     direction: 'out' as const,
-                    transactionBlockHeight: '99',
                     tokenSymbol: 'NEAR',
                     amountWholeUnits: '1',
                     balanceWholeUnits: '5',
@@ -375,7 +373,7 @@ describe('JSON to CSV Converter', function() {
             const lines = csv.split('\n');
             
             assert.equal(lines.length, 2);
-            assert.equal(lines[0], 'receipt_block_height,timestamp,counterparty,direction,transaction_block_height,token_symbol,amount_whole_units,balance_whole_units,asset,amount_raw,token_balance_raw,transaction_hash,receipt_id');
+            assert.equal(lines[0], 'change_block_height,timestamp,counterparty,direction,token_symbol,amount_whole_units,balance_whole_units,asset,amount_raw,token_balance_raw,transaction_hash,receipt_id');
             assert.ok(lines[1]?.includes('100'));
             assert.ok(lines[1]?.includes('NEAR'));
             assert.ok(lines[1]?.includes('test.near'));
@@ -386,17 +384,16 @@ describe('JSON to CSV Converter', function() {
             const lines = csv.split('\n');
             
             assert.equal(lines.length, 1);
-            assert.equal(lines[0], 'receipt_block_height,timestamp,counterparty,direction,transaction_block_height,token_symbol,amount_whole_units,balance_whole_units,asset,amount_raw,token_balance_raw,transaction_hash,receipt_id');
+            assert.equal(lines[0], 'change_block_height,timestamp,counterparty,direction,token_symbol,amount_whole_units,balance_whole_units,asset,amount_raw,token_balance_raw,transaction_hash,receipt_id');
         });
 
         it('should properly escape special characters in CSV', function() {
             const rows = [
                 {
-                    receiptBlockHeight: 100,
+                    changeBlockHeight: 100,
                     timestamp: '2024-01-15T10:30:00.000Z',
                     counterparty: 'test"quote".near',
                     direction: 'in' as const,
-                    transactionBlockHeight: '99',
                     tokenSymbol: 'TOKEN',
                     amountWholeUnits: '1',
                     balanceWholeUnits: '2',
@@ -508,7 +505,7 @@ describe('JSON to CSV Converter', function() {
             const lines = csvContent.split('\n');
 
             assert.equal(lines.length, 3); // header + 2 data rows
-            assert.ok(lines[0]?.includes('receipt_block_height'));
+            assert.ok(lines[0]?.includes('change_block_height'));
             assert.ok(lines[1]?.includes('151391583'));
             assert.ok(lines[1]?.includes('nep141:eth.omft.near'));
             assert.ok(lines[2]?.includes('151391587'));
