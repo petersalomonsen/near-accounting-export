@@ -38,10 +38,10 @@ export interface BalanceChanges {
  * Transfer detail capturing the counterparty and amount for a balance change
  */
 export interface TransferDetail {
-    type: 'near' | 'ft' | 'mt' | 'staking_reward';  // NEAR native, Fungible Token, Multi-Token (intents), Staking Reward
+    type: 'near' | 'ft' | 'mt' | 'staking_reward' | 'action_receipt_gas_reward';  // NEAR native, Fungible Token, Multi-Token (intents), Staking Reward, Contract Gas Reward
     direction: 'in' | 'out';
     amount: string;
-    counterparty: string;  // The other account involved in the transfer
+    counterparty: string;  // The other account involved in the transfer (for gas rewards: the caller who triggered the contract execution)
     tokenId?: string;  // For FT: contract address, for MT: token identifier, for staking_reward: pool address
     memo?: string;
     txHash?: string;
@@ -863,7 +863,8 @@ function processBlockReceipts(
     targetAccountId: string,
     transfers: TransferDetail[],
     matchingTxHashes: Set<string>,
-    processedReceipts: Set<string>
+    processedReceipts: Set<string>,
+    balanceBefore?: bigint
 ): void {
     // Check all shards for receipt execution outcomes
     for (const shard of neardataBlock.shards || []) {
@@ -973,6 +974,96 @@ function processBlockReceipts(
                 matchingTxHashes.add(txHash);
             }
         }
+        
+        // Process state_changes to find action_receipt_gas_reward for the target account
+        for (const stateChange of shard.state_changes || []) {
+            if (stateChange.type === 'account_update' && 
+                stateChange.cause?.type === 'action_receipt_gas_reward' &&
+                stateChange.change?.account_id === targetAccountId) {
+                
+                const receiptHash = stateChange.cause.receipt_hash;
+                
+                // Find the receipt that caused this gas reward to get the caller (predecessor)
+                let caller = 'unknown';
+                let txHash: string | undefined;
+                
+                for (const receiptExecution of shard.receipt_execution_outcomes || []) {
+                    if (receiptExecution.receipt?.receipt_id === receiptHash) {
+                        caller = receiptExecution.receipt.predecessor_id;
+                        txHash = receiptExecution.tx_hash;
+                        break;
+                    }
+                }
+                
+                // Calculate the gas reward amount by finding the previous account state
+                // First try to find the receipt_processing state change for the same receipt
+                let previousAmount: bigint | null = null;
+                for (const prevChange of shard.state_changes || []) {
+                    if (prevChange.type === 'account_update' &&
+                        prevChange.cause?.type === 'receipt_processing' &&
+                        prevChange.cause?.receipt_hash === receiptHash &&
+                        prevChange.change?.account_id === targetAccountId) {
+                        previousAmount = BigInt(prevChange.change.amount);
+                        break;
+                    }
+                }
+                
+                // If no receipt_processing found, try to find the most recent account state change
+                // in this block before the gas reward (any cause type)
+                if (previousAmount === null) {
+                    // Collect all state changes for this account, in order
+                    const accountChanges: Array<{amount: bigint, cause: string, receiptHash?: string}> = [];
+                    for (const sc of shard.state_changes || []) {
+                        if (sc.type === 'account_update' && sc.change?.account_id === targetAccountId) {
+                            accountChanges.push({
+                                amount: BigInt(sc.change.amount),
+                                cause: sc.cause?.type || 'unknown',
+                                receiptHash: sc.cause?.receipt_hash
+                            });
+                        }
+                    }
+                    
+                    // Find the index of our gas reward change and use the previous one
+                    for (let i = 0; i < accountChanges.length; i++) {
+                        const change = accountChanges[i];
+                        if (change && change.cause === 'action_receipt_gas_reward' && 
+                            change.receiptHash === receiptHash) {
+                            const prevChange = accountChanges[i - 1];
+                            if (i > 0 && prevChange) {
+                                previousAmount = prevChange.amount;
+                            }
+                            break;
+                        }
+                    }
+                }
+                
+                // If still no previous amount found, use the balanceBefore parameter
+                if (previousAmount === null && balanceBefore !== undefined) {
+                    previousAmount = balanceBefore;
+                }
+                
+                if (previousAmount !== null) {
+                    const newAmount = BigInt(stateChange.change.amount);
+                    const gasRewardAmount = newAmount - previousAmount;
+                    
+                    if (gasRewardAmount > 0n) {
+                        transfers.push({
+                            type: 'action_receipt_gas_reward',
+                            direction: 'in',
+                            amount: gasRewardAmount.toString(),
+                            counterparty: caller,
+                            memo: 'contract gas reward (30% of gas burnt)',
+                            txHash,
+                            receiptId: receiptHash
+                        });
+                        
+                        if (txHash && !matchingTxHashes.has(txHash)) {
+                            matchingTxHashes.add(txHash);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -980,10 +1071,12 @@ function processBlockReceipts(
  * Find transaction that caused a balance change
  * Uses neardata.xyz API to get complete block data with execution outcomes and logs
  * Also checks subsequent blocks for cross-contract call receipts
+ * @param balanceBefore - Optional NEAR balance before this block (used for gas reward calculation when no receipt_processing state change exists)
  */
 export async function findBalanceChangingTransaction(
     targetAccountId: string,
-    balanceChangeBlock: number
+    balanceChangeBlock: number,
+    balanceBefore?: bigint
 ): Promise<TransactionInfo> {
     if (getStopSignal()) {
         throw new Error('Operation cancelled by user');
@@ -1001,7 +1094,7 @@ export async function findBalanceChangingTransaction(
             const processedReceipts = new Set<string>();
 
             // Process the main block
-            processBlockReceipts(neardataBlock, targetAccountId, transfers, matchingTxHashes, processedReceipts);
+            processBlockReceipts(neardataBlock, targetAccountId, transfers, matchingTxHashes, processedReceipts, balanceBefore);
 
             // Also check subsequent blocks for cross-contract call receipts.
             // This is needed because NEAR deducts the deposit from sender's balance when
@@ -1015,8 +1108,12 @@ export async function findBalanceChangingTransaction(
             //
             // So when we detect a balance change at block N, we need to check block N+1
             // (and possibly N+2, N+3) to find the receipt that shows where the funds went.
+            // 
+            // Note: We always check subsequent blocks even if we found gas rewards,
+            // because gas rewards don't explain the full balance change (e.g., staking deposits).
             const MAX_SUBSEQUENT_BLOCKS = 3;
-            for (let i = 1; i <= MAX_SUBSEQUENT_BLOCKS && transfers.length === 0; i++) {
+            const hasOnlyGasRewards = transfers.every(t => t.type === 'action_receipt_gas_reward');
+            for (let i = 1; i <= MAX_SUBSEQUENT_BLOCKS && (transfers.length === 0 || hasOnlyGasRewards); i++) {
                 const subsequentBlock = await fetchNeardataBlock(balanceChangeBlock + i);
                 if (subsequentBlock) {
                     processBlockReceipts(subsequentBlock, targetAccountId, transfers, matchingTxHashes, processedReceipts);

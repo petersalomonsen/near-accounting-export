@@ -786,7 +786,9 @@ async function enrichTransactionsWithTransfers(
         
         try {
             console.log(`Enriching transaction at block ${tx.block}...`);
-            const txInfo = await findBalanceChangingTransaction(history.accountId, tx.block);
+            // Pass the NEAR balance before this block for gas reward calculation
+            const nearBalanceBefore = tx.balanceBefore?.near ? BigInt(tx.balanceBefore.near) : undefined;
+            const txInfo = await findBalanceChangingTransaction(history.accountId, tx.block, nearBalanceBefore);
             
             if (txInfo && txInfo.transfers && txInfo.transfers.length > 0) {
                 tx.transfers = txInfo.transfers;

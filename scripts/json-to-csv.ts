@@ -9,7 +9,7 @@ import { getTokenMetadata, formatTokenAmount } from './token-metadata.js';
 
 // Types matching the data structures from get-account-history.ts
 interface TransferDetail {
-    type: 'near' | 'ft' | 'mt' | 'staking_reward';
+    type: 'near' | 'ft' | 'mt' | 'staking_reward' | 'action_receipt_gas_reward';
     direction: 'in' | 'out';
     amount: string;
     counterparty: string;
@@ -26,13 +26,29 @@ interface BalanceSnapshot {
     stakingPools?: Record<string, string>;
 }
 
+interface BalanceChange {
+    start: string;
+    end: string;
+    diff: string;
+}
+
+interface Changes {
+    nearChanged: boolean;
+    nearDiff?: string;
+    tokensChanged: Record<string, BalanceChange>;
+    intentsChanged: Record<string, BalanceChange>;
+    stakingChanged?: Record<string, BalanceChange>;
+}
+
 interface TransactionEntry {
     block: number;
     transactionBlock?: number | null;
     timestamp: number | null;
     transactionHashes: string[];
     transfers?: TransferDetail[];
+    balanceBefore?: BalanceSnapshot;
     balanceAfter?: BalanceSnapshot;
+    changes?: Changes;
 }
 
 interface AccountHistory {
@@ -134,46 +150,137 @@ function getTokenBalance(transfer: TransferDetail, balanceAfter: BalanceSnapshot
 }
 
 /**
- * Convert account history to CSV rows
+ * Convert account history to CSV rows based on actual balance changes
+ * Creates one row per asset that changed in each block
  */
 async function convertToCSVRows(history: AccountHistory): Promise<CSVRow[]> {
     const rows: CSVRow[] = [];
 
     for (const transaction of history.transactions) {
-        if (!transaction.transfers || transaction.transfers.length === 0) {
+        const changes = transaction.changes;
+        if (!changes) {
             continue;
         }
 
-        for (const transfer of transaction.transfers) {
-            // Get asset name (contract ID or "NEAR")
-            const asset = getAssetName(transfer);
+        const timestamp = formatTimestamp(transaction.timestamp);
+        const txHash = transaction.transactionHashes.length > 0 ? transaction.transactionHashes[0] || '' : '';
+        
+        // Find matching transfer for counterparty info (best effort)
+        const findTransferForAsset = (asset: string, type: 'near' | 'ft' | 'mt' | 'staking_reward'): TransferDetail | undefined => {
+            if (!transaction.transfers) return undefined;
+            return transaction.transfers.find(t => {
+                if (type === 'near') return t.type === 'near' || t.type === 'action_receipt_gas_reward';
+                if (type === 'mt') return t.type === 'mt' && t.tokenId === asset;
+                if (type === 'ft') return t.type === 'ft' && t.tokenId === asset;
+                if (type === 'staking_reward') return t.type === 'staking_reward' && t.tokenId === asset;
+                return false;
+            });
+        };
+
+        // Process NEAR changes
+        if (changes.nearChanged && changes.nearDiff) {
+            const diff = BigInt(changes.nearDiff);
+            const direction: 'in' | 'out' = diff >= 0n ? 'in' : 'out';
+            const amount = diff >= 0n ? changes.nearDiff : changes.nearDiff.substring(1); // Remove leading minus
+            const balanceRaw = transaction.balanceAfter?.near || '0';
             
-            // Get token metadata for symbol and decimals
-            const metadata = await getTokenMetadata(
-                asset === 'NEAR' ? 'NEAR' : (transfer.tokenId || asset),
-                transfer.type
-            );
+            const metadata = await getTokenMetadata('NEAR', 'near');
+            const matchingTransfer = findTransferForAsset('NEAR', 'near');
             
-            // Format amount and balance with decimals
-            const amountWholeUnits = formatTokenAmount(transfer.amount || '0', metadata.decimals);
-            const tokenBalanceRaw = getTokenBalance(transfer, transaction.balanceAfter);
-            const balanceWholeUnits = formatTokenAmount(tokenBalanceRaw, metadata.decimals);
-            
-            const row: CSVRow = {
+            rows.push({
                 changeBlockHeight: transaction.block,
-                timestamp: formatTimestamp(transaction.timestamp),
-                counterparty: transfer.counterparty || '',
-                direction: transfer.direction,
+                timestamp,
+                counterparty: matchingTransfer?.counterparty || '',
+                direction,
                 tokenSymbol: metadata.symbol,
-                amountWholeUnits,
-                balanceWholeUnits,
-                asset: asset,
-                amountRaw: transfer.amount || '',
-                tokenBalanceRaw,
-                transactionHash: transfer.txHash || (transaction.transactionHashes.length > 0 ? transaction.transactionHashes[0] || '' : ''),
-                receiptId: transfer.receiptId || ''
-            };
-            rows.push(row);
+                amountWholeUnits: formatTokenAmount(amount, metadata.decimals),
+                balanceWholeUnits: formatTokenAmount(balanceRaw, metadata.decimals),
+                asset: 'NEAR',
+                amountRaw: amount,
+                tokenBalanceRaw: balanceRaw,
+                transactionHash: matchingTransfer?.txHash || txHash,
+                receiptId: matchingTransfer?.receiptId || ''
+            });
+        }
+
+        // Process fungible token changes
+        for (const [tokenId, change] of Object.entries(changes.tokensChanged)) {
+            const diff = BigInt(change.diff);
+            const direction: 'in' | 'out' = diff >= 0n ? 'in' : 'out';
+            const amount = diff >= 0n ? change.diff : change.diff.substring(1);
+            const balanceRaw = transaction.balanceAfter?.fungibleTokens?.[tokenId] || '0';
+            
+            const metadata = await getTokenMetadata(tokenId, 'ft');
+            const matchingTransfer = findTransferForAsset(tokenId, 'ft');
+            
+            rows.push({
+                changeBlockHeight: transaction.block,
+                timestamp,
+                counterparty: matchingTransfer?.counterparty || '',
+                direction,
+                tokenSymbol: metadata.symbol,
+                amountWholeUnits: formatTokenAmount(amount, metadata.decimals),
+                balanceWholeUnits: formatTokenAmount(balanceRaw, metadata.decimals),
+                asset: tokenId,
+                amountRaw: amount,
+                tokenBalanceRaw: balanceRaw,
+                transactionHash: matchingTransfer?.txHash || txHash,
+                receiptId: matchingTransfer?.receiptId || ''
+            });
+        }
+
+        // Process intents (multi-token) changes
+        for (const [tokenId, change] of Object.entries(changes.intentsChanged)) {
+            const diff = BigInt(change.diff);
+            const direction: 'in' | 'out' = diff >= 0n ? 'in' : 'out';
+            const amount = diff >= 0n ? change.diff : change.diff.substring(1);
+            const balanceRaw = transaction.balanceAfter?.intentsTokens?.[tokenId] || '0';
+            
+            const metadata = await getTokenMetadata(tokenId, 'mt');
+            const matchingTransfer = findTransferForAsset(tokenId, 'mt');
+            
+            rows.push({
+                changeBlockHeight: transaction.block,
+                timestamp,
+                counterparty: matchingTransfer?.counterparty || '',
+                direction,
+                tokenSymbol: metadata.symbol,
+                amountWholeUnits: formatTokenAmount(amount, metadata.decimals),
+                balanceWholeUnits: formatTokenAmount(balanceRaw, metadata.decimals),
+                asset: tokenId,
+                amountRaw: amount,
+                tokenBalanceRaw: balanceRaw,
+                transactionHash: matchingTransfer?.txHash || txHash,
+                receiptId: matchingTransfer?.receiptId || ''
+            });
+        }
+
+        // Process staking changes
+        if (changes.stakingChanged) {
+            for (const [poolId, change] of Object.entries(changes.stakingChanged)) {
+                const diff = BigInt(change.diff);
+                const direction: 'in' | 'out' = diff >= 0n ? 'in' : 'out';
+                const amount = diff >= 0n ? change.diff : change.diff.substring(1);
+                const balanceRaw = transaction.balanceAfter?.stakingPools?.[poolId] || '0';
+                
+                const metadata = await getTokenMetadata(poolId, 'staking_reward');
+                const matchingTransfer = findTransferForAsset(poolId, 'staking_reward');
+                
+                rows.push({
+                    changeBlockHeight: transaction.block,
+                    timestamp,
+                    counterparty: matchingTransfer?.counterparty || poolId,
+                    direction,
+                    tokenSymbol: metadata.symbol,
+                    amountWholeUnits: formatTokenAmount(amount, metadata.decimals),
+                    balanceWholeUnits: formatTokenAmount(balanceRaw, metadata.decimals),
+                    asset: `STAKING:${poolId}`,
+                    amountRaw: amount,
+                    tokenBalanceRaw: balanceRaw,
+                    transactionHash: matchingTransfer?.txHash || txHash,
+                    receiptId: matchingTransfer?.receiptId || ''
+                });
+            }
         }
     }
 
@@ -401,4 +508,4 @@ export {
     getAssetName,
     getTokenBalance
 };
-export type { AccountHistory, TransactionEntry, TransferDetail, BalanceSnapshot, CSVRow };
+export type { AccountHistory, TransactionEntry, TransferDetail, BalanceSnapshot, CSVRow, Changes, BalanceChange };
