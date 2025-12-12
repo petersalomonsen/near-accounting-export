@@ -953,6 +953,7 @@ function processBlockReceipts(
             }
 
             // Check receipt logs for EVENT_JSON entries mentioning the account (fallback)
+            // Also check plain text logs like wrap.near uses: "Transfer X from Y to Z"
             if (!affectsTargetAccount) {
                 for (const log of logs) {
                     if (log.startsWith('EVENT_JSON:')) {
@@ -961,10 +962,49 @@ function processBlockReceipts(
                             const eventStr = JSON.stringify(eventData);
                             if (eventStr.includes(targetAccountId)) {
                                 affectsTargetAccount = true;
+                                // Parse FT transfers from this receipt
+                                const ftTransfers = parseFtTransferEvents(logs, targetAccountId, receiverId, txHash, receiptId);
+                                if (ftTransfers.length > 0) {
+                                    transfers.push(...ftTransfers);
+                                }
                                 break;
                             }
                         } catch (e) {
                             // Skip invalid JSON
+                        }
+                    }
+                    // Check for plain text transfer logs (wrap.near style)
+                    // Format: "Transfer X from Y to Z" 
+                    else if (log.includes(targetAccountId)) {
+                        const plainTransferMatch = log.match(/^Transfer (\d+) from ([^\s]+) to ([^\s]+)$/);
+                        if (plainTransferMatch) {
+                            const amount = plainTransferMatch[1];
+                            const fromAccount = plainTransferMatch[2];
+                            const toAccount = plainTransferMatch[3];
+                            
+                            if (toAccount === targetAccountId) {
+                                transfers.push({
+                                    type: 'ft',
+                                    direction: 'in',
+                                    amount: amount!,
+                                    counterparty: fromAccount!,
+                                    tokenId: receiverId, // The FT contract
+                                    txHash,
+                                    receiptId
+                                });
+                                affectsTargetAccount = true;
+                            } else if (fromAccount === targetAccountId) {
+                                transfers.push({
+                                    type: 'ft',
+                                    direction: 'out',
+                                    amount: amount!,
+                                    counterparty: toAccount!,
+                                    tokenId: receiverId, // The FT contract
+                                    txHash,
+                                    receiptId
+                                });
+                                affectsTargetAccount = true;
+                            }
                         }
                     }
                 }
@@ -1106,14 +1146,22 @@ export async function findBalanceChangingTransaction(
             // - Block N+1: deposit_and_stake receipt executes on staking pool
             //   The receipt with deposit details (counterparty, amount, method) is here
             //
-            // So when we detect a balance change at block N, we need to check block N+1
-            // (and possibly N+2, N+3) to find the receipt that shows where the funds went.
+            // Example 2: Intents withdrawal creating FT transfer
+            // - Block N: act_proposal executes, starts withdrawal from intents.near
+            //   Creates receipt chain that eventually results in FT transfer to target
+            // - Block N+4: FT contract (wrap.near) executes ft_transfer to target
+            //   The FT transfer receipt (with logs) that credits the target is here
+            //
+            // So when we detect a balance change at block N, we need to check subsequent
+            // blocks (N+1, N+2, ...) to find the receipts that show where the funds went
+            // or came from.
             // 
-            // Note: We always check subsequent blocks even if we found gas rewards,
-            // because gas rewards don't explain the full balance change (e.g., staking deposits).
-            const MAX_SUBSEQUENT_BLOCKS = 3;
-            const hasOnlyGasRewards = transfers.every(t => t.type === 'action_receipt_gas_reward');
-            for (let i = 1; i <= MAX_SUBSEQUENT_BLOCKS && (transfers.length === 0 || hasOnlyGasRewards); i++) {
+            // We always check subsequent blocks because:
+            // - Gas rewards don't explain the full balance change (e.g., staking deposits)
+            // - Cross-contract FT transfers (e.g., wrap.near via intents) execute later
+            // - Multiple receipt chains can execute across several blocks
+            const MAX_SUBSEQUENT_BLOCKS = 5;
+            for (let i = 1; i <= MAX_SUBSEQUENT_BLOCKS; i++) {
                 const subsequentBlock = await fetchNeardataBlock(balanceChangeBlock + i);
                 if (subsequentBlock) {
                     processBlockReceipts(subsequentBlock, targetAccountId, transfers, matchingTxHashes, processedReceipts);

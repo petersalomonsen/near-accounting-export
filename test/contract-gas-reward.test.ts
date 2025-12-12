@@ -250,4 +250,81 @@ describe('Contract Gas Reward Investigation', function() {
         
         assert(foundReceipt, 'Should find receipt Az63YBQFDTSbsHaFQ8vKGDFxqreG4Jby4qsU4PQ9P7v5');
     });
+
+    it('should parse plain text FT transfer logs from wrap.near at block 171593921', async function() {
+        // Block 171593921 has a wrap.near FT transfer that uses plain text log format
+        // instead of EVENT_JSON. The log is: "Transfer 200000000000000000000000 from intents.near to romakqatesting.sputnik-dao.near"
+        // This tests that we correctly parse this non-standard log format.
+        
+        const blockHeight = 171593921;
+        
+        // Get balance before and after to verify the change
+        const balanceBefore = await getAllBalances(
+            TEST_ACCOUNT,
+            blockHeight - 1,
+            TOKEN_CONTRACTS,
+            INTENTS_TOKENS,
+            true
+        );
+        
+        const balanceAfter = await getAllBalances(
+            TEST_ACCOUNT,
+            blockHeight,
+            TOKEN_CONTRACTS,
+            INTENTS_TOKENS,
+            true
+        );
+        
+        // Verify wrap.near balance changed
+        const wrapBefore = BigInt(balanceBefore.fungibleTokens['wrap.near'] || '0');
+        const wrapAfter = BigInt(balanceAfter.fungibleTokens['wrap.near'] || '0');
+        const wrapDiff = wrapAfter - wrapBefore;
+        
+        console.log(`\nwrap.near balance before: ${wrapBefore}`);
+        console.log(`wrap.near balance after: ${wrapAfter}`);
+        console.log(`wrap.near diff: ${wrapDiff} (${Number(wrapDiff) / 1e24} wNEAR)`);
+        
+        // The transfer is 0.2 wNEAR = 200000000000000000000000 yoctoNEAR
+        assert.equal(wrapDiff.toString(), '200000000000000000000000', 'wrap.near balance should increase by 0.2 wNEAR');
+        
+        // Get transfer details
+        const txInfo = await findBalanceChangingTransaction(TEST_ACCOUNT, blockHeight);
+        
+        console.log(`\nTransaction hashes: ${JSON.stringify(txInfo.transactionHashes)}`);
+        console.log(`Transfers found: ${txInfo.transfers.length}`);
+        console.log(`Transfers: ${JSON.stringify(txInfo.transfers, null, 2)}`);
+        
+        // Should find the FT transfer from wrap.near
+        const ftTransfer = txInfo.transfers.find(t => 
+            t.type === 'ft' && 
+            t.tokenId === 'wrap.near' && 
+            t.direction === 'in'
+        );
+        
+        assert(ftTransfer, 'Should find FT transfer from wrap.near');
+        assert.equal(ftTransfer.amount, '200000000000000000000000', 'FT transfer amount should be 0.2 wNEAR');
+        assert.equal(ftTransfer.counterparty, 'intents.near', 'FT transfer counterparty should be intents.near');
+        assert.equal(ftTransfer.receiptId, '3pcD1HKN721MebbBE1CpjVkFenVjUR7ChDUWGKxf2tRa', 'FT transfer receipt ID should match');
+        
+        // Also verify the block data has the plain text log
+        const blockData = await fetchNeardataBlock(blockHeight);
+        assert(blockData, 'Should fetch block data');
+        
+        let foundPlainTextLog = false;
+        for (const shard of blockData.shards || []) {
+            for (const receiptExecution of shard.receipt_execution_outcomes || []) {
+                if (receiptExecution.receipt?.receipt_id === '3pcD1HKN721MebbBE1CpjVkFenVjUR7ChDUWGKxf2tRa') {
+                    const logs = receiptExecution.execution_outcome?.outcome?.logs || [];
+                    for (const log of logs) {
+                        if (log.startsWith('Transfer 200000000000000000000000 from intents.near to romakqatesting.sputnik-dao.near')) {
+                            foundPlainTextLog = true;
+                            console.log(`\nFound plain text log: "${log}"`);
+                        }
+                    }
+                }
+            }
+        }
+        
+        assert(foundPlainTextLog, 'Should find plain text transfer log in block data');
+    });
 });
