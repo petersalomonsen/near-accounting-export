@@ -52,6 +52,16 @@ See [API.md](API.md) for complete API documentation, including:
 - Job creation and management
 - Status tracking
 - JSON and CSV downloads
+- **Deployment options** (Fly.io, Docker Compose)
+
+**Quick Deploy to Fly.io:**
+```bash
+fly launch --no-deploy
+fly volumes create accounting_data --size 1
+fly secrets set FASTNEAR_API_KEY=xxx NEARBLOCKS_API_KEY=xxx
+fly deploy
+```
+See [API.md](API.md) for detailed deployment instructions.
 
 ### Command Line
 

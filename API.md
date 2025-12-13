@@ -556,11 +556,130 @@ Monitor the API server using:
 4. **Job Status**: Track failed jobs for investigation
 5. **Rate Limiting**: Monitor blocked requests if rate limiting is enabled
 
-## Support
+## Deployment
 
-For issues or questions:
-- GitHub Issues: https://github.com/petersalomonsen/near-accounting-export/issues
-- Documentation: See README.md in the repository
+### Fly.io Deployment
+
+Fly.io provides a simple platform for deploying the API server with persistent storage.
+
+#### Prerequisites
+
+1. Install the Fly.io CLI: https://fly.io/docs/hands-on/install-flyctl/
+2. Sign up for a Fly.io account: `fly auth signup` or `fly auth login`
+
+#### Initial Deployment
+
+1. **Launch the app** (first time only):
+   ```bash
+   fly launch --no-deploy
+   ```
+   This will use the existing `fly.toml` configuration.
+
+2. **Create a persistent volume** for data storage:
+   ```bash
+   fly volumes create accounting_data --size 1
+   ```
+   Note: The volume name `accounting_data` must match the `source` in `fly.toml`.
+
+3. **Set secrets** for API keys:
+   ```bash
+   fly secrets set FASTNEAR_API_KEY=your_fastnear_api_key_here
+   fly secrets set NEARBLOCKS_API_KEY=your_nearblocks_api_key_here
+   ```
+
+4. **Deploy the application**:
+   ```bash
+   fly deploy
+   ```
+
+#### Accessing Your Deployment
+
+After deployment, your API will be available at:
+```
+https://near-accounting-export.fly.dev
+```
+
+Check the health endpoint:
+```bash
+curl https://near-accounting-export.fly.dev/health
+```
+
+#### Updating the Deployment
+
+To deploy changes:
+```bash
+# Build locally first
+npm run build
+
+# Deploy to Fly.io
+fly deploy
+```
+
+#### Viewing Logs
+
+Monitor your application logs:
+```bash
+fly logs
+```
+
+#### Scaling
+
+To increase resources (if needed):
+```bash
+# Scale memory
+fly scale memory 1024
+
+# Scale to multiple machines (not recommended due to in-memory job tracking)
+fly scale count 2
+```
+
+**Important Limitation**: The current implementation uses in-memory tracking for running jobs (`runningJobs` Map). This means:
+- Only run a single instance (`fly scale count 1`)
+- Running multiple instances will cause jobs to be tracked separately per instance
+- For multi-instance deployments, consider implementing Redis or database-backed job tracking
+
+#### Volume Management
+
+View volumes:
+```bash
+fly volumes list
+```
+
+Extend volume size:
+```bash
+fly volumes extend <volume_id> --size 2
+```
+
+#### Environment Variables
+
+View current secrets:
+```bash
+fly secrets list
+```
+
+Update a secret:
+```bash
+fly secrets set NEAR_RPC_ENDPOINT=https://your-custom-rpc.com
+```
+
+#### SSH Access
+
+Access your running instance:
+```bash
+fly ssh console
+```
+
+View data directory:
+```bash
+fly ssh console -C "ls -la /data"
+```
+
+#### Cost Estimation
+
+With the current `fly.toml` configuration:
+- **VM**: shared-cpu-1x with 512MB RAM (~$2-3/month)
+- **Volume**: 1GB persistent storage (~$0.15/month)
+- **Total**: ~$2-4/month for a single instance
 
 ### Using Docker Compose
 
@@ -582,7 +701,7 @@ services:
     restart: unless-stopped
 ```
 
-### Environment Setup
+**Environment Setup:**
 
 ```bash
 # Create data directory
@@ -594,14 +713,6 @@ chmod 700 /var/data/near-accounting
 # Start the service
 docker-compose up -d
 ```
-
-## Monitoring
-
-Monitor the API server using:
-
-1. **Health Check Endpoint**: Regular polls to `/health`
-2. **Logs**: stdout/stderr for job progress and errors
-3. **Data Directory**: Monitor disk usage in `DATA_DIR`
 
 ## Support
 
