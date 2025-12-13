@@ -11,6 +11,7 @@
     "build": "tsc",
     "prebuild": "rm -rf dist",
     "start": "npm run build && node dist/scripts/get-account-history.js",
+    "api": "npm run build && node dist/scripts/api-server.js",
     "json-to-csv": "npm run build && node dist/scripts/json-to-csv.js",
     "test": "npm run build && mocha --timeout 60000 dist/test/**/*.test.js",
     "dev": "tsx scripts/get-account-history.ts"
@@ -26,11 +27,15 @@
   "dependencies": {
     "@near-js/jsonrpc-client": "^1.5.0",
     "@near-js/jsonrpc-types": "^1.5.0",
-    "dotenv": "^17.2.3"
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "uuid": "^11.0.3"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/mocha": "^10.0.10",
     "@types/node": "^22.10.2",
+    "@types/uuid": "^10.0.0",
     "mocha": "^11.7.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"

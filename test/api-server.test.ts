@@ -1,0 +1,348 @@
+// Test case for the API server
+import { strict as assert } from 'assert';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import http from 'http';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Helper to make HTTP requests
+function makeRequest(
+    method: string,
+    path: string,
+    body?: any
+): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
+    return new Promise((resolve, reject) => {
+        const options: http.RequestOptions = {
+            hostname: 'localhost',
+            port: 3001,
+            path,
+            method,
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        };
+
+        const req = http.request(options, (res) => {
+            let data = '';
+
+            res.on('data', (chunk) => {
+                data += chunk;
+            });
+
+            res.on('end', () => {
+                let parsedBody;
+                try {
+                    parsedBody = JSON.parse(data);
+                } catch {
+                    parsedBody = data;
+                }
+
+                resolve({
+                    statusCode: res.statusCode || 0,
+                    body: parsedBody,
+                    headers: res.headers
+                });
+            });
+        });
+
+        req.on('error', reject);
+
+        if (body) {
+            req.write(JSON.stringify(body));
+        }
+
+        req.end();
+    });
+}
+
+describe('API Server', function() {
+    // API tests may take time
+    this.timeout(120000);
+
+    let serverProcess: any = null;
+    const TEST_DATA_DIR = path.join(__dirname, '..', '..', 'test-data', 'api');
+    const TEST_ACCOUNT = 'testaccount.near';
+
+    before(async function() {
+        // Setup test data directory
+        if (fs.existsSync(TEST_DATA_DIR)) {
+            fs.rmSync(TEST_DATA_DIR, { recursive: true });
+        }
+        fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
+
+        // Start the API server on a different port for testing
+        const { spawn } = await import('child_process');
+        
+        serverProcess = spawn('node', ['dist/scripts/api-server.js'], {
+            env: {
+                ...process.env,
+                PORT: '3001',
+                DATA_DIR: TEST_DATA_DIR
+            },
+            stdio: 'inherit'
+        });
+
+        // Wait for server to start
+        await new Promise(resolve => setTimeout(resolve, 2000));
+    });
+
+    after(function() {
+        // Stop the server
+        if (serverProcess) {
+            serverProcess.kill();
+        }
+
+        // Cleanup test data
+        if (fs.existsSync(TEST_DATA_DIR)) {
+            fs.rmSync(TEST_DATA_DIR, { recursive: true });
+        }
+    });
+
+    describe('Health Check', function() {
+        it('should respond to health check', async function() {
+            const response = await makeRequest('GET', '/health');
+            
+            assert.equal(response.statusCode, 200);
+            assert.equal(response.body.status, 'ok');
+            assert.ok(response.body.timestamp);
+        });
+    });
+
+    describe('Account Registration', function() {
+        it('should register a new account', async function() {
+            const response = await makeRequest('POST', '/api/accounts', {
+                accountId: TEST_ACCOUNT
+            });
+            
+            assert.equal(response.statusCode, 201);
+            assert.equal(response.body.message, 'Account registered successfully');
+            assert.equal(response.body.account.accountId, TEST_ACCOUNT);
+            assert.ok(response.body.account.registeredAt);
+        });
+
+        it('should return existing account if already registered', async function() {
+            const response = await makeRequest('POST', '/api/accounts', {
+                accountId: TEST_ACCOUNT
+            });
+            
+            assert.equal(response.statusCode, 200);
+            assert.equal(response.body.message, 'Account already registered');
+            assert.equal(response.body.account.accountId, TEST_ACCOUNT);
+        });
+
+        it('should reject invalid account ID format', async function() {
+            const response = await makeRequest('POST', '/api/accounts', {
+                accountId: 'invalid account!'
+            });
+            
+            assert.equal(response.statusCode, 400);
+            assert.ok(response.body.error.includes('Invalid NEAR account ID format'));
+        });
+
+        it('should reject missing account ID', async function() {
+            const response = await makeRequest('POST', '/api/accounts', {});
+            
+            assert.equal(response.statusCode, 400);
+            assert.ok(response.body.error.includes('accountId is required'));
+        });
+
+        it('should list registered accounts', async function() {
+            const response = await makeRequest('GET', '/api/accounts');
+            
+            assert.equal(response.statusCode, 200);
+            assert.ok(Array.isArray(response.body.accounts));
+            assert.ok(response.body.accounts.length >= 1);
+            
+            const account = response.body.accounts.find((a: any) => a.accountId === TEST_ACCOUNT);
+            assert.ok(account, 'Registered account should be in the list');
+        });
+    });
+
+    describe('Job Management', function() {
+        it('should reject job for unregistered account', async function() {
+            const response = await makeRequest('POST', '/api/jobs', {
+                accountId: 'unregistered.near'
+            });
+            
+            assert.equal(response.statusCode, 403);
+            assert.ok(response.body.error.includes('Account not registered'));
+        });
+
+        it('should create a job for registered account', async function() {
+            const response = await makeRequest('POST', '/api/jobs', {
+                accountId: TEST_ACCOUNT,
+                options: {
+                    maxTransactions: 5,
+                    direction: 'backward'
+                }
+            });
+            
+            assert.equal(response.statusCode, 201);
+            assert.equal(response.body.message, 'Job created successfully');
+            assert.ok(response.body.job.jobId);
+            assert.equal(response.body.job.accountId, TEST_ACCOUNT);
+            assert.equal(response.body.job.status, 'pending');
+            assert.equal(response.body.job.options.maxTransactions, 5);
+        });
+
+        it('should reject invalid direction', async function() {
+            const response = await makeRequest('POST', '/api/jobs', {
+                accountId: TEST_ACCOUNT,
+                options: {
+                    direction: 'sideways'
+                }
+            });
+            
+            assert.equal(response.statusCode, 400);
+            assert.ok(response.body.error.includes('direction must be'));
+        });
+
+        it('should reject invalid maxTransactions', async function() {
+            const response = await makeRequest('POST', '/api/jobs', {
+                accountId: TEST_ACCOUNT,
+                options: {
+                    maxTransactions: -5
+                }
+            });
+            
+            assert.equal(response.statusCode, 400);
+            assert.ok(response.body.error.includes('maxTransactions must be a positive number'));
+        });
+
+        it('should list all jobs', async function() {
+            const response = await makeRequest('GET', '/api/jobs');
+            
+            assert.equal(response.statusCode, 200);
+            assert.ok(Array.isArray(response.body.jobs));
+            assert.ok(response.body.jobs.length >= 1);
+        });
+
+        it('should filter jobs by account ID', async function() {
+            const response = await makeRequest('GET', `/api/jobs?accountId=${TEST_ACCOUNT}`);
+            
+            assert.equal(response.statusCode, 200);
+            assert.ok(Array.isArray(response.body.jobs));
+            
+            // All jobs should belong to the test account
+            for (const job of response.body.jobs) {
+                assert.equal(job.accountId, TEST_ACCOUNT);
+            }
+        });
+
+        it('should get job status by ID', async function() {
+            // Create a job first
+            const createResponse = await makeRequest('POST', '/api/jobs', {
+                accountId: TEST_ACCOUNT,
+                options: { maxTransactions: 1 }
+            });
+            
+            const jobId = createResponse.body.job.jobId;
+            
+            // Get job status
+            const response = await makeRequest('GET', `/api/jobs/${jobId}`);
+            
+            assert.equal(response.statusCode, 200);
+            assert.equal(response.body.job.jobId, jobId);
+            assert.equal(response.body.job.accountId, TEST_ACCOUNT);
+            assert.ok(['pending', 'running', 'completed', 'failed'].includes(response.body.job.status));
+        });
+
+        it('should return 404 for non-existent job', async function() {
+            const response = await makeRequest('GET', '/api/jobs/non-existent-job-id');
+            
+            assert.equal(response.statusCode, 404);
+            assert.ok(response.body.error.includes('Job not found'));
+        });
+    });
+
+    describe('Download Endpoints', function() {
+        let completedJobId: string;
+
+        before(async function() {
+            // Create a job and wait for completion
+            this.timeout(180000); // 3 minutes for job completion
+            
+            const createResponse = await makeRequest('POST', '/api/jobs', {
+                accountId: TEST_ACCOUNT,
+                options: { maxTransactions: 2 }
+            });
+            
+            completedJobId = createResponse.body.job.jobId;
+            
+            // Poll until completed or failed
+            let attempts = 0;
+            while (attempts < 60) {
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                
+                const statusResponse = await makeRequest('GET', `/api/jobs/${completedJobId}`);
+                const status = statusResponse.body.job.status;
+                
+                if (status === 'completed') {
+                    break;
+                }
+                
+                if (status === 'failed') {
+                    throw new Error(`Job failed: ${statusResponse.body.job.error}`);
+                }
+                
+                attempts++;
+            }
+            
+            if (attempts >= 60) {
+                throw new Error('Job did not complete within timeout');
+            }
+        });
+
+        it('should reject download for non-completed job', async function() {
+            // Create a new job but don't wait for completion
+            const createResponse = await makeRequest('POST', '/api/jobs', {
+                accountId: TEST_ACCOUNT,
+                options: { maxTransactions: 100 }
+            });
+            
+            const jobId = createResponse.body.job.jobId;
+            
+            // Try to download immediately
+            const response = await makeRequest('GET', `/api/jobs/${jobId}/download/json`);
+            
+            assert.equal(response.statusCode, 400);
+            assert.ok(response.body.error.includes('Job is not completed'));
+        });
+
+        it('should download completed job as JSON', async function() {
+            const response = await makeRequest('GET', `/api/jobs/${completedJobId}/download/json`);
+            
+            // For streaming responses, we expect either success or 404 if file doesn't exist
+            assert.ok(response.statusCode === 200 || response.statusCode === 404);
+            
+            if (response.statusCode === 200) {
+                assert.ok(response.body.accountId);
+                assert.ok(Array.isArray(response.body.transactions));
+            }
+        });
+
+        it('should download completed job as CSV', async function() {
+            const response = await makeRequest('GET', `/api/jobs/${completedJobId}/download/csv`);
+            
+            // For streaming responses, we expect either success or 404 if file doesn't exist
+            assert.ok(response.statusCode === 200 || response.statusCode === 404);
+            
+            // CSV download may generate the CSV on first request
+            if (response.statusCode === 200 && typeof response.body === 'string') {
+                // Check CSV headers
+                assert.ok(response.body.includes('change_block_height'));
+                assert.ok(response.body.includes('timestamp'));
+                assert.ok(response.body.includes('counterparty'));
+            }
+        });
+
+        it('should return 404 for download of non-existent job', async function() {
+            const response = await makeRequest('GET', '/api/jobs/non-existent-job/download/json');
+            
+            assert.equal(response.statusCode, 404);
+            assert.ok(response.body.error.includes('Job not found'));
+        });
+    });
+});

@@ -493,6 +493,38 @@ async function main(): Promise<void> {
     }
 }
 
+/**
+ * Convert JSON file to CSV file (programmatic API)
+ */
+export async function convertJsonToCsv(inputFile: string, outputFile: string): Promise<void> {
+    // Check if input file exists
+    if (!fs.existsSync(inputFile)) {
+        throw new Error(`Input file not found: ${inputFile}`);
+    }
+
+    // Read and parse input file
+    const inputData = fs.readFileSync(inputFile, 'utf-8');
+    const history: AccountHistory = JSON.parse(inputData);
+
+    // Validate basic structure
+    if (!history.accountId || !Array.isArray(history.transactions)) {
+        throw new Error('Invalid JSON structure - missing accountId or transactions array');
+    }
+
+    // Convert to CSV rows
+    const rows = await convertToCSVRows(history);
+
+    // Generate CSV content
+    const csvContent = generateCSV(rows);
+
+    // Write output file
+    const outputDir = path.dirname(outputFile);
+    if (outputDir && !fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true });
+    }
+    fs.writeFileSync(outputFile, csvContent);
+}
+
 // Run if called directly
 if (import.meta.url.startsWith('file:') && process.argv[1] === fileURLToPath(import.meta.url)) {
     main();
