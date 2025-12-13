@@ -4,6 +4,12 @@
 
 The API server provides REST endpoints for managing NEAR account data collection jobs, including account registration, job creation, status tracking, and data downloads in JSON and CSV formats.
 
+**Important:** 
+- Each account has a single JSON file (`accountId.json`) and CSV file (`accountId.csv`) in the data directory
+- Multiple jobs can be created for the same account, each job appending or continuing from the existing file
+- Only one job can run per account at a time (enforced to prevent conflicts)
+- Data can be downloaded at any time, even while a job is running, allowing access to partial results
+
 ## Starting the API Server
 
 ### Development
@@ -171,6 +177,7 @@ Create a new data collection job for a registered account.
 **Error Responses:**
 - `400 Bad Request` - Invalid options or missing accountId
 - `403 Forbidden` - Account not registered
+- `409 Conflict` - A job is already running for this account
 
 ---
 
@@ -242,26 +249,32 @@ Get the status of a specific job.
 
 **GET /api/jobs/:jobId/download/json**
 
-Download the collected data as JSON.
+Download the collected data as JSON for the account associated with the job.
+
+**Note:** Data can be downloaded at any time, even while a job is running. This allows access to partial results as they are collected.
 
 **Response:**
 - Content-Type: `application/json`
-- Content-Disposition: `attachment; filename="myaccount.near-<jobId>.json"`
+- Content-Disposition: `attachment; filename="myaccount.near.json"`
 - Body: JSON file with account history
 
 **Error Responses:**
-- `400 Bad Request` - Job is not completed
-- `404 Not Found` - Job or output file not found
+- `404 Not Found` - Job not found or no data file exists for this account yet
 
 ---
 
 **GET /api/jobs/:jobId/download/csv**
 
-Download the collected data as CSV.
+Download the collected data as CSV for the account associated with the job.
+
+**Note:** 
+- Data can be downloaded at any time, even while a job is running
+- CSV is generated on-demand from the JSON file
+- If the JSON file has been updated since the last CSV generation, a fresh CSV will be created
 
 **Response:**
 - Content-Type: `text/csv`
-- Content-Disposition: `attachment; filename="myaccount.near-<jobId>.csv"`
+- Content-Disposition: `attachment; filename="myaccount.near.csv"`
 - Body: CSV file with transaction history
 
 **CSV Columns:**
@@ -279,8 +292,7 @@ Download the collected data as CSV.
 - `receipt_id` - Receipt ID
 
 **Error Responses:**
-- `400 Bad Request` - Job is not completed
-- `404 Not Found` - Job not found
+- `404 Not Found` - Job not found or no data file exists for this account yet
 - `500 Internal Server Error` - Error converting to CSV
 
 ## Usage Examples
@@ -413,8 +425,15 @@ The API server stores all data in the directory specified by `DATA_DIR`:
 
 - `accounts.json` - Registered accounts
 - `jobs.json` - Job metadata and status
-- `job-<jobId>.json` - Job output data
-- `job-<jobId>.csv` - Job output as CSV (generated on first download)
+- `<accountId>.json` - Account transaction data (one file per account)
+- `<accountId>.csv` - Account data as CSV (generated on-demand from JSON)
+
+**Key Points:**
+- Each account has a single JSON file that all jobs for that account write to
+- Jobs append or continue from the existing account file
+- CSV files are regenerated if the JSON file has been updated since the last CSV generation
+- Only one job can run per account at a time to prevent data conflicts
+- Data can be downloaded at any time, even while jobs are running
 
 **Important:** Always mount a persistent volume for the `DATA_DIR` in production to ensure data survives server restarts.
 
@@ -435,6 +454,8 @@ Common HTTP status codes:
 - `400 Bad Request` - Invalid input
 - `403 Forbidden` - Action not allowed
 - `404 Not Found` - Resource not found
+- `409 Conflict` - Resource conflict (e.g., job already running for account)
+- `500 Internal Server Error` - Server error
 - `500 Internal Server Error` - Server error
 
 ## Testing

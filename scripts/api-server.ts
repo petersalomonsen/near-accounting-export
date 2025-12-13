@@ -78,15 +78,15 @@ function saveJobs(db: JobsDb): void {
     fs.writeFileSync(JOBS_FILE, JSON.stringify(db, null, 2));
 }
 
-function getJobOutputFile(jobId: string): string {
-    return path.join(DATA_DIR, `job-${jobId}.json`);
+function getAccountOutputFile(accountId: string): string {
+    return path.join(DATA_DIR, `${accountId}.json`);
 }
 
-function getJobCsvFile(jobId: string): string {
-    return path.join(DATA_DIR, `job-${jobId}.csv`);
+function getAccountCsvFile(accountId: string): string {
+    return path.join(DATA_DIR, `${accountId}.csv`);
 }
 
-// Background job processor
+// Background job processor - tracks running jobs per account
 const runningJobs = new Map<string, Promise<void>>();
 
 async function processJob(jobId: string): Promise<void> {
@@ -103,9 +103,9 @@ async function processJob(jobId: string): Promise<void> {
         job.startedAt = new Date().toISOString();
         saveJobs(jobsDb);
         
-        const outputFile = getJobOutputFile(jobId);
+        const outputFile = getAccountOutputFile(job.accountId);
         
-        // Run the data collection
+        // Run the data collection - this will append/continue from existing file
         await getAccountHistory({
             accountId: job.accountId,
             outputFile,
@@ -138,7 +138,7 @@ async function processJob(jobId: string): Promise<void> {
         
         console.error(`Job ${jobId} failed:`, error);
     } finally {
-        runningJobs.delete(jobId);
+        runningJobs.delete(job.accountId);
     }
 }
 
@@ -222,6 +222,13 @@ app.post('/api/jobs', (req: Request, res: Response) => {
         });
     }
     
+    // Check if there's already a running job for this account
+    if (runningJobs.has(accountId)) {
+        return res.status(409).json({ 
+            error: 'A job is already running for this account. Only one job per account can run at a time.' 
+        });
+    }
+    
     // Validate options
     if (options.direction && !['forward', 'backward'].includes(options.direction)) {
         return res.status(400).json({ error: 'direction must be "forward" or "backward"' });
@@ -250,9 +257,9 @@ app.post('/api/jobs', (req: Request, res: Response) => {
     jobsDb.jobs[jobId] = job;
     saveJobs(jobsDb);
     
-    // Start processing in background
+    // Start processing in background - track by accountId
     const jobPromise = processJob(jobId);
-    runningJobs.set(jobId, jobPromise);
+    runningJobs.set(accountId, jobPromise);
     
     res.status(201).json({
         message: 'Job created successfully',
@@ -314,20 +321,14 @@ app.get('/api/jobs/:jobId/download/json', (req: Request, res: Response) => {
         return res.status(404).json({ error: 'Job not found' });
     }
     
-    if (job.status !== 'completed') {
-        return res.status(400).json({ 
-            error: `Job is not completed. Current status: ${job.status}` 
-        });
-    }
-    
-    const outputFile = getJobOutputFile(jobId);
+    const outputFile = getAccountOutputFile(job.accountId);
     
     if (!fs.existsSync(outputFile)) {
-        return res.status(404).json({ error: 'Job output file not found' });
+        return res.status(404).json({ error: 'No data file found for this account yet' });
     }
     
     res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename="${job.accountId}-${jobId}.json"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${job.accountId}.json"`);
     
     const fileStream = fs.createReadStream(outputFile);
     fileStream.pipe(res);
@@ -349,22 +350,20 @@ app.get('/api/jobs/:jobId/download/csv', async (req: Request, res: Response) => 
             return res.status(404).json({ error: 'Job not found' });
         }
         
-        if (job.status !== 'completed') {
-            return res.status(400).json({ 
-                error: `Job is not completed. Current status: ${job.status}` 
-            });
-        }
-        
-        const outputFile = getJobOutputFile(jobId);
+        const outputFile = getAccountOutputFile(job.accountId);
         
         if (!fs.existsSync(outputFile)) {
-            return res.status(404).json({ error: 'Job output file not found' });
+            return res.status(404).json({ error: 'No data file found for this account yet' });
         }
         
-        const csvFile = getJobCsvFile(jobId);
+        const csvFile = getAccountCsvFile(job.accountId);
         
-        // Generate CSV if it doesn't exist
-        if (!fs.existsSync(csvFile)) {
+        // Generate CSV if it doesn't exist or if JSON is newer
+        const jsonStat = fs.statSync(outputFile);
+        const csvExists = fs.existsSync(csvFile);
+        const csvNeedsUpdate = !csvExists || (csvExists && fs.statSync(csvFile).mtime < jsonStat.mtime);
+        
+        if (csvNeedsUpdate) {
             try {
                 await convertJsonToCsv(outputFile, csvFile);
             } catch (error) {
@@ -377,7 +376,7 @@ app.get('/api/jobs/:jobId/download/csv', async (req: Request, res: Response) => 
         }
         
         res.setHeader('Content-Type', 'text/csv');
-        res.setHeader('Content-Disposition', `attachment; filename="${job.accountId}-${jobId}.csv"`);
+        res.setHeader('Content-Disposition', `attachment; filename="${job.accountId}.csv"`);
         
         const fileStream = fs.createReadStream(csvFile);
         fileStream.pipe(res);
