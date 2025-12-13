@@ -456,7 +456,6 @@ Common HTTP status codes:
 - `404 Not Found` - Resource not found
 - `409 Conflict` - Resource conflict (e.g., job already running for account)
 - `500 Internal Server Error` - Server error
-- `500 Internal Server Error` - Server error
 
 ## Testing
 
