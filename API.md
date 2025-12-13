@@ -2,13 +2,14 @@
 
 ## Overview
 
-The API server provides REST endpoints for managing NEAR account data collection jobs, including account registration, job creation, status tracking, and data downloads in JSON and CSV formats.
+The API server provides REST endpoints for managing NEAR account data collection jobs, including account registration, job creation, account status tracking with data range information, and data downloads in JSON and CSV formats.
 
 **Important:** 
 - Each account has a single JSON file (`accountId.json`) and CSV file (`accountId.csv`) in the data directory
 - Multiple jobs can be created for the same account, each job appending or continuing from the existing file
 - Only one job can run per account at a time (enforced to prevent conflicts)
 - Data can be downloaded at any time, even while a job is running, allowing access to partial results
+- Use the account status endpoint to see data range and ongoing jobs without needing job IDs
 
 ## Starting the API Server
 
@@ -130,6 +131,50 @@ List all registered accounts.
 }
 ```
 
+---
+
+**GET /api/accounts/:accountId/status**
+
+Get the data collection status for a specific account, including the data range and any ongoing jobs.
+
+**Response:**
+```json
+{
+  "accountId": "myaccount.near",
+  "hasData": true,
+  "dataRange": {
+    "firstBlock": 120000000,
+    "lastBlock": 121000000,
+    "totalTransactions": 150,
+    "updatedAt": "2024-01-01T00:05:00.000Z"
+  },
+  "ongoingJob": {
+    "jobId": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "running",
+    "createdAt": "2024-01-01T00:00:00.000Z",
+    "startedAt": "2024-01-01T00:00:05.000Z",
+    "options": {
+      "direction": "backward",
+      "maxTransactions": 100
+    }
+  }
+}
+```
+
+**Response (no data yet):**
+```json
+{
+  "accountId": "myaccount.near",
+  "hasData": false,
+  "dataRange": null,
+  "ongoingJob": null
+}
+```
+
+**Error Responses:**
+- `400 Bad Request` - Missing accountId
+- `404 Not Found` - Account not registered
+
 ### Job Management
 
 **POST /api/jobs**
@@ -247,9 +292,9 @@ Get the status of a specific job.
 
 ### Data Download
 
-**GET /api/jobs/:jobId/download/json**
+**GET /api/accounts/:accountId/download/json**
 
-Download the collected data as JSON for the account associated with the job.
+Download the collected data as JSON for the specified account.
 
 **Note:** Data can be downloaded at any time, even while a job is running. This allows access to partial results as they are collected.
 
@@ -259,13 +304,14 @@ Download the collected data as JSON for the account associated with the job.
 - Body: JSON file with account history
 
 **Error Responses:**
-- `404 Not Found` - Job not found or no data file exists for this account yet
+- `400 Bad Request` - Missing accountId
+- `404 Not Found` - Account not registered or no data file exists for this account yet
 
 ---
 
-**GET /api/jobs/:jobId/download/csv**
+**GET /api/accounts/:accountId/download/csv**
 
-Download the collected data as CSV for the account associated with the job.
+Download the collected data as CSV for the specified account.
 
 **Note:** 
 - Data can be downloaded at any time, even while a job is running
@@ -292,7 +338,8 @@ Download the collected data as CSV for the account associated with the job.
 - `receipt_id` - Receipt ID
 
 **Error Responses:**
-- `404 Not Found` - Job not found or no data file exists for this account yet
+- `400 Bad Request` - Missing accountId
+- `404 Not Found` - Account not registered or no data file exists for this account yet
 - `500 Internal Server Error` - Error converting to CSV
 
 ## Usage Examples
@@ -316,14 +363,17 @@ curl -X POST http://localhost:3000/api/jobs \
     }
   }'
 
+# Check account status and data range
+curl http://localhost:3000/api/accounts/myaccount.near/status
+
 # Check job status (replace with actual job ID)
 curl http://localhost:3000/api/jobs/550e8400-e29b-41d4-a716-446655440000
 
 # Download JSON result
-curl -O -J http://localhost:3000/api/jobs/550e8400-e29b-41d4-a716-446655440000/download/json
+curl -O -J http://localhost:3000/api/accounts/myaccount.near/download/json
 
 # Download CSV result
-curl -O -J http://localhost:3000/api/jobs/550e8400-e29b-41d4-a716-446655440000/download/csv
+curl -O -J http://localhost:3000/api/accounts/myaccount.near/download/csv
 ```
 
 ### JavaScript/TypeScript
@@ -350,26 +400,17 @@ const jobResponse = await fetch('http://localhost:3000/api/jobs', {
   })
 });
 const { job } = await jobResponse.json();
-const jobId = job.jobId;
+const accountId = job.accountId;
 
-// Poll for completion
-let status = 'pending';
-while (status === 'pending' || status === 'running') {
-  await new Promise(resolve => setTimeout(resolve, 5000));
-  
-  const statusResponse = await fetch(`http://localhost:3000/api/jobs/${jobId}`);
-  const { job: currentJob } = await statusResponse.json();
-  status = currentJob.status;
-  
-  console.log(`Job status: ${status}`);
-}
+// Check account status
+const statusResponse = await fetch(`http://localhost:3000/api/accounts/${accountId}/status`);
+const accountStatus = await statusResponse.json();
+console.log('Account status:', accountStatus);
 
-// Download results
-if (status === 'completed') {
-  const jsonResponse = await fetch(`http://localhost:3000/api/jobs/${jobId}/download/json`);
-  const data = await jsonResponse.json();
-  console.log('Downloaded data:', data);
-}
+// Download results (can be done anytime, even while job is running)
+const jsonResponse = await fetch(`http://localhost:3000/api/accounts/${accountId}/download/json`);
+const data = await jsonResponse.json();
+console.log('Downloaded data:', data);
 ```
 
 ### Python
@@ -398,25 +439,18 @@ response = requests.post(
         }
     }
 )
-job_id = response.json()["job"]["jobId"]
+account_id = response.json()["job"]["accountId"]
 
-# Poll for completion
-while True:
-    response = requests.get(f"{BASE_URL}/api/jobs/{job_id}")
-    status = response.json()["job"]["status"]
-    print(f"Job status: {status}")
-    
-    if status in ["completed", "failed"]:
-        break
-    
-    time.sleep(5)
+# Check account status
+response = requests.get(f"{BASE_URL}/api/accounts/{account_id}/status")
+account_status = response.json()
+print(f"Account status: {account_status}")
 
-# Download CSV
-if status == "completed":
-    response = requests.get(f"{BASE_URL}/api/jobs/{job_id}/download/csv")
-    with open("output.csv", "wb") as f:
-        f.write(response.content)
-    print("Downloaded CSV to output.csv")
+# Download CSV (can be done anytime, even while job is running)
+response = requests.get(f"{BASE_URL}/api/accounts/{account_id}/download/csv")
+with open("output.csv", "wb") as f:
+    f.write(response.content)
+print("Downloaded CSV to output.csv")
 ```
 
 ## Data Persistence

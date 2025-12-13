@@ -306,57 +306,109 @@ app.get('/api/jobs', (req: Request, res: Response) => {
     res.json({ jobs });
 });
 
-// GET /api/jobs/:jobId/download/json - Download job result as JSON
-app.get('/api/jobs/:jobId/download/json', (req: Request, res: Response) => {
-    const jobId = req.params.jobId;
+// GET /api/accounts/:accountId/status - Get account data collection status
+app.get('/api/accounts/:accountId/status', (req: Request, res: Response) => {
+    const accountId = req.params.accountId;
     
-    if (!jobId) {
-        return res.status(400).json({ error: 'Job ID is required' });
+    if (!accountId) {
+        return res.status(400).json({ error: 'Account ID is required' });
     }
     
+    // Check if account is registered
+    const accountsDb = loadAccounts();
+    if (!accountsDb.accounts[accountId]) {
+        return res.status(404).json({ error: 'Account not registered' });
+    }
+    
+    // Check for running job
     const jobsDb = loadJobs();
-    const job = jobsDb.jobs[jobId];
+    const accountJobs = Object.values(jobsDb.jobs).filter(job => job.accountId === accountId);
+    const runningJob = accountJobs.find(job => job.status === 'running' || job.status === 'pending');
     
-    if (!job) {
-        return res.status(404).json({ error: 'Job not found' });
+    // Check if data file exists and get metadata
+    const outputFile = getAccountOutputFile(accountId);
+    let dataRange = null;
+    let hasData = false;
+    
+    if (fs.existsSync(outputFile)) {
+        try {
+            const fileContent = fs.readFileSync(outputFile, 'utf8');
+            const accountHistory = JSON.parse(fileContent);
+            hasData = true;
+            dataRange = {
+                firstBlock: accountHistory.metadata?.firstBlock || null,
+                lastBlock: accountHistory.metadata?.lastBlock || null,
+                totalTransactions: accountHistory.metadata?.totalTransactions || 0,
+                updatedAt: accountHistory.updatedAt || null
+            };
+        } catch (error) {
+            console.error('Error reading account data file:', error);
+        }
     }
     
-    const outputFile = getAccountOutputFile(job.accountId);
+    res.json({
+        accountId,
+        hasData,
+        dataRange,
+        ongoingJob: runningJob ? {
+            jobId: runningJob.jobId,
+            status: runningJob.status,
+            createdAt: runningJob.createdAt,
+            startedAt: runningJob.startedAt,
+            options: runningJob.options
+        } : null
+    });
+});
+
+// GET /api/accounts/:accountId/download/json - Download account data as JSON
+app.get('/api/accounts/:accountId/download/json', (req: Request, res: Response) => {
+    const accountId = req.params.accountId;
+    
+    if (!accountId) {
+        return res.status(400).json({ error: 'Account ID is required' });
+    }
+    
+    // Check if account is registered
+    const accountsDb = loadAccounts();
+    if (!accountsDb.accounts[accountId]) {
+        return res.status(404).json({ error: 'Account not registered' });
+    }
+    
+    const outputFile = getAccountOutputFile(accountId);
     
     if (!fs.existsSync(outputFile)) {
         return res.status(404).json({ error: 'No data file found for this account yet' });
     }
     
     res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename="${job.accountId}.json"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${accountId}.json"`);
     
     const fileStream = fs.createReadStream(outputFile);
     fileStream.pipe(res);
 });
 
-// GET /api/jobs/:jobId/download/csv - Download job result as CSV
-app.get('/api/jobs/:jobId/download/csv', async (req: Request, res: Response) => {
+// GET /api/accounts/:accountId/download/csv - Download account data as CSV
+app.get('/api/accounts/:accountId/download/csv', async (req: Request, res: Response) => {
     try {
-        const jobId = req.params.jobId;
+        const accountId = req.params.accountId;
         
-        if (!jobId) {
-            return res.status(400).json({ error: 'Job ID is required' });
+        if (!accountId) {
+            return res.status(400).json({ error: 'Account ID is required' });
         }
         
-        const jobsDb = loadJobs();
-        const job = jobsDb.jobs[jobId];
-        
-        if (!job) {
-            return res.status(404).json({ error: 'Job not found' });
+        // Check if account is registered
+        const accountsDb = loadAccounts();
+        if (!accountsDb.accounts[accountId]) {
+            return res.status(404).json({ error: 'Account not registered' });
         }
         
-        const outputFile = getAccountOutputFile(job.accountId);
+        const outputFile = getAccountOutputFile(accountId);
         
         if (!fs.existsSync(outputFile)) {
             return res.status(404).json({ error: 'No data file found for this account yet' });
         }
         
-        const csvFile = getAccountCsvFile(job.accountId);
+        const csvFile = getAccountCsvFile(accountId);
         
         // Generate CSV if it doesn't exist or if JSON is newer
         const jsonStat = fs.statSync(outputFile);
@@ -376,7 +428,7 @@ app.get('/api/jobs/:jobId/download/csv', async (req: Request, res: Response) => 
         }
         
         res.setHeader('Content-Type', 'text/csv');
-        res.setHeader('Content-Disposition', `attachment; filename="${job.accountId}.csv"`);
+        res.setHeader('Content-Disposition', `attachment; filename="${accountId}.csv"`);
         
         const fileStream = fs.createReadStream(csvFile);
         fileStream.pipe(res);
@@ -409,11 +461,12 @@ const server = app.listen(PORT, () => {
     console.log('Available endpoints:');
     console.log('  POST   /api/accounts - Register an account');
     console.log('  GET    /api/accounts - List registered accounts');
+    console.log('  GET    /api/accounts/:accountId/status - Get account status and data range');
+    console.log('  GET    /api/accounts/:accountId/download/json - Download account data as JSON');
+    console.log('  GET    /api/accounts/:accountId/download/csv - Download account data as CSV');
     console.log('  POST   /api/jobs - Start a data collection job');
     console.log('  GET    /api/jobs - List all jobs');
     console.log('  GET    /api/jobs/:jobId - Get job status');
-    console.log('  GET    /api/jobs/:jobId/download/json - Download as JSON');
-    console.log('  GET    /api/jobs/:jobId/download/csv - Download as CSV');
     console.log('  GET    /health - Health check');
 });
 
