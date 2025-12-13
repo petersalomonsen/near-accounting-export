@@ -11,18 +11,18 @@ describe('Account Registration Payment Verification', function() {
     this.timeout(30000);
     
     // Mock transaction data based on mainnet FT transfer structure
-    // This represents the structure of transaction BfcxWzpQbvPzPXp438EpqpfcLZ1vHW36YoetCBac3WEA
+    // This represents the structure of transaction BfcxWzpQbvPzPXp438EpqpfcLZ1vHW36YoetCBac3WEA from arizcredits.near
     const mockValidTransaction = {
         transaction: {
             signer_id: 'test-sender.near',
-            receiver_id: 'usdc.near',
+            receiver_id: 'arizcredits.near',
             actions: [
                 {
                     FunctionCall: {
                         method_name: 'ft_transfer',
                         args: Buffer.from(JSON.stringify({
-                            receiver_id: 'accounting-export.near',
-                            amount: '1000000' // 1 USDC (6 decimals)
+                            receiver_id: 'arizcredits.near',
+                            amount: '100000' // 0.1 ARIZ (6 decimals)
                         })).toString('base64'),
                         gas: 30000000000000,
                         deposit: '1'
@@ -31,24 +31,30 @@ describe('Account Registration Payment Verification', function() {
             ]
         },
         transaction_outcome: {
-            block_timestamp: Date.now() * 1_000_000 - 1000 * 1_000_000 // 1 second ago in nanoseconds
+            block_hash: 'Ctc7YvPGGDLsdGdxWwjCaKbZejhqdmLyaMbgooKn4kDG'
         },
         status: {
             SuccessValue: ''
+        }
+    };
+    
+    const mockValidBlock = {
+        header: {
+            timestamp: Date.now() * 1_000_000 - 1000 * 1_000_000 // 1 second ago in nanoseconds
         }
     };
     
     const mockOldTransaction = {
         transaction: {
             signer_id: 'test-sender.near',
-            receiver_id: 'usdc.near',
+            receiver_id: 'arizcredits.near',
             actions: [
                 {
                     FunctionCall: {
                         method_name: 'ft_transfer',
                         args: Buffer.from(JSON.stringify({
-                            receiver_id: 'accounting-export.near',
-                            amount: '1000000'
+                            receiver_id: 'arizcredits.near',
+                            amount: '100000'
                         })).toString('base64'),
                         gas: 30000000000000,
                         deposit: '1'
@@ -57,23 +63,29 @@ describe('Account Registration Payment Verification', function() {
             ]
         },
         transaction_outcome: {
-            block_timestamp: Date.now() * 1_000_000 - 31 * 24 * 60 * 60 * 1000 * 1_000_000 // 31 days ago
+            block_hash: 'OldBlockHash123456789'
         },
         status: {
             SuccessValue: ''
         }
     };
     
+    const mockOldBlock = {
+        header: {
+            timestamp: Date.now() * 1_000_000 - 31 * 24 * 60 * 60 * 1000 * 1_000_000 // 31 days ago
+        }
+    };
+    
     const mockInsufficientAmountTransaction = {
         transaction: {
             signer_id: 'test-sender.near',
-            receiver_id: 'usdc.near',
+            receiver_id: 'arizcredits.near',
             actions: [
                 {
                     FunctionCall: {
                         method_name: 'ft_transfer',
                         args: Buffer.from(JSON.stringify({
-                            receiver_id: 'accounting-export.near',
+                            receiver_id: 'arizcredits.near',
                             amount: '100' // Too small
                         })).toString('base64'),
                         gas: 30000000000000,
@@ -83,7 +95,7 @@ describe('Account Registration Payment Verification', function() {
             ]
         },
         transaction_outcome: {
-            block_timestamp: Date.now() * 1_000_000 - 1000 * 1_000_000
+            block_hash: 'ValidBlockHash123'
         },
         status: {
             SuccessValue: ''
@@ -93,14 +105,14 @@ describe('Account Registration Payment Verification', function() {
     const mockWrongRecipientTransaction = {
         transaction: {
             signer_id: 'test-sender.near',
-            receiver_id: 'usdc.near',
+            receiver_id: 'arizcredits.near',
             actions: [
                 {
                     FunctionCall: {
                         method_name: 'ft_transfer',
                         args: Buffer.from(JSON.stringify({
                             receiver_id: 'wrong-recipient.near',
-                            amount: '1000000'
+                            amount: '100000'
                         })).toString('base64'),
                         gas: 30000000000000,
                         deposit: '1'
@@ -109,7 +121,7 @@ describe('Account Registration Payment Verification', function() {
             ]
         },
         transaction_outcome: {
-            block_timestamp: Date.now() * 1_000_000 - 1000 * 1_000_000
+            block_hash: 'ValidBlockHash123'
         },
         status: {
             SuccessValue: ''
@@ -119,14 +131,14 @@ describe('Account Registration Payment Verification', function() {
     const mockFailedTransaction = {
         transaction: {
             signer_id: 'test-sender.near',
-            receiver_id: 'usdc.near',
+            receiver_id: 'arizcredits.near',
             actions: [
                 {
                     FunctionCall: {
                         method_name: 'ft_transfer',
                         args: Buffer.from(JSON.stringify({
-                            receiver_id: 'accounting-export.near',
-                            amount: '1000000'
+                            receiver_id: 'arizcredits.near',
+                            amount: '100000'
                         })).toString('base64'),
                         gas: 30000000000000,
                         deposit: '1'
@@ -135,7 +147,7 @@ describe('Account Registration Payment Verification', function() {
             ]
         },
         transaction_outcome: {
-            block_timestamp: Date.now() * 1_000_000 - 1000 * 1_000_000
+            block_hash: 'FailedBlockHash123'
         },
         status: {
             Failure: {
@@ -158,27 +170,27 @@ describe('Account Registration Payment Verification', function() {
             const argsStr = Buffer.from(action.args, 'base64').toString('utf8');
             const args = JSON.parse(argsStr);
             
-            assert.equal(args.receiver_id, 'accounting-export.near');
-            assert.equal(args.amount, '1000000');
+            assert.equal(args.receiver_id, 'arizcredits.near');
+            assert.equal(args.amount, '100000');
             
             // Verify amount is sufficient
-            assert.ok(BigInt(args.amount) >= BigInt('1000000'));
+            assert.ok(BigInt(args.amount) >= BigInt('100000'));
         });
         
-        it('should detect transaction age', function() {
-            const txTimestamp = mockValidTransaction.transaction_outcome.block_timestamp;
+        it('should detect transaction age from block', function() {
+            const blockTimestamp = mockValidBlock.header.timestamp;
             const now = Date.now() * 1_000_000;
-            const age = now - txTimestamp;
+            const age = now - blockTimestamp;
             const ageMs = age / 1_000_000;
             
             // Should be less than 30 days
             assert.ok(ageMs < 30 * 24 * 60 * 60 * 1000);
         });
         
-        it('should detect old transaction', function() {
-            const txTimestamp = mockOldTransaction.transaction_outcome.block_timestamp;
+        it('should detect old transaction from block', function() {
+            const blockTimestamp = mockOldBlock.header.timestamp;
             const now = Date.now() * 1_000_000;
-            const age = now - txTimestamp;
+            const age = now - blockTimestamp;
             const ageMs = age / 1_000_000;
             
             // Should be more than 30 days
@@ -192,7 +204,7 @@ describe('Account Registration Payment Verification', function() {
             const argsStr = Buffer.from(action.args, 'base64').toString('utf8');
             const args = JSON.parse(argsStr);
             
-            assert.ok(BigInt(args.amount) < BigInt('1000000'));
+            assert.ok(BigInt(args.amount) < BigInt('100000'));
         });
         
         it('should detect wrong recipient', function() {
@@ -202,7 +214,7 @@ describe('Account Registration Payment Verification', function() {
             const argsStr = Buffer.from(action.args, 'base64').toString('utf8');
             const args = JSON.parse(argsStr);
             
-            assert.notEqual(args.receiver_id, 'accounting-export.near');
+            assert.notEqual(args.receiver_id, 'arizcredits.near');
         });
         
         it('should detect failed transaction', function() {
@@ -215,7 +227,7 @@ describe('Account Registration Payment Verification', function() {
     describe('Transaction Structure Validation', function() {
         it('should have correct FT transfer structure based on mainnet transaction', function() {
             // This test validates that our mock matches the structure of real FT transfers
-            // Based on transaction BfcxWzpQbvPzPXp438EpqpfcLZ1vHW36YoetCBac3WEA
+            // Based on transaction BfcxWzpQbvPzPXp438EpqpfcLZ1vHW36YoetCBac3WEA from arizcredits.near
             
             const tx = mockValidTransaction;
             
@@ -237,12 +249,22 @@ describe('Account Registration Payment Verification', function() {
                 assert.ok(action.FunctionCall.deposit, 'FunctionCall should have deposit');
             }
             
-            // Check transaction outcome
+            // Check transaction outcome (should have block_hash, not block_timestamp)
             assert.ok(tx.transaction_outcome, 'Transaction should have transaction_outcome');
-            assert.ok(tx.transaction_outcome.block_timestamp, 'Outcome should have block_timestamp');
+            assert.ok(tx.transaction_outcome.block_hash, 'Outcome should have block_hash');
+            assert.ok(!('block_timestamp' in tx.transaction_outcome), 'Outcome should NOT have block_timestamp directly');
             
             // Check status
             assert.ok(tx.status, 'Transaction should have status');
+        });
+        
+        it('should validate block structure', function() {
+            // Block should have header with timestamp
+            const block = mockValidBlock;
+            
+            assert.ok(block.header, 'Block should have header');
+            assert.ok(block.header.timestamp, 'Block header should have timestamp');
+            assert.ok(typeof block.header.timestamp === 'number', 'Timestamp should be a number');
         });
     });
 });

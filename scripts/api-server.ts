@@ -18,9 +18,9 @@ import { getClient } from './rpc.js';
 
 // Payment verification configuration
 const PAYMENT_CONFIG = {
-    requiredAmount: process.env.REGISTRATION_FEE_AMOUNT || '1000000000000000000000000', // 1 USDC (6 decimals = 1000000)
-    recipientAccount: process.env.REGISTRATION_FEE_RECIPIENT || 'accounting-export.near',
-    ftContractId: process.env.REGISTRATION_FEE_TOKEN || 'usdc.near', // Default to USDC
+    requiredAmount: process.env.REGISTRATION_FEE_AMOUNT || '100000', // 0.1 ARIZ (6 decimals = 100000)
+    recipientAccount: process.env.REGISTRATION_FEE_RECIPIENT || 'arizcredits.near',
+    ftContractId: process.env.REGISTRATION_FEE_TOKEN || 'arizcredits.near', // Default to ARIZ
     maxAge: parseInt(process.env.REGISTRATION_TX_MAX_AGE_MS || String(30 * 24 * 60 * 60 * 1000), 10) // Default 30 days
 };
 
@@ -208,8 +208,42 @@ async function verifyPaymentTransaction(txHash: string): Promise<PaymentVerifica
         const transaction = txResult.transaction;
         const senderAccountId = transaction.signer_id;
         
+        // Get block hash from transaction outcome
+        const blockHash = txResult.transaction_outcome?.block_hash;
+        if (!blockHash) {
+            return { valid: false, error: 'Block hash not found in transaction outcome' };
+        }
+        
+        // Fetch block to get timestamp
+        const blockResponse = await fetch(endpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 'dontcare',
+                method: 'block',
+                params: {
+                    block_id: blockHash
+                }
+            })
+        });
+        
+        if (!blockResponse.ok) {
+            return { valid: false, error: `Failed to fetch block: ${blockResponse.statusText}` };
+        }
+        
+        const blockData: any = await blockResponse.json();
+        
+        if (blockData.error) {
+            return { valid: false, error: `Block fetch error: ${blockData.error.message || JSON.stringify(blockData.error)}` };
+        }
+        
+        const txTimestamp = blockData.result?.header?.timestamp || 0;
+        if (txTimestamp === 0) {
+            return { valid: false, error: 'Block timestamp not found' };
+        }
+        
         // Check transaction age
-        const txTimestamp = txResult.transaction_outcome?.block_timestamp || 0;
         const txAge = Date.now() * 1_000_000 - txTimestamp; // Convert to nanoseconds
         if (txAge > PAYMENT_CONFIG.maxAge * 1_000_000) {
             return { 

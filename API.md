@@ -81,9 +81,9 @@ Check if the API server is running.
 Register a NEAR account for data collection. Registration requires payment verification via a fungible token transfer transaction.
 
 **Payment Requirements:**
-- Transfer the required amount (configurable via `REGISTRATION_FEE_AMOUNT`, default: 1 USDC = 1000000) 
-- Send to the recipient account (configurable via `REGISTRATION_FEE_RECIPIENT`, default: accounting-export.near)
-- Use the specified FT contract (configurable via `REGISTRATION_FEE_TOKEN`, default: usdc.near)
+- Transfer the required amount (configurable via `REGISTRATION_FEE_AMOUNT`, default: 0.1 ARIZ = 100000) 
+- Send to the recipient account (configurable via `REGISTRATION_FEE_RECIPIENT`, default: arizcredits.near)
+- Use the specified FT contract (configurable via `REGISTRATION_FEE_TOKEN`, default: arizcredits.near)
 - Transaction must be within the maximum age (configurable via `REGISTRATION_TX_MAX_AGE_MS`, default: 30 days)
 
 **Request Body:**
@@ -119,15 +119,15 @@ Note: The account ID is automatically extracted from the payment transaction sen
 
 **Error Responses:**
 - `400 Bad Request` - Missing transaction hash, payment verification failed, or transaction issues
-  - Example: `{ "error": "Payment verification failed", "details": "Insufficient amount. Required: 1000000, Got: 100" }`
+  - Example: `{ "error": "Payment verification failed", "details": "Insufficient amount. Required: 100000, Got: 100" }`
   - Example: `{ "error": "Payment verification failed", "details": "Transaction is too old" }`
   - Example: `{ "error": "Payment verification failed", "details": "Incorrect recipient" }`
 - `500 Internal Server Error` - Failed to verify payment transaction
 
 **Environment Variables for Payment Configuration:**
-- `REGISTRATION_FEE_AMOUNT` - Required payment amount in FT base units (default: "1000000" for 1 USDC)
-- `REGISTRATION_FEE_RECIPIENT` - Recipient account for payments (default: "accounting-export.near")
-- `REGISTRATION_FEE_TOKEN` - FT contract ID (default: "usdc.near")
+- `REGISTRATION_FEE_AMOUNT` - Required payment amount in FT base units (default: "100000" for 0.1 ARIZ with 6 decimals)
+- `REGISTRATION_FEE_RECIPIENT` - Recipient account for payments (default: "arizcredits.near")
+- `REGISTRATION_FEE_TOKEN` - FT contract ID (default: "arizcredits.near")
 - `REGISTRATION_TX_MAX_AGE_MS` - Maximum age of transaction in milliseconds (default: 30 days)
 
 ---
