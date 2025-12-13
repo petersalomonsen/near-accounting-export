@@ -340,51 +340,74 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 // POST /api/accounts - Register an account
 app.post('/api/accounts', async (req: Request, res: Response) => {
-    const { transactionHash } = req.body;
+    const { transactionHash, accountId: providedAccountId } = req.body;
     
-    if (!transactionHash || typeof transactionHash !== 'string') {
-        return res.status(400).json({ error: 'transactionHash is required and must be a string' });
+    // Check if payment verification is disabled (for testing)
+    const paymentRequired = PAYMENT_CONFIG.requiredAmount !== '0';
+    
+    let accountId: string;
+    
+    if (paymentRequired) {
+        // Payment verification mode
+        if (!transactionHash || typeof transactionHash !== 'string') {
+            return res.status(400).json({ error: 'transactionHash is required and must be a string' });
+        }
+        
+        try {
+            // Verify the payment transaction
+            const verificationResult = await verifyPaymentTransaction(transactionHash);
+            
+            if (!verificationResult.valid) {
+                return res.status(400).json({ 
+                    error: 'Payment verification failed', 
+                    details: verificationResult.error 
+                });
+            }
+            
+            accountId = verificationResult.senderAccountId!;
+        } catch (error) {
+            console.error('Error verifying payment transaction:', error);
+            return res.status(500).json({ 
+                error: 'Failed to verify payment transaction',
+                details: error instanceof Error ? error.message : String(error)
+            });
+        }
+    } else {
+        // No payment required (testing mode) - accept accountId directly
+        if (!providedAccountId || typeof providedAccountId !== 'string') {
+            return res.status(400).json({ error: 'accountId is required and must be a string' });
+        }
+        
+        // Validate NEAR account ID format
+        const accountIdRegex = /^[a-z0-9][a-z0-9_-]*[a-z0-9](\.[a-z0-9][a-z0-9_-]*[a-z0-9])*\.near$/;
+        const implicitAccountRegex = /^[a-f0-9]{64}$/;
+        if (!accountIdRegex.test(providedAccountId) && !implicitAccountRegex.test(providedAccountId)) {
+            return res.status(400).json({ error: 'Invalid NEAR account ID format' });
+        }
+        
+        accountId = providedAccountId;
     }
     
-    try {
-        // Verify the payment transaction
-        const verificationResult = await verifyPaymentTransaction(transactionHash);
-        
-        if (!verificationResult.valid) {
-            return res.status(400).json({ 
-                error: 'Payment verification failed', 
-                details: verificationResult.error 
-            });
-        }
-        
-        const accountId = verificationResult.senderAccountId!;
-        const accountsDb = loadAccounts();
-        
-        if (accountsDb.accounts[accountId]) {
-            return res.status(200).json({
-                message: 'Account already registered',
-                account: accountsDb.accounts[accountId]
-            });
-        }
-        
-        accountsDb.accounts[accountId] = {
-            accountId,
-            registeredAt: new Date().toISOString()
-        };
-        
-        saveAccounts(accountsDb);
-        
-        res.status(201).json({
-            message: 'Account registered successfully',
+    const accountsDb = loadAccounts();
+    
+    if (accountsDb.accounts[accountId]) {
+        return res.status(200).json({
+            message: 'Account already registered',
             account: accountsDb.accounts[accountId]
         });
-    } catch (error) {
-        console.error('Error verifying payment transaction:', error);
-        res.status(500).json({ 
-            error: 'Failed to verify payment transaction',
-            details: error instanceof Error ? error.message : String(error)
-        });
     }
+    
+    accountsDb.accounts[accountId] = {
+        accountId,
+        registeredAt: new Date().toISOString()
+    };
+    
+    saveAccounts(accountsDb);
+    
+    res.status(201).json({
+        message: 'Account registered successfully',
+        account: accountsDb.accounts[accountId]
+    });
 });
 
 // GET /api/accounts - List registered accounts
@@ -411,20 +434,20 @@ app.post('/api/jobs', (req: Request, res: Response) => {
         });
     }
     
-    // Check if there's already a running job for this account
-    if (runningJobs.has(accountId)) {
-        return res.status(409).json({ 
-            error: 'A job is already running for this account. Only one job per account can run at a time.' 
-        });
-    }
-    
-    // Validate options
+    // Validate options BEFORE checking for running jobs
     if (options.direction && !['forward', 'backward'].includes(options.direction)) {
         return res.status(400).json({ error: 'direction must be "forward" or "backward"' });
     }
     
     if (options.maxTransactions !== undefined && (typeof options.maxTransactions !== 'number' || options.maxTransactions <= 0)) {
         return res.status(400).json({ error: 'maxTransactions must be a positive number' });
+    }
+    
+    // Check if there's already a running job for this account
+    if (runningJobs.has(accountId)) {
+        return res.status(409).json({ 
+            error: 'A job is already running for this account. Only one job per account can run at a time.' 
+        });
     }
     
     // Create job
