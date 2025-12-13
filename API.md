@@ -450,17 +450,63 @@ npm test
 
 1. **Account Registration**: The API requires explicit account registration to prevent arbitrary data collection.
 
-2. **Rate Limiting**: Consider adding rate limiting middleware in production to prevent abuse.
+2. **Rate Limiting**: **Important for production** - Add rate limiting middleware to prevent abuse:
+   ```javascript
+   import rateLimit from 'express-rate-limit';
+   
+   const limiter = rateLimit({
+     windowMs: 15 * 60 * 1000, // 15 minutes
+     max: 100 // limit each IP to 100 requests per windowMs
+   });
+   
+   app.use('/api/', limiter);
+   ```
 
-3. **Authentication**: For production use, add authentication middleware to protect endpoints.
+3. **Authentication**: For production use, add authentication middleware to protect endpoints:
+   ```javascript
+   import jwt from 'jsonwebtoken';
+   
+   function authenticateToken(req, res, next) {
+     const token = req.headers['authorization'];
+     // Verify token...
+     next();
+   }
+   
+   app.use('/api/', authenticateToken);
+   ```
 
-4. **HTTPS**: Always use HTTPS in production to protect data in transit.
+4. **HTTPS**: Always use HTTPS in production to protect data in transit. Configure a reverse proxy (nginx, Caddy) with TLS certificates.
 
-5. **Input Validation**: All inputs are validated to prevent injection attacks.
+5. **Input Validation**: All inputs are validated to prevent injection attacks. The validation helper ensures NEAR account ID format compliance.
 
-6. **File Access**: Job outputs are isolated by job ID to prevent unauthorized access.
+6. **File Access**: Job outputs are isolated by UUID to prevent unauthorized access. Consider adding user-to-job ownership checks.
 
-## Production Deployment
+7. **CORS**: Configure CORS based on your frontend requirements:
+   ```javascript
+   import cors from 'cors';
+   
+   app.use(cors({
+     origin: 'https://your-frontend-domain.com'
+   }));
+   ```
+
+8. **Environment Variables**: Never commit sensitive API keys or secrets. Use `.env` files (gitignored) or secure secret management.
+
+## Monitoring
+
+Monitor the API server using:
+
+1. **Health Check Endpoint**: Regular polls to `/health`
+2. **Logs**: stdout/stderr for job progress and errors
+3. **Data Directory**: Monitor disk usage in `DATA_DIR`
+4. **Job Status**: Track failed jobs for investigation
+5. **Rate Limiting**: Monitor blocked requests if rate limiting is enabled
+
+## Support
+
+For issues or questions:
+- GitHub Issues: https://github.com/petersalomonsen/near-accounting-export/issues
+- Documentation: See README.md in the repository
 
 ### Using Docker Compose
 

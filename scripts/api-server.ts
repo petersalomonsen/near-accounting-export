@@ -157,6 +157,12 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     next();
 });
 
+// NOTE: For production use, consider adding:
+// - Rate limiting middleware (e.g., express-rate-limit) to prevent abuse
+// - Authentication middleware to protect endpoints
+// - CORS configuration based on your needs
+// - Input sanitization and validation middleware
+
 // POST /api/accounts - Register an account
 app.post('/api/accounts', (req: Request, res: Response) => {
     const { accountId } = req.body;
