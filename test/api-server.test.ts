@@ -84,8 +84,20 @@ describe('API Server', function() {
             stdio: 'inherit'
         });
 
-        // Wait for server to start
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Poll for server readiness with retry mechanism
+        const maxRetries = 20;
+        const retryDelay = 200;
+        for (let i = 0; i < maxRetries; i++) {
+            try {
+                await makeRequest('GET', '/health');
+                break; // Server is ready
+            } catch (error) {
+                if (i === maxRetries - 1) {
+                    throw new Error('Server failed to start within timeout');
+                }
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+            }
+        }
     });
 
     after(function() {

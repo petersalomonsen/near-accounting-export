@@ -142,6 +142,11 @@ async function processJob(jobId: string): Promise<void> {
     }
 }
 
+// Validation helpers
+function isValidNearAccountId(accountId: string): boolean {
+    return /^([a-z0-9_-]+\.)*[a-z0-9_-]+$/.test(accountId);
+}
+
 // Express app
 const app = express();
 app.use(express.json());
@@ -161,7 +166,7 @@ app.post('/api/accounts', (req: Request, res: Response) => {
     }
     
     // Basic validation for NEAR account ID format
-    if (!accountId.match(/^([a-z0-9_-]+\.)*[a-z0-9_-]+$/)) {
+    if (!isValidNearAccountId(accountId)) {
         return res.status(400).json({ error: 'Invalid NEAR account ID format' });
     }
     
@@ -323,7 +328,7 @@ app.get('/api/jobs/:jobId/download/json', (req: Request, res: Response) => {
 });
 
 // GET /api/jobs/:jobId/download/csv - Download job result as CSV
-app.get('/api/jobs/:jobId/download/csv', (req: Request, res: Response) => {
+app.get('/api/jobs/:jobId/download/csv', async (req: Request, res: Response) => {
     const jobId = req.params.jobId;
     
     if (!jobId) {
@@ -354,7 +359,7 @@ app.get('/api/jobs/:jobId/download/csv', (req: Request, res: Response) => {
     // Generate CSV if it doesn't exist
     if (!fs.existsSync(csvFile)) {
         try {
-            convertJsonToCsv(outputFile, csvFile);
+            await convertJsonToCsv(outputFile, csvFile);
         } catch (error) {
             console.error('Error converting to CSV:', error);
             return res.status(500).json({ 
