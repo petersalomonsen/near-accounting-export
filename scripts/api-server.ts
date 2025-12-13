@@ -302,9 +302,9 @@ async function verifyPaymentTransaction(txHash: string): Promise<PaymentVerifica
             };
         }
         
-        // Check transaction status
+        // Check transaction status - SuccessValue can be empty string "", which is valid
         const status = txResult.status;
-        if (!status || !status.SuccessValue !== undefined && !status.SuccessReceiptId) {
+        if (!status || (status.SuccessValue === undefined && !status.SuccessReceiptId)) {
             return { valid: false, error: 'Transaction failed' };
         }
         
