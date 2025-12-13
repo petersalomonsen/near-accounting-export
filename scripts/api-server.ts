@@ -329,51 +329,59 @@ app.get('/api/jobs/:jobId/download/json', (req: Request, res: Response) => {
 
 // GET /api/jobs/:jobId/download/csv - Download job result as CSV
 app.get('/api/jobs/:jobId/download/csv', async (req: Request, res: Response) => {
-    const jobId = req.params.jobId;
-    
-    if (!jobId) {
-        return res.status(400).json({ error: 'Job ID is required' });
-    }
-    
-    const jobsDb = loadJobs();
-    const job = jobsDb.jobs[jobId];
-    
-    if (!job) {
-        return res.status(404).json({ error: 'Job not found' });
-    }
-    
-    if (job.status !== 'completed') {
-        return res.status(400).json({ 
-            error: `Job is not completed. Current status: ${job.status}` 
-        });
-    }
-    
-    const outputFile = getJobOutputFile(jobId);
-    
-    if (!fs.existsSync(outputFile)) {
-        return res.status(404).json({ error: 'Job output file not found' });
-    }
-    
-    const csvFile = getJobCsvFile(jobId);
-    
-    // Generate CSV if it doesn't exist
-    if (!fs.existsSync(csvFile)) {
-        try {
-            await convertJsonToCsv(outputFile, csvFile);
-        } catch (error) {
-            console.error('Error converting to CSV:', error);
-            return res.status(500).json({ 
-                error: 'Failed to convert data to CSV',
-                details: error instanceof Error ? error.message : String(error)
+    try {
+        const jobId = req.params.jobId;
+        
+        if (!jobId) {
+            return res.status(400).json({ error: 'Job ID is required' });
+        }
+        
+        const jobsDb = loadJobs();
+        const job = jobsDb.jobs[jobId];
+        
+        if (!job) {
+            return res.status(404).json({ error: 'Job not found' });
+        }
+        
+        if (job.status !== 'completed') {
+            return res.status(400).json({ 
+                error: `Job is not completed. Current status: ${job.status}` 
             });
         }
+        
+        const outputFile = getJobOutputFile(jobId);
+        
+        if (!fs.existsSync(outputFile)) {
+            return res.status(404).json({ error: 'Job output file not found' });
+        }
+        
+        const csvFile = getJobCsvFile(jobId);
+        
+        // Generate CSV if it doesn't exist
+        if (!fs.existsSync(csvFile)) {
+            try {
+                await convertJsonToCsv(outputFile, csvFile);
+            } catch (error) {
+                console.error('Error converting to CSV:', error);
+                return res.status(500).json({ 
+                    error: 'Failed to convert data to CSV',
+                    details: error instanceof Error ? error.message : String(error)
+                });
+            }
+        }
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="${job.accountId}-${jobId}.csv"`);
+        
+        const fileStream = fs.createReadStream(csvFile);
+        fileStream.pipe(res);
+    } catch (error) {
+        console.error('Unexpected error in CSV download:', error);
+        res.status(500).json({ 
+            error: 'Internal server error',
+            message: error instanceof Error ? error.message : String(error)
+        });
     }
-    
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="${job.accountId}-${jobId}.csv"`);
-    
-    const fileStream = fs.createReadStream(csvFile);
-    fileStream.pipe(res);
 });
 
 // Health check endpoint

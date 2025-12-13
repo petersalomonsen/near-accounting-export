@@ -7,6 +7,15 @@ import http from 'http';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Test configuration constants
+const TEST_CONFIG = {
+    SERVER_PORT: 3001,
+    SERVER_READY_MAX_RETRIES: 20,
+    SERVER_READY_RETRY_DELAY_MS: 200,
+    JOB_COMPLETION_MAX_RETRIES: 60,
+    JOB_COMPLETION_RETRY_DELAY_MS: 3000
+};
+
 // Helper to make HTTP requests
 function makeRequest(
     method: string,
@@ -16,7 +25,7 @@ function makeRequest(
     return new Promise((resolve, reject) => {
         const options: http.RequestOptions = {
             hostname: 'localhost',
-            port: 3001,
+            port: TEST_CONFIG.SERVER_PORT,
             path,
             method,
             headers: {
@@ -78,24 +87,22 @@ describe('API Server', function() {
         serverProcess = spawn('node', ['dist/scripts/api-server.js'], {
             env: {
                 ...process.env,
-                PORT: '3001',
+                PORT: TEST_CONFIG.SERVER_PORT.toString(),
                 DATA_DIR: TEST_DATA_DIR
             },
             stdio: 'inherit'
         });
 
         // Poll for server readiness with retry mechanism
-        const maxRetries = 20;
-        const retryDelay = 200;
-        for (let i = 0; i < maxRetries; i++) {
+        for (let i = 0; i < TEST_CONFIG.SERVER_READY_MAX_RETRIES; i++) {
             try {
                 await makeRequest('GET', '/health');
                 break; // Server is ready
             } catch (error) {
-                if (i === maxRetries - 1) {
+                if (i === TEST_CONFIG.SERVER_READY_MAX_RETRIES - 1) {
                     throw new Error('Server failed to start within timeout');
                 }
-                await new Promise(resolve => setTimeout(resolve, retryDelay));
+                await new Promise(resolve => setTimeout(resolve, TEST_CONFIG.SERVER_READY_RETRY_DELAY_MS));
             }
         }
     });
@@ -285,8 +292,8 @@ describe('API Server', function() {
             
             // Poll until completed or failed
             let attempts = 0;
-            while (attempts < 60) {
-                await new Promise(resolve => setTimeout(resolve, 3000));
+            while (attempts < TEST_CONFIG.JOB_COMPLETION_MAX_RETRIES) {
+                await new Promise(resolve => setTimeout(resolve, TEST_CONFIG.JOB_COMPLETION_RETRY_DELAY_MS));
                 
                 const statusResponse = await makeRequest('GET', `/api/jobs/${completedJobId}`);
                 const status = statusResponse.body.job.status;
@@ -302,7 +309,7 @@ describe('API Server', function() {
                 attempts++;
             }
             
-            if (attempts >= 60) {
+            if (attempts >= TEST_CONFIG.JOB_COMPLETION_MAX_RETRIES) {
                 throw new Error('Job did not complete within timeout');
             }
         });
