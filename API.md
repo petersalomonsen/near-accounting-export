@@ -78,12 +78,18 @@ Check if the API server is running.
 
 **POST /api/accounts**
 
-Register a NEAR account for data collection. Only registered accounts can have data collection jobs created.
+Register a NEAR account for data collection. Registration requires payment verification via a fungible token transfer transaction.
+
+**Payment Requirements:**
+- Transfer the required amount (configurable via `REGISTRATION_FEE_AMOUNT`, default: 1 USDC = 1000000) 
+- Send to the recipient account (configurable via `REGISTRATION_FEE_RECIPIENT`, default: accounting-export.near)
+- Use the specified FT contract (configurable via `REGISTRATION_FEE_TOKEN`, default: usdc.near)
+- Transaction must be within the maximum age (configurable via `REGISTRATION_TX_MAX_AGE_MS`, default: 30 days)
 
 **Request Body:**
 ```json
 {
-  "accountId": "myaccount.near"
+  "transactionHash": "BfcxWzpQbvPzPXp438EpqpfcLZ1vHW36YoetCBac3WEA"
 }
 ```
 
@@ -92,26 +98,37 @@ Register a NEAR account for data collection. Only registered accounts can have d
 {
   "message": "Account registered successfully",
   "account": {
-    "accountId": "myaccount.near",
+    "accountId": "sender.near",
     "registeredAt": "2024-01-01T00:00:00.000Z"
   }
 }
 ```
+
+Note: The account ID is automatically extracted from the payment transaction sender.
 
 **Response (200 OK - Already Registered):**
 ```json
 {
   "message": "Account already registered",
   "account": {
-    "accountId": "myaccount.near",
+    "accountId": "sender.near",
     "registeredAt": "2024-01-01T00:00:00.000Z"
   }
 }
 ```
 
 **Error Responses:**
-- `400 Bad Request` - Invalid account ID format or missing accountId
-- Example: `{ "error": "Invalid NEAR account ID format" }`
+- `400 Bad Request` - Missing transaction hash, payment verification failed, or transaction issues
+  - Example: `{ "error": "Payment verification failed", "details": "Insufficient amount. Required: 1000000, Got: 100" }`
+  - Example: `{ "error": "Payment verification failed", "details": "Transaction is too old" }`
+  - Example: `{ "error": "Payment verification failed", "details": "Incorrect recipient" }`
+- `500 Internal Server Error` - Failed to verify payment transaction
+
+**Environment Variables for Payment Configuration:**
+- `REGISTRATION_FEE_AMOUNT` - Required payment amount in FT base units (default: "1000000" for 1 USDC)
+- `REGISTRATION_FEE_RECIPIENT` - Recipient account for payments (default: "accounting-export.near")
+- `REGISTRATION_FEE_TOKEN` - FT contract ID (default: "usdc.near")
+- `REGISTRATION_TX_MAX_AGE_MS` - Maximum age of transaction in milliseconds (default: 30 days)
 
 ---
 
@@ -347,16 +364,16 @@ Download the collected data as CSV for the specified account.
 ### cURL
 
 ```bash
-# Register an account
+# Register an account (provide transaction hash of FT payment)
 curl -X POST http://localhost:3000/api/accounts \
   -H "Content-Type: application/json" \
-  -d '{"accountId": "myaccount.near"}'
+  -d '{"transactionHash": "YOUR_PAYMENT_TX_HASH_HERE"}'
 
-# Create a job
+# Create a job (account ID is extracted from payment transaction)
 curl -X POST http://localhost:3000/api/jobs \
   -H "Content-Type: application/json" \
   -d '{
-    "accountId": "myaccount.near",
+    "accountId": "youraccountid.near",
     "options": {
       "maxTransactions": 50,
       "direction": "backward"
@@ -379,20 +396,21 @@ curl -O -J http://localhost:3000/api/accounts/myaccount.near/download/csv
 ### JavaScript/TypeScript
 
 ```javascript
-// Register an account
+// Register an account (provide transaction hash of FT payment)
 const registerResponse = await fetch('http://localhost:3000/api/accounts', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ accountId: 'myaccount.near' })
+  body: JSON.stringify({ transactionHash: 'YOUR_PAYMENT_TX_HASH_HERE' })
 });
 const registration = await registerResponse.json();
+const accountId = registration.account.accountId; // Extracted from payment transaction
 
 // Create a job
 const jobResponse = await fetch('http://localhost:3000/api/jobs', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
-    accountId: 'myaccount.near',
+    accountId: accountId,
     options: {
       maxTransactions: 50,
       direction: 'backward'
@@ -421,25 +439,26 @@ import time
 
 BASE_URL = "http://localhost:3000"
 
-# Register an account
+# Register an account (provide transaction hash of FT payment)
 response = requests.post(
     f"{BASE_URL}/api/accounts",
-    json={"accountId": "myaccount.near"}
+    json={"transactionHash": "YOUR_PAYMENT_TX_HASH_HERE"}
 )
-print(response.json())
+registration = response.json()
+account_id = registration["account"]["accountId"]  # Extracted from payment transaction
+print(registration)
 
 # Create a job
 response = requests.post(
     f"{BASE_URL}/api/jobs",
     json={
-        "accountId": "myaccount.near",
+        "accountId": account_id,
         "options": {
             "maxTransactions": 50,
             "direction": "backward"
         }
     }
 )
-account_id = response.json()["job"]["accountId"]
 
 # Check account status
 response = requests.get(f"{BASE_URL}/api/accounts/{account_id}/status")

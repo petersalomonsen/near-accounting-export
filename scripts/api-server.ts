@@ -14,6 +14,15 @@ dotenv.config();
 import { getAccountHistory, verifyHistoryFile } from './get-account-history.js';
 import type { TransactionEntry } from './get-account-history.js';
 import { convertJsonToCsv } from './json-to-csv.js';
+import { getClient } from './rpc.js';
+
+// Payment verification configuration
+const PAYMENT_CONFIG = {
+    requiredAmount: process.env.REGISTRATION_FEE_AMOUNT || '1000000000000000000000000', // 1 USDC (6 decimals = 1000000)
+    recipientAccount: process.env.REGISTRATION_FEE_RECIPIENT || 'accounting-export.near',
+    ftContractId: process.env.REGISTRATION_FEE_TOKEN || 'usdc.near', // Default to USDC
+    maxAge: parseInt(process.env.REGISTRATION_TX_MAX_AGE_MS || String(30 * 24 * 60 * 60 * 1000), 10) // Default 30 days
+};
 
 // Types
 interface RegisteredAccount {
@@ -147,6 +156,138 @@ function isValidNearAccountId(accountId: string): boolean {
     return /^([a-z0-9_-]+\.)*[a-z0-9_-]+$/.test(accountId);
 }
 
+// Payment verification
+interface PaymentVerificationResult {
+    valid: boolean;
+    senderAccountId?: string;
+    error?: string;
+}
+
+async function verifyPaymentTransaction(txHash: string): Promise<PaymentVerificationResult> {
+    try {
+        const endpoint = process.env.NEAR_RPC_ENDPOINT || 'https://archival-rpc.mainnet.fastnear.com';
+        const headers: Record<string, string> = {
+            'Content-Type': 'application/json'
+        };
+        const apiKey = process.env.FASTNEAR_API_KEY;
+        if (apiKey) {
+            headers['Authorization'] = `Bearer ${apiKey}`;
+        }
+        
+        // Fetch transaction details using EXPERIMENTAL_tx_status
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 'dontcare',
+                method: 'EXPERIMENTAL_tx_status',
+                params: {
+                    tx_hash: txHash,
+                    sender_account_id: 'dontcare'
+                }
+            })
+        });
+        
+        if (!response.ok) {
+            return { valid: false, error: `RPC request failed: ${response.statusText}` };
+        }
+        
+        const data: any = await response.json();
+        
+        if (data.error) {
+            return { valid: false, error: `RPC error: ${data.error.message || JSON.stringify(data.error)}` };
+        }
+        
+        const txResult = data.result;
+        
+        if (!txResult || !txResult.transaction) {
+            return { valid: false, error: 'Transaction not found' };
+        }
+        
+        const transaction = txResult.transaction;
+        const senderAccountId = transaction.signer_id;
+        
+        // Check transaction age
+        const txTimestamp = txResult.transaction_outcome?.block_timestamp || 0;
+        const txAge = Date.now() * 1_000_000 - txTimestamp; // Convert to nanoseconds
+        if (txAge > PAYMENT_CONFIG.maxAge * 1_000_000) {
+            return { 
+                valid: false, 
+                error: `Transaction is too old (age: ${Math.floor(txAge / (1_000_000 * 1000))}ms, max: ${PAYMENT_CONFIG.maxAge}ms)` 
+            };
+        }
+        
+        // Check if transaction has FT transfer action
+        const actions = transaction.actions || [];
+        let ftTransferFound = false;
+        let transferAmount = '0';
+        let receiverId = transaction.receiver_id;
+        
+        for (const action of actions) {
+            if (action.FunctionCall) {
+                const methodName = action.FunctionCall.method_name;
+                
+                // Check if it's an FT transfer
+                if (methodName === 'ft_transfer' || methodName === 'ft_transfer_call') {
+                    // Check if receiver_id is the FT contract
+                    if (receiverId !== PAYMENT_CONFIG.ftContractId) {
+                        continue;
+                    }
+                    
+                    ftTransferFound = true;
+                    
+                    // Parse args to get receiver_id and amount
+                    const argsBase64 = action.FunctionCall.args;
+                    const argsStr = Buffer.from(argsBase64, 'base64').toString('utf8');
+                    const args = JSON.parse(argsStr);
+                    
+                    // Verify recipient
+                    if (args.receiver_id !== PAYMENT_CONFIG.recipientAccount) {
+                        return { 
+                            valid: false, 
+                            error: `Incorrect recipient. Expected: ${PAYMENT_CONFIG.recipientAccount}, Got: ${args.receiver_id}` 
+                        };
+                    }
+                    
+                    transferAmount = args.amount || '0';
+                    break;
+                }
+            }
+        }
+        
+        if (!ftTransferFound) {
+            return { valid: false, error: 'No FT transfer found in transaction' };
+        }
+        
+        // Verify amount
+        if (BigInt(transferAmount) < BigInt(PAYMENT_CONFIG.requiredAmount)) {
+            return { 
+                valid: false, 
+                error: `Insufficient amount. Required: ${PAYMENT_CONFIG.requiredAmount}, Got: ${transferAmount}` 
+            };
+        }
+        
+        // Check transaction status
+        const status = txResult.status;
+        if (!status || !status.SuccessValue !== undefined && !status.SuccessReceiptId) {
+            return { valid: false, error: 'Transaction failed' };
+        }
+        
+        return { 
+            valid: true, 
+            senderAccountId 
+        };
+        
+    } catch (error) {
+        console.error('Error verifying transaction:', error);
+        return { 
+            valid: false, 
+            error: `Failed to fetch transaction: ${error instanceof Error ? error.message : String(error)}` 
+        };
+    }
+}
+
 // Express app
 const app = express();
 app.use(express.json());
@@ -164,38 +305,52 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // - Input sanitization and validation middleware
 
 // POST /api/accounts - Register an account
-app.post('/api/accounts', (req: Request, res: Response) => {
-    const { accountId } = req.body;
+app.post('/api/accounts', async (req: Request, res: Response) => {
+    const { transactionHash } = req.body;
     
-    if (!accountId || typeof accountId !== 'string') {
-        return res.status(400).json({ error: 'accountId is required and must be a string' });
+    if (!transactionHash || typeof transactionHash !== 'string') {
+        return res.status(400).json({ error: 'transactionHash is required and must be a string' });
     }
     
-    // Basic validation for NEAR account ID format
-    if (!isValidNearAccountId(accountId)) {
-        return res.status(400).json({ error: 'Invalid NEAR account ID format' });
-    }
-    
-    const accountsDb = loadAccounts();
-    
-    if (accountsDb.accounts[accountId]) {
-        return res.status(200).json({
-            message: 'Account already registered',
+    try {
+        // Verify the payment transaction
+        const verificationResult = await verifyPaymentTransaction(transactionHash);
+        
+        if (!verificationResult.valid) {
+            return res.status(400).json({ 
+                error: 'Payment verification failed', 
+                details: verificationResult.error 
+            });
+        }
+        
+        const accountId = verificationResult.senderAccountId!;
+        const accountsDb = loadAccounts();
+        
+        if (accountsDb.accounts[accountId]) {
+            return res.status(200).json({
+                message: 'Account already registered',
+                account: accountsDb.accounts[accountId]
+            });
+        }
+        
+        accountsDb.accounts[accountId] = {
+            accountId,
+            registeredAt: new Date().toISOString()
+        };
+        
+        saveAccounts(accountsDb);
+        
+        res.status(201).json({
+            message: 'Account registered successfully',
             account: accountsDb.accounts[accountId]
         });
+    } catch (error) {
+        console.error('Error verifying payment transaction:', error);
+        res.status(500).json({ 
+            error: 'Failed to verify payment transaction',
+            details: error instanceof Error ? error.message : String(error)
+        });
     }
-    
-    accountsDb.accounts[accountId] = {
-        accountId,
-        registeredAt: new Date().toISOString()
-    };
-    
-    saveAccounts(accountsDb);
-    
-    res.status(201).json({
-        message: 'Account registered successfully',
-        account: accountsDb.accounts[accountId]
-    });
 });
 
 // GET /api/accounts - List registered accounts
