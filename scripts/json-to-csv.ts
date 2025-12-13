@@ -322,9 +322,8 @@ function generateCSV(rows: CSVRow[]): string {
             escapeCSV(row.amountWholeUnits),
             escapeCSV(row.balanceWholeUnits),
             escapeCSV(row.asset),
-            // Wrap raw values in quotes to preserve as strings (prevent Excel scientific notation)
-            `"${row.amountRaw}"`,
-            `"${row.tokenBalanceRaw}"`,
+            row.amountRaw,
+            row.tokenBalanceRaw,
             escapeCSV(row.transactionHash),
             escapeCSV(row.receiptId)
         ];
