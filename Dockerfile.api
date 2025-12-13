@@ -1,0 +1,31 @@
+FROM node:20-alpine
+
+# Install wget for healthcheck
+RUN apk add --no-cache wget
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install production dependencies only
+RUN npm ci --production
+
+# Copy compiled application
+COPY dist/ ./dist/
+
+# Set environment variables
+ENV PORT=3000
+ENV DATA_DIR=/data
+
+# Create data directory
+RUN mkdir -p /data
+
+# Expose API port
+EXPOSE 3000
+
+# Volume for persistent data
+VOLUME /data
+
+# Start API server
+CMD ["node", "dist/scripts/api-server.js"]

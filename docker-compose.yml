@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/data
+    environment:
+      - PORT=3000
+      - DATA_DIR=/data
+      - NEAR_RPC_ENDPOINT=${NEAR_RPC_ENDPOINT:-https://archival-rpc.mainnet.fastnear.com}
+      - FASTNEAR_API_KEY=${FASTNEAR_API_KEY}
+      - NEARBLOCKS_API_KEY=${NEARBLOCKS_API_KEY}
+      - RPC_DELAY_MS=${RPC_DELAY_MS:-50}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

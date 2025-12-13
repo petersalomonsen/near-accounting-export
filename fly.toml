@@ -1,0 +1,31 @@
+# fly.toml app configuration file generated for near-accounting-export
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+
+app = "near-accounting-export"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile.api"
+
+[env]
+  PORT = "3000"
+  DATA_DIR = "/data"
+  NEAR_RPC_ENDPOINT = "https://archival-rpc.mainnet.fastnear.com"
+  RPC_DELAY_MS = "50"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
+
+[mounts]
+  source = "accounting_data"
+  destination = "/data"
