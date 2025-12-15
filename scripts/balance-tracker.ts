@@ -684,6 +684,7 @@ export async function findLatestBalanceChangingBlock(
 
 /**
  * Parse NEP-141 FT transfer events from logs
+ * Supports both EVENT_JSON (NEP-141 standard) and plain text logs (wrap.near style)
  */
 function parseFtTransferEvents(
     logs: string[],
@@ -695,46 +696,78 @@ function parseFtTransferEvents(
     const transfers: TransferDetail[] = [];
     
     for (const log of logs) {
-        if (!log.startsWith('EVENT_JSON:')) continue;
-        
-        try {
-            const eventData = JSON.parse(log.substring('EVENT_JSON:'.length));
-            
-            // NEP-141 ft_transfer event
-            if (eventData.standard === 'nep141' && eventData.event === 'ft_transfer') {
-                for (const transfer of eventData.data || []) {
-                    const oldOwner = transfer.old_owner_id;
-                    const newOwner = transfer.new_owner_id;
-                    const amount = transfer.amount;
-                    const memo = transfer.memo;
-                    
-                    if (oldOwner === targetAccountId) {
-                        transfers.push({
-                            type: 'ft',
-                            direction: 'out',
-                            amount,
-                            counterparty: newOwner,
-                            tokenId: contractId,
-                            memo,
-                            txHash,
-                            receiptId
-                        });
-                    } else if (newOwner === targetAccountId) {
-                        transfers.push({
-                            type: 'ft',
-                            direction: 'in',
-                            amount,
-                            counterparty: oldOwner,
-                            tokenId: contractId,
-                            memo,
-                            txHash,
-                            receiptId
-                        });
+        // Try EVENT_JSON format (NEP-141 standard)
+        if (log.startsWith('EVENT_JSON:')) {
+            try {
+                const eventData = JSON.parse(log.substring('EVENT_JSON:'.length));
+                
+                // NEP-141 ft_transfer event
+                if (eventData.standard === 'nep141' && eventData.event === 'ft_transfer') {
+                    for (const transfer of eventData.data || []) {
+                        const oldOwner = transfer.old_owner_id;
+                        const newOwner = transfer.new_owner_id;
+                        const amount = transfer.amount;
+                        const memo = transfer.memo;
+                        
+                        if (oldOwner === targetAccountId) {
+                            transfers.push({
+                                type: 'ft',
+                                direction: 'out',
+                                amount,
+                                counterparty: newOwner,
+                                tokenId: contractId,
+                                memo,
+                                txHash,
+                                receiptId
+                            });
+                        } else if (newOwner === targetAccountId) {
+                            transfers.push({
+                                type: 'ft',
+                                direction: 'in',
+                                amount,
+                                counterparty: oldOwner,
+                                tokenId: contractId,
+                                memo,
+                                txHash,
+                                receiptId
+                            });
+                        }
                     }
                 }
+            } catch (e) {
+                // Skip invalid JSON
             }
-        } catch (e) {
-            // Skip invalid JSON
+        }
+        // Try plain text format (wrap.near style): "Transfer X from Y to Z"
+        else if (log.includes(targetAccountId)) {
+            const plainTransferMatch = log.match(/^Transfer (\d+) from ([^\s]+) to ([^\s]+)$/);
+            if (plainTransferMatch) {
+                const amount = plainTransferMatch[1]!;
+                const fromAccount = plainTransferMatch[2]!;
+                const toAccount = plainTransferMatch[3]!;
+                
+                if (toAccount === targetAccountId) {
+                    transfers.push({
+                        type: 'ft',
+                        direction: 'in',
+                        amount,
+                        counterparty: fromAccount,
+                        tokenId: contractId,
+                        txHash,
+                        receiptId
+                    });
+                } else if (fromAccount === targetAccountId) {
+                    transfers.push({
+                        type: 'ft',
+                        direction: 'out',
+                        amount,
+                        counterparty: toAccount,
+                        tokenId: contractId,
+                        txHash,
+                        receiptId
+                    });
+                }
+            }
         }
     }
     
