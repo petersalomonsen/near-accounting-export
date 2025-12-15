@@ -751,11 +751,31 @@ async function enrichTransactionsWithTransfers(
     outputFile: string,
     maxToEnrich: number = 50
 ): Promise<number> {
+    // Helper to check if transfers are missing for a balance change type
+    const hasMissingTransfers = (tx: TransactionEntry): boolean => {
+        if (!tx.changes || !tx.transfers) return false;
+        
+        // Check if FT balance changed but no FT transfer was captured
+        const ftChanges = Object.keys(tx.changes.tokensChanged || {});
+        if (ftChanges.length > 0) {
+            const hasFtTransfer = tx.transfers.some(t => t.type === 'ft');
+            if (!hasFtTransfer) return true;
+        }
+        
+        // Check if MT balance changed but no MT transfer was captured  
+        const mtChanges = Object.keys(tx.changes.intentsChanged || {});
+        if (mtChanges.length > 0) {
+            const hasMtTransfer = tx.transfers.some(t => t.type === 'mt');
+            if (!hasMtTransfer) return true;
+        }
+        
+        return false;
+    };
+    
     // Find transactions that haven't been attempted for enrichment yet
     // tx.transfers === undefined means never attempted
-    // tx.transfers === [] means attempted but found nothing (don't retry)
-    // tx.transfers.length > 0 means has transfers (don't retry)
-    // Only enrich transactions that have balance changes (otherwise there's nothing to find)
+    // tx.transfers === [] means attempted but found nothing (don't retry unless balance changes suggest missing transfers)
+    // Also re-enrich if FT/MT balance changed but no corresponding transfer was captured
     const transactionsToEnrich = history.transactions.filter(tx => {
         const neverAttempted = tx.transfers === undefined;
         const hasBalanceChanges = tx.changes && (
@@ -763,7 +783,8 @@ async function enrichTransactionsWithTransfers(
             Object.keys(tx.changes.tokensChanged || {}).length > 0 ||
             Object.keys(tx.changes.intentsChanged || {}).length > 0
         );
-        return neverAttempted && hasBalanceChanges;
+        const missingTransfers = hasMissingTransfers(tx);
+        return (neverAttempted && hasBalanceChanges) || missingTransfers;
     });
     
     if (transactionsToEnrich.length === 0) {
