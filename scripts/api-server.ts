@@ -252,10 +252,11 @@ async function verifyPaymentTransaction(txHash: string): Promise<PaymentVerifica
             };
         }
         
-        // Check if transaction has FT transfer action
+        // Check if transaction has FT transfer action (direct transfer)
         const actions = transaction.actions || [];
         let ftTransferFound = false;
         let transferAmount = '0';
+        let actualSenderAccountId = senderAccountId; // May be updated if transfer is in receipts
         let receiverId = transaction.receiver_id;
         
         for (const action of actions) {
@@ -290,6 +291,49 @@ async function verifyPaymentTransaction(txHash: string): Promise<PaymentVerifica
             }
         }
         
+        // If not found in transaction actions, check receipts (e.g., DAO proposals, other cross-contract calls)
+        if (!ftTransferFound && txResult.receipts) {
+            for (const receipt of txResult.receipts) {
+                // Skip receipts not directed to the FT contract
+                if (receipt.receiver_id !== PAYMENT_CONFIG.ftContractId) {
+                    continue;
+                }
+                
+                const receiptActions = receipt.receipt?.Action?.actions || [];
+                for (const action of receiptActions) {
+                    if (action.FunctionCall) {
+                        const methodName = action.FunctionCall.method_name;
+                        
+                        if (methodName === 'ft_transfer' || methodName === 'ft_transfer_call') {
+                            try {
+                                // Parse args to get receiver_id and amount
+                                const argsBase64 = action.FunctionCall.args;
+                                const argsStr = Buffer.from(argsBase64, 'base64').toString('utf8');
+                                const args = JSON.parse(argsStr);
+                                
+                                // Verify recipient
+                                if (args.receiver_id !== PAYMENT_CONFIG.recipientAccount) {
+                                    continue;
+                                }
+                                
+                                ftTransferFound = true;
+                                transferAmount = args.amount || '0';
+                                // The actual sender is the predecessor_id (the account that initiated the receipt)
+                                // This could be a DAO, multisig, or other contract acting on behalf of the user
+                                actualSenderAccountId = receipt.predecessor_id;
+                                break;
+                            } catch (e) {
+                                // Skip receipts with invalid args
+                                continue;
+                            }
+                        }
+                    }
+                }
+                
+                if (ftTransferFound) break;
+            }
+        }
+        
         if (!ftTransferFound) {
             return { valid: false, error: 'No FT transfer found in transaction' };
         }
@@ -310,7 +354,7 @@ async function verifyPaymentTransaction(txHash: string): Promise<PaymentVerifica
         
         return { 
             valid: true, 
-            senderAccountId 
+            senderAccountId: actualSenderAccountId 
         };
         
     } catch (error) {
