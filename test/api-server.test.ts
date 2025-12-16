@@ -377,3 +377,164 @@ describe('API Server', function() {
         });
     });
 });
+
+// Separate test suite for payment verification with real transactions
+// This requires network access and tests against actual mainnet transactions
+describe('API Server - Payment Verification', function() {
+    this.timeout(120000);
+
+    let serverProcess: any = null;
+    const TEST_DATA_DIR = path.join(__dirname, '..', '..', 'test-data', 'api-payment');
+    const PAYMENT_TEST_PORT = 3003;
+
+    // Real DAO transaction that transfers 0.1 ARIZ via a Sputnik DAO proposal
+    // Transaction: 93AijbdCEF8odXHzLsEx6D1ZCKdDquKoVungdzBZTYMD
+    // - Signer: maledress6270.near (calls act_proposal on DAO)
+    // - DAO: romakqatesting.sputnik-dao.near (executes ft_transfer)
+    // - Recipient: arizcredits.near
+    // - Amount: 100000 (0.1 ARIZ)
+    const DAO_TRANSACTION_HASH = '93AijbdCEF8odXHzLsEx6D1ZCKdDquKoVungdzBZTYMD';
+    const EXPECTED_DAO_ACCOUNT = 'romakqatesting.sputnik-dao.near';
+
+    function makePaymentRequest(
+        method: string,
+        requestPath: string,
+        body?: any
+    ): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
+        return new Promise((resolve, reject) => {
+            const options: http.RequestOptions = {
+                hostname: 'localhost',
+                port: PAYMENT_TEST_PORT,
+                path: requestPath,
+                method,
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            };
+
+            const req = http.request(options, (res) => {
+                let data = '';
+
+                res.on('data', (chunk) => {
+                    data += chunk;
+                });
+
+                res.on('end', () => {
+                    let parsedBody;
+                    try {
+                        parsedBody = JSON.parse(data);
+                    } catch {
+                        parsedBody = data;
+                    }
+
+                    resolve({
+                        statusCode: res.statusCode || 0,
+                        body: parsedBody,
+                        headers: res.headers
+                    });
+                });
+            });
+
+            req.on('error', reject);
+
+            if (body) {
+                req.write(JSON.stringify(body));
+            }
+
+            req.end();
+        });
+    }
+
+    before(async function() {
+        // Setup test data directory
+        if (fs.existsSync(TEST_DATA_DIR)) {
+            fs.rmSync(TEST_DATA_DIR, { recursive: true });
+        }
+        fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
+
+        // Start the API server WITH payment verification enabled
+        const { spawn } = await import('child_process');
+        
+        serverProcess = spawn('node', ['dist/scripts/api-server.js'], {
+            env: {
+                ...process.env,
+                PORT: PAYMENT_TEST_PORT.toString(),
+                DATA_DIR: TEST_DATA_DIR,
+                // Enable payment verification with default ARIZ settings
+                REGISTRATION_FEE_AMOUNT: '100000',
+                REGISTRATION_FEE_RECIPIENT: 'arizcredits.near',
+                REGISTRATION_FEE_TOKEN: 'arizcredits.near',
+                // Allow old transactions for testing (the test transaction is from the past)
+                REGISTRATION_TX_MAX_AGE_MS: String(365 * 24 * 60 * 60 * 1000) // 1 year
+            },
+            stdio: 'inherit'
+        });
+
+        // Poll for server readiness
+        for (let i = 0; i < 20; i++) {
+            try {
+                await makePaymentRequest('GET', '/health');
+                break;
+            } catch (error) {
+                if (i === 19) {
+                    throw new Error('Payment test server failed to start within timeout');
+                }
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+        }
+    });
+
+    after(function() {
+        if (serverProcess) {
+            serverProcess.kill();
+        }
+
+        if (fs.existsSync(TEST_DATA_DIR)) {
+            fs.rmSync(TEST_DATA_DIR, { recursive: true });
+        }
+    });
+
+    describe('DAO Transaction Payment Verification', function() {
+        it('should register account from DAO proposal ft_transfer in receipts', async function() {
+            // Register using the DAO transaction hash
+            // The ft_transfer is in the receipts, not in the top-level transaction actions
+            const response = await makePaymentRequest('POST', '/api/accounts', {
+                transactionHash: DAO_TRANSACTION_HASH
+            });
+            
+            assert.equal(response.statusCode, 201, `Expected 201 but got ${response.statusCode}: ${JSON.stringify(response.body)}`);
+            assert.equal(response.body.message, 'Account registered successfully');
+            // The registered account should be the DAO (predecessor_id in receipt), not the signer
+            assert.equal(response.body.account.accountId, EXPECTED_DAO_ACCOUNT);
+            assert.ok(response.body.account.registeredAt);
+        });
+
+        it('should return existing account when re-registering with same DAO transaction', async function() {
+            const response = await makePaymentRequest('POST', '/api/accounts', {
+                transactionHash: DAO_TRANSACTION_HASH
+            });
+            
+            assert.equal(response.statusCode, 200);
+            assert.equal(response.body.message, 'Account already registered');
+            assert.equal(response.body.account.accountId, EXPECTED_DAO_ACCOUNT);
+        });
+
+        it('should reject registration with invalid transaction hash', async function() {
+            const response = await makePaymentRequest('POST', '/api/accounts', {
+                transactionHash: 'InvalidTransactionHashThatDoesNotExist123456789'
+            });
+            
+            assert.equal(response.statusCode, 400);
+            assert.ok(response.body.error.includes('Payment verification failed'));
+        });
+
+        it('should reject registration without transaction hash when payment is required', async function() {
+            const response = await makePaymentRequest('POST', '/api/accounts', {
+                accountId: 'someaccount.near'
+            });
+            
+            assert.equal(response.statusCode, 400);
+            assert.ok(response.body.error.includes('transactionHash is required'));
+        });
+    });
+});
