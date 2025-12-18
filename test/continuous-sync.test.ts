@@ -17,55 +17,60 @@ const TEST_CONFIG = {
     CYCLE_DELAY_MS: '100'
 };
 
-// Helper to make HTTP requests
-function makeRequest(
-    method: string,
-    path: string,
-    body?: any
-): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
-    return new Promise((resolve, reject) => {
-        const options: http.RequestOptions = {
-            hostname: 'localhost',
-            port: TEST_CONFIG.SERVER_PORT,
-            path,
-            method,
-            headers: {
-                'Content-Type': 'application/json'
-            }
-        };
-
-        const req = http.request(options, (res) => {
-            let data = '';
-
-            res.on('data', (chunk) => {
-                data += chunk;
-            });
-
-            res.on('end', () => {
-                let parsedBody;
-                try {
-                    parsedBody = JSON.parse(data);
-                } catch {
-                    parsedBody = data;
+// Helper to make HTTP requests with configurable port
+function createRequestHelper(port: number) {
+    return function makeRequest(
+        method: string,
+        requestPath: string,
+        body?: any
+    ): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
+        return new Promise((resolve, reject) => {
+            const options: http.RequestOptions = {
+                hostname: 'localhost',
+                port,
+                path: requestPath,
+                method,
+                headers: {
+                    'Content-Type': 'application/json'
                 }
+            };
 
-                resolve({
-                    statusCode: res.statusCode || 0,
-                    body: parsedBody,
-                    headers: res.headers
+            const req = http.request(options, (res) => {
+                let data = '';
+
+                res.on('data', (chunk) => {
+                    data += chunk;
+                });
+
+                res.on('end', () => {
+                    let parsedBody;
+                    try {
+                        parsedBody = JSON.parse(data);
+                    } catch {
+                        parsedBody = data;
+                    }
+
+                    resolve({
+                        statusCode: res.statusCode || 0,
+                        body: parsedBody,
+                        headers: res.headers
+                    });
                 });
             });
+
+            req.on('error', reject);
+
+            if (body) {
+                req.write(JSON.stringify(body));
+            }
+
+            req.end();
         });
-
-        req.on('error', reject);
-
-        if (body) {
-            req.write(JSON.stringify(body));
-        }
-
-        req.end();
-    });
+    };
 }
+
+// Create request helpers for different test suites
+const makeRequest = createRequestHelper(TEST_CONFIG.SERVER_PORT);
 
 describe('Continuous Sync', function() {
     // Tests may take time
@@ -291,54 +296,8 @@ describe('Subscription Renewal', function() {
     const TEST_DATA_DIR = path.join(__dirname, '..', '..', 'test-data', 'subscription-renewal');
     const TEST_PORT = 3004;
 
-    function makeRenewalRequest(
-        method: string,
-        requestPath: string,
-        body?: any
-    ): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
-        return new Promise((resolve, reject) => {
-            const options: http.RequestOptions = {
-                hostname: 'localhost',
-                port: TEST_PORT,
-                path: requestPath,
-                method,
-                headers: {
-                    'Content-Type': 'application/json'
-                }
-            };
-
-            const req = http.request(options, (res) => {
-                let data = '';
-
-                res.on('data', (chunk) => {
-                    data += chunk;
-                });
-
-                res.on('end', () => {
-                    let parsedBody;
-                    try {
-                        parsedBody = JSON.parse(data);
-                    } catch {
-                        parsedBody = data;
-                    }
-
-                    resolve({
-                        statusCode: res.statusCode || 0,
-                        body: parsedBody,
-                        headers: res.headers
-                    });
-                });
-            });
-
-            req.on('error', reject);
-
-            if (body) {
-                req.write(JSON.stringify(body));
-            }
-
-            req.end();
-        });
-    }
+    // Use the shared request helper with a different port
+    const makeRenewalRequest = createRequestHelper(TEST_PORT);
 
     before(async function() {
         // Setup test data directory

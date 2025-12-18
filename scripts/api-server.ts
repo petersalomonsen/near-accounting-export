@@ -160,6 +160,9 @@ async function processJob(jobId: string): Promise<void> {
 }
 
 // Continuous sync state
+// Note: These module-level variables are intentional for a single-instance server.
+// The fly.toml configuration limits the server to a single instance (scale count 1)
+// to prevent data conflicts and ensure job tracking consistency.
 let continuousSyncRunning = false;
 let continuousSyncShuttingDown = false;
 
