@@ -454,6 +454,7 @@ function isValidNearAccountId(accountId: string): boolean {
 interface PaymentVerificationResult {
     valid: boolean;
     senderAccountId?: string;
+    transactionTimestamp?: string;
     error?: string;
 }
 
@@ -646,9 +647,13 @@ async function verifyPaymentTransaction(txHash: string): Promise<PaymentVerifica
             return { valid: false, error: 'Transaction failed' };
         }
         
+        // Convert nanoseconds to ISO string
+        const txDate = new Date(txTimestamp / 1_000_000).toISOString();
+        
         return { 
             valid: true, 
-            senderAccountId: actualSenderAccountId 
+            senderAccountId: actualSenderAccountId,
+            transactionTimestamp: txDate
         };
         
     } catch (error) {
@@ -684,6 +689,7 @@ app.post('/api/accounts', async (req: Request, res: Response) => {
     const paymentRequired = PAYMENT_CONFIG.requiredAmount !== '0';
     
     let accountId: string;
+    let verificationResult: PaymentVerificationResult | undefined;
     
     if (paymentRequired) {
         // Payment verification mode
@@ -693,7 +699,7 @@ app.post('/api/accounts', async (req: Request, res: Response) => {
         
         try {
             // Verify the payment transaction
-            const verificationResult = await verifyPaymentTransaction(transactionHash);
+            verificationResult = await verifyPaymentTransaction(transactionHash);
             
             if (!verificationResult.valid) {
                 return res.status(400).json({ 
@@ -733,10 +739,10 @@ app.post('/api/accounts', async (req: Request, res: Response) => {
     if (existingAccount) {
         // If payment verification is required and transaction hash is provided,
         // allow subscription renewal
-        if (paymentRequired && transactionHash) {
+        if (paymentRequired && transactionHash && verificationResult) {
             // Update payment info for subscription renewal
             existingAccount.paymentTransactionHash = transactionHash;
-            existingAccount.paymentTransactionDate = new Date().toISOString();
+            existingAccount.paymentTransactionDate = verificationResult.transactionTimestamp!;
             saveAccounts(accountsDb);
             
             return res.status(200).json({
@@ -757,9 +763,9 @@ app.post('/api/accounts', async (req: Request, res: Response) => {
         registeredAt: new Date().toISOString()
     };
     
-    if (paymentRequired && transactionHash) {
+    if (paymentRequired && transactionHash && verificationResult) {
         newAccount.paymentTransactionHash = transactionHash;
-        newAccount.paymentTransactionDate = new Date().toISOString();
+        newAccount.paymentTransactionDate = verificationResult.transactionTimestamp!;
     }
     
     accountsDb.accounts[accountId] = newAccount;
