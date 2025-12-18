@@ -181,62 +181,23 @@ describe('API Server', function() {
     });
 
     describe('Job Management', function() {
-        it('should reject job for unregistered account', async function() {
+        it('should return 404 for POST /api/jobs (endpoint removed)', async function() {
             const response = await makeRequest('POST', '/api/jobs', {
                 accountId: 'unregistered.near'
             });
             
-            assert.equal(response.statusCode, 403);
-            assert.ok(response.body.error.includes('Account not registered'));
+            // POST /api/jobs has been removed - jobs are now automatic
+            assert.equal(response.statusCode, 404);
+            assert.ok(response.body.error.includes('POST /api/jobs has been removed'));
         });
 
-        it('should create a job for registered account', async function() {
-            const response = await makeRequest('POST', '/api/jobs', {
-                accountId: TEST_ACCOUNT,
-                options: {
-                    maxTransactions: 5,
-                    direction: 'backward'
-                }
-            });
-            
-            assert.equal(response.statusCode, 201);
-            assert.equal(response.body.message, 'Job created successfully');
-            assert.ok(response.body.job.jobId);
-            assert.equal(response.body.job.accountId, TEST_ACCOUNT);
-            assert.equal(response.body.job.status, 'pending');
-            assert.equal(response.body.job.options.maxTransactions, 5);
-        });
-
-        it('should reject invalid direction', async function() {
-            const response = await makeRequest('POST', '/api/jobs', {
-                accountId: TEST_ACCOUNT,
-                options: {
-                    direction: 'sideways'
-                }
-            });
-            
-            assert.equal(response.statusCode, 400);
-            assert.ok(response.body.error.includes('direction must be'));
-        });
-
-        it('should reject invalid maxTransactions', async function() {
-            const response = await makeRequest('POST', '/api/jobs', {
-                accountId: TEST_ACCOUNT,
-                options: {
-                    maxTransactions: -5
-                }
-            });
-            
-            assert.equal(response.statusCode, 400);
-            assert.ok(response.body.error.includes('maxTransactions must be a positive number'));
-        });
-
-        it('should list all jobs', async function() {
+        it('should list all jobs (may be empty initially)', async function() {
             const response = await makeRequest('GET', '/api/jobs');
             
             assert.equal(response.statusCode, 200);
             assert.ok(Array.isArray(response.body.jobs));
-            assert.ok(response.body.jobs.length >= 1);
+            // Jobs may be empty initially since POST /api/jobs is removed
+            // Jobs are now created automatically by the continuous sync loop
         });
 
         it('should filter jobs by account ID', async function() {
@@ -245,26 +206,10 @@ describe('API Server', function() {
             assert.equal(response.statusCode, 200);
             assert.ok(Array.isArray(response.body.jobs));
             
-            // All jobs should belong to the test account
+            // All jobs should belong to the test account (if any exist)
             for (const job of response.body.jobs) {
                 assert.equal(job.accountId, TEST_ACCOUNT);
             }
-        });
-
-        it('should get job status by ID', async function() {
-            // Get the list of jobs and use an existing job ID
-            const listResponse = await makeRequest('GET', `/api/jobs?accountId=${TEST_ACCOUNT}`);
-            assert.ok(listResponse.body.jobs.length >= 1, 'Should have at least one job');
-            
-            const jobId = listResponse.body.jobs[0].jobId;
-            
-            // Get job status
-            const response = await makeRequest('GET', `/api/jobs/${jobId}`);
-            
-            assert.equal(response.statusCode, 200);
-            assert.equal(response.body.job.jobId, jobId);
-            assert.equal(response.body.job.accountId, TEST_ACCOUNT);
-            assert.ok(['pending', 'running', 'completed', 'failed'].includes(response.body.job.status));
         });
 
         it('should return 404 for non-existent job', async function() {
@@ -276,59 +221,9 @@ describe('API Server', function() {
     });
 
     describe('Download Endpoints', function() {
-        let completedJobId: string;
-
-        before(async function() {
-            // Wait for any existing job to complete, or create a new one
-            this.timeout(180000); // 3 minutes for job completion
-            
-            // First, try to find an existing job for the account
-            const listResponse = await makeRequest('GET', `/api/jobs?accountId=${TEST_ACCOUNT}`);
-            let jobId: string | undefined;
-            
-            if (listResponse.body.jobs.length > 0) {
-                // Use the first job
-                jobId = listResponse.body.jobs[0].jobId;
-            } else {
-                // No existing job, create one
-                const createResponse = await makeRequest('POST', '/api/jobs', {
-                    accountId: TEST_ACCOUNT,
-                    options: { maxTransactions: 2 }
-                });
-                
-                if (createResponse.statusCode === 409) {
-                    // There's a running job, get it from the list
-                    const refreshList = await makeRequest('GET', `/api/jobs?accountId=${TEST_ACCOUNT}`);
-                    jobId = refreshList.body.jobs[0].jobId;
-                } else {
-                    jobId = createResponse.body.job.jobId;
-                }
-            }
-            
-            completedJobId = jobId!;
-            
-            // Poll until completed or failed
-            let attempts = 0;
-            while (attempts < TEST_CONFIG.JOB_COMPLETION_MAX_RETRIES) {
-                const statusResponse = await makeRequest('GET', `/api/jobs/${completedJobId}`);
-                const status = statusResponse.body.job.status;
-                
-                if (status === 'completed') {
-                    break;
-                }
-                
-                if (status === 'failed') {
-                    throw new Error(`Job failed: ${statusResponse.body.job.error}`);
-                }
-                
-                await new Promise(resolve => setTimeout(resolve, TEST_CONFIG.JOB_COMPLETION_RETRY_DELAY_MS));
-                attempts++;
-            }
-            
-            if (attempts >= TEST_CONFIG.JOB_COMPLETION_MAX_RETRIES) {
-                throw new Error('Job did not complete within timeout');
-            }
-        });
+        // Note: With the removal of POST /api/jobs, jobs are now created automatically
+        // by the continuous sync loop. We skip the job completion wait since we can't
+        // manually create jobs anymore.
 
         it('should reject download for account without data', async function() {
             // Register a new account that has no data
@@ -342,10 +237,11 @@ describe('API Server', function() {
             assert.ok(response.body.error.includes('No data file found'));
         });
 
-        it('should download account data as JSON', async function() {
+        it('should download account data as JSON (or 404 if no data yet)', async function() {
             const response = await makeRequest('GET', `/api/accounts/${TEST_ACCOUNT}/download/json`);
             
             // For streaming responses, we expect either success or 404 if file doesn't exist
+            // Without manual job creation, data file may not exist yet
             assert.ok(response.statusCode === 200 || response.statusCode === 404);
             
             if (response.statusCode === 200) {
@@ -354,7 +250,7 @@ describe('API Server', function() {
             }
         });
 
-        it('should download account data as CSV', async function() {
+        it('should download account data as CSV (or 404 if no data yet)', async function() {
             const response = await makeRequest('GET', `/api/accounts/${TEST_ACCOUNT}/download/csv`);
             
             // For streaming responses, we expect either success or 404 if file doesn't exist
