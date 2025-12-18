@@ -405,14 +405,18 @@ describe('API Server - Payment Verification', function() {
             assert.ok(response.body.account.registeredAt);
         });
 
-        it('should return existing account when re-registering with same DAO transaction', async function() {
+        it('should renew subscription when re-registering with same DAO transaction', async function() {
             const response = await makePaymentRequest('POST', '/api/accounts', {
                 transactionHash: DAO_TRANSACTION_HASH
             });
             
+            // With the new subscription model, re-registering with a valid tx hash renews the subscription
             assert.equal(response.statusCode, 200);
-            assert.equal(response.body.message, 'Account already registered');
+            assert.equal(response.body.message, 'Subscription renewed successfully');
             assert.equal(response.body.account.accountId, EXPECTED_DAO_ACCOUNT);
+            // Verify payment info is stored
+            assert.ok(response.body.account.paymentTransactionHash);
+            assert.ok(response.body.account.paymentTransactionDate);
         });
 
         it('should reject registration with invalid transaction hash', async function() {
