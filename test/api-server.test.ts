@@ -610,6 +610,58 @@ describe('API Server - CORS Configuration', function() {
         const RESTRICTED_TEST_DATA_DIR = path.join(__dirname, '..', '..', 'test-data', 'api-cors-restricted');
         const RESTRICTED_TEST_PORT = 3005;
 
+        // Helper for restricted server requests - shared across tests
+        function makeRestrictedRequest(
+            method: string,
+            requestPath: string,
+            origin: string,
+            body?: any
+        ): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
+            return new Promise((resolve, reject) => {
+                const options: http.RequestOptions = {
+                    hostname: 'localhost',
+                    port: RESTRICTED_TEST_PORT,
+                    path: requestPath,
+                    method,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Origin': origin
+                    }
+                };
+
+                const req = http.request(options, (res) => {
+                    let data = '';
+
+                    res.on('data', (chunk) => {
+                        data += chunk;
+                    });
+
+                    res.on('end', () => {
+                        let parsedBody;
+                        try {
+                            parsedBody = JSON.parse(data);
+                        } catch {
+                            parsedBody = data;
+                        }
+
+                        resolve({
+                            statusCode: res.statusCode || 0,
+                            body: parsedBody,
+                            headers: res.headers
+                        });
+                    });
+                });
+
+                req.on('error', reject);
+
+                if (body) {
+                    req.write(JSON.stringify(body));
+                }
+
+                req.end();
+            });
+        }
+
         before(async function() {
             // Setup test data directory
             if (fs.existsSync(RESTRICTED_TEST_DATA_DIR)) {
@@ -630,58 +682,6 @@ describe('API Server - CORS Configuration', function() {
                 },
                 stdio: 'inherit'
             });
-
-            // Helper for restricted server requests
-            function makeRestrictedRequest(
-                method: string,
-                requestPath: string,
-                origin: string,
-                body?: any
-            ): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
-                return new Promise((resolve, reject) => {
-                    const options: http.RequestOptions = {
-                        hostname: 'localhost',
-                        port: RESTRICTED_TEST_PORT,
-                        path: requestPath,
-                        method,
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Origin': origin
-                        }
-                    };
-
-                    const req = http.request(options, (res) => {
-                        let data = '';
-
-                        res.on('data', (chunk) => {
-                            data += chunk;
-                        });
-
-                        res.on('end', () => {
-                            let parsedBody;
-                            try {
-                                parsedBody = JSON.parse(data);
-                            } catch {
-                                parsedBody = data;
-                            }
-
-                            resolve({
-                                statusCode: res.statusCode || 0,
-                                body: parsedBody,
-                                headers: res.headers
-                            });
-                        });
-                    });
-
-                    req.on('error', reject);
-
-                    if (body) {
-                        req.write(JSON.stringify(body));
-                    }
-
-                    req.end();
-                });
-            }
 
             // Poll for server readiness
             for (let i = 0; i < 20; i++) {
@@ -708,51 +708,6 @@ describe('API Server - CORS Configuration', function() {
         });
 
         it('should allow requests from explicitly allowed origin', async function() {
-            function makeRestrictedRequest(
-                method: string,
-                requestPath: string,
-                origin: string
-            ): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
-                return new Promise((resolve, reject) => {
-                    const options: http.RequestOptions = {
-                        hostname: 'localhost',
-                        port: RESTRICTED_TEST_PORT,
-                        path: requestPath,
-                        method,
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Origin': origin
-                        }
-                    };
-
-                    const req = http.request(options, (res) => {
-                        let data = '';
-
-                        res.on('data', (chunk) => {
-                            data += chunk;
-                        });
-
-                        res.on('end', () => {
-                            let parsedBody;
-                            try {
-                                parsedBody = JSON.parse(data);
-                            } catch {
-                                parsedBody = data;
-                            }
-
-                            resolve({
-                                statusCode: res.statusCode || 0,
-                                body: parsedBody,
-                                headers: res.headers
-                            });
-                        });
-                    });
-
-                    req.on('error', reject);
-                    req.end();
-                });
-            }
-
             const response = await makeRestrictedRequest('GET', '/health', 'https://allowed1.example.com');
             
             assert.equal(response.statusCode, 200);
@@ -760,51 +715,6 @@ describe('API Server - CORS Configuration', function() {
         });
 
         it('should allow requests from second allowed origin', async function() {
-            function makeRestrictedRequest(
-                method: string,
-                requestPath: string,
-                origin: string
-            ): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
-                return new Promise((resolve, reject) => {
-                    const options: http.RequestOptions = {
-                        hostname: 'localhost',
-                        port: RESTRICTED_TEST_PORT,
-                        path: requestPath,
-                        method,
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Origin': origin
-                        }
-                    };
-
-                    const req = http.request(options, (res) => {
-                        let data = '';
-
-                        res.on('data', (chunk) => {
-                            data += chunk;
-                        });
-
-                        res.on('end', () => {
-                            let parsedBody;
-                            try {
-                                parsedBody = JSON.parse(data);
-                            } catch {
-                                parsedBody = data;
-                            }
-
-                            resolve({
-                                statusCode: res.statusCode || 0,
-                                body: parsedBody,
-                                headers: res.headers
-                            });
-                        });
-                    });
-
-                    req.on('error', reject);
-                    req.end();
-                });
-            }
-
             const response = await makeRestrictedRequest('GET', '/health', 'https://allowed2.example.com');
             
             assert.equal(response.statusCode, 200);
