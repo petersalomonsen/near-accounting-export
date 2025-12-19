@@ -57,6 +57,39 @@ CMD ["node", "dist/scripts/api-server.js"]
 | `FASTNEAR_API_KEY` | FastNEAR API key for higher rate limits | None |
 | `NEARBLOCKS_API_KEY` | NearBlocks API key for faster transaction discovery | None |
 | `RPC_DELAY_MS` | Delay between RPC calls in ms | `50` |
+| `BATCH_SIZE` | Number of transactions to fetch per account per cycle | `10` |
+| `CYCLE_DELAY_MS` | Delay between continuous sync cycles in ms | `30000` |
+| `REGISTRATION_FEE_AMOUNT` | Required payment amount in FT base units (set to `0` to disable) | `100000` |
+| `REGISTRATION_FEE_RECIPIENT` | Recipient account for payments | `arizcredits.near` |
+| `REGISTRATION_FEE_TOKEN` | FT contract ID for payments | `arizcredits.near` |
+| `REGISTRATION_TX_MAX_AGE_MS` | Maximum age of payment transaction (subscription validity period) | `2592000000` (30 days) |
+
+## Continuous Sync
+
+The API server automatically runs a continuous sync loop that processes all registered accounts with valid (non-expired) payments. This eliminates the need for manual job creation.
+
+### How It Works
+
+1. **On server start**: The continuous sync loop begins immediately
+2. **Processing cycle**: Each registered account is processed in round-robin order
+3. **Payment validation**: Accounts with expired payments are skipped (but their data is preserved)
+4. **Backward search**: If an account's history is incomplete, the server searches backward for older transactions
+5. **Forward search**: The server always checks for new transactions going forward
+6. **Cycle delay**: After processing all accounts, the server waits `CYCLE_DELAY_MS` before starting the next cycle
+
+### Subscription Model
+
+- Each account registration requires a payment transaction
+- Payments are valid for `REGISTRATION_TX_MAX_AGE_MS` (default: 30 days)
+- To renew a subscription, call `POST /api/accounts` with a new `transactionHash`
+- Accounts with expired payments are skipped but their data is preserved
+
+### Graceful Shutdown
+
+The server responds to `SIGTERM` and `SIGINT` signals by:
+1. Stopping the continuous sync loop
+2. Allowing current account processing to complete
+3. Closing the HTTP server gracefully
 
 ## API Endpoints
 
@@ -78,7 +111,7 @@ Check if the API server is running.
 
 **POST /api/accounts**
 
-Register a NEAR account for data collection. Registration requires payment verification via a fungible token transfer transaction.
+Register a NEAR account for data collection or renew an existing subscription. Registration requires payment verification via a fungible token transfer transaction.
 
 **Payment Requirements:**
 - Transfer the required amount (configurable via `REGISTRATION_FEE_AMOUNT`, default: 0.1 ARIZ = 100000) 
@@ -99,14 +132,31 @@ Register a NEAR account for data collection. Registration requires payment verif
   "message": "Account registered successfully",
   "account": {
     "accountId": "sender.near",
-    "registeredAt": "2024-01-01T00:00:00.000Z"
+    "registeredAt": "2024-01-01T00:00:00.000Z",
+    "paymentTransactionHash": "BfcxWzpQbvPzPXp438EpqpfcLZ1vHW36YoetCBac3WEA",
+    "paymentTransactionDate": "2024-01-01T00:00:00.000Z"
   }
 }
 ```
 
 Note: The account ID is automatically extracted from the payment transaction sender.
 
-**Response (200 OK - Already Registered):**
+**Response (200 OK - Subscription Renewed):**
+```json
+{
+  "message": "Subscription renewed successfully",
+  "account": {
+    "accountId": "sender.near",
+    "registeredAt": "2024-01-01T00:00:00.000Z",
+    "paymentTransactionHash": "NewTransactionHash123",
+    "paymentTransactionDate": "2024-02-01T00:00:00.000Z"
+  }
+}
+```
+
+Note: If an account is already registered and a new valid payment transaction is provided, the subscription is renewed with the new payment information.
+
+**Response (200 OK - Already Registered, No Renewal):**
 ```json
 {
   "message": "Account already registered",
@@ -125,10 +175,10 @@ Note: The account ID is automatically extracted from the payment transaction sen
 - `500 Internal Server Error` - Failed to verify payment transaction
 
 **Environment Variables for Payment Configuration:**
-- `REGISTRATION_FEE_AMOUNT` - Required payment amount in FT base units (default: "100000" for 0.1 ARIZ with 6 decimals)
+- `REGISTRATION_FEE_AMOUNT` - Required payment amount in FT base units (default: "100000" for 0.1 ARIZ with 6 decimals). Set to `0` to disable payment verification.
 - `REGISTRATION_FEE_RECIPIENT` - Recipient account for payments (default: "arizcredits.near")
 - `REGISTRATION_FEE_TOKEN` - FT contract ID (default: "arizcredits.near")
-- `REGISTRATION_TX_MAX_AGE_MS` - Maximum age of transaction in milliseconds (default: 30 days)
+- `REGISTRATION_TX_MAX_AGE_MS` - Maximum age of transaction in milliseconds (default: 30 days). This also determines subscription validity period.
 
 ---
 
@@ -194,52 +244,18 @@ Get the data collection status for a specific account, including the data range 
 
 ### Job Management
 
-**POST /api/jobs**
+> **Note:** `POST /api/jobs` has been removed. Jobs are now processed automatically in a continuous sync loop for all registered accounts with valid payments. Use `GET /api/jobs` to view job history.
 
-Create a new data collection job for a registered account.
+**POST /api/jobs** (REMOVED)
 
-**Request Body:**
+This endpoint has been removed. Jobs are now created and run automatically by the server's continuous sync loop. The server processes all registered accounts with valid (non-expired) payments in a round-robin fashion.
+
+**Response (404 Not Found):**
 ```json
 {
-  "accountId": "myaccount.near",
-  "options": {
-    "direction": "backward",
-    "maxTransactions": 100,
-    "startBlock": 120000000,
-    "endBlock": 121000000
-  }
+  "error": "POST /api/jobs has been removed. Jobs are now processed automatically for registered accounts with valid payment."
 }
 ```
-
-**Parameters:**
-- `accountId` (required): The NEAR account ID to collect data for
-- `options` (optional):
-  - `direction`: "backward" or "forward" (default: "backward")
-  - `maxTransactions`: Maximum number of transactions to fetch (default: 100)
-  - `startBlock`: Starting block height (optional)
-  - `endBlock`: Ending block height (optional)
-
-**Response (201 Created):**
-```json
-{
-  "message": "Job created successfully",
-  "job": {
-    "jobId": "550e8400-e29b-41d4-a716-446655440000",
-    "accountId": "myaccount.near",
-    "status": "pending",
-    "createdAt": "2024-01-01T00:00:00.000Z",
-    "options": {
-      "direction": "backward",
-      "maxTransactions": 100
-    }
-  }
-}
-```
-
-**Error Responses:**
-- `400 Bad Request` - Invalid options or missing accountId
-- `403 Forbidden` - Account not registered
-- `409 Conflict` - A job is already running for this account
 
 ---
 

@@ -24,10 +24,18 @@ const PAYMENT_CONFIG = {
     maxAge: parseInt(process.env.REGISTRATION_TX_MAX_AGE_MS || String(30 * 24 * 60 * 60 * 1000), 10) // Default 30 days
 };
 
+// Continuous sync configuration
+const SYNC_CONFIG = {
+    batchSize: parseInt(process.env.BATCH_SIZE || '10', 10),
+    cycleDelayMs: parseInt(process.env.CYCLE_DELAY_MS || '30000', 10)
+};
+
 // Types
 interface RegisteredAccount {
     accountId: string;
     registeredAt: string;
+    paymentTransactionHash?: string;
+    paymentTransactionDate?: string;
 }
 
 interface Job {
@@ -151,6 +159,292 @@ async function processJob(jobId: string): Promise<void> {
     }
 }
 
+// Continuous sync state
+// Note: These module-level variables are intentional for a single-instance server.
+// The fly.toml configuration limits the server to a single instance (scale count 1)
+// to prevent data conflicts and ensure job tracking consistency.
+let continuousSyncRunning = false;
+let continuousSyncShuttingDown = false;
+
+/**
+ * Check if an account has a valid (non-expired) payment
+ */
+function isPaymentValid(account: RegisteredAccount): boolean {
+    // If payment verification is disabled, all accounts are valid
+    if (PAYMENT_CONFIG.requiredAmount === '0') {
+        return true;
+    }
+    
+    // If no payment date, account is invalid (for payment-required mode)
+    if (!account.paymentTransactionDate) {
+        return false;
+    }
+    
+    const paymentDate = new Date(account.paymentTransactionDate).getTime();
+    const now = Date.now();
+    const age = now - paymentDate;
+    
+    return age <= PAYMENT_CONFIG.maxAge;
+}
+
+/**
+ * Load account history file and check if history is complete
+ */
+interface AccountHistoryMetadata {
+    historyComplete?: boolean;
+    firstBlock: number | null;
+    lastBlock: number | null;
+    totalTransactions: number;
+}
+
+interface AccountHistoryFile {
+    accountId: string;
+    metadata: AccountHistoryMetadata;
+    transactions: any[];
+}
+
+function loadAccountHistoryFile(accountId: string): AccountHistoryFile | null {
+    const outputFile = getAccountOutputFile(accountId);
+    if (!fs.existsSync(outputFile)) {
+        return null;
+    }
+    try {
+        return JSON.parse(fs.readFileSync(outputFile, 'utf8'));
+    } catch (error) {
+        console.error(`Error loading account history file for ${accountId}:`, error);
+        return null;
+    }
+}
+
+/**
+ * Process a single account in the continuous sync loop
+ */
+export async function processAccountCycle(accountId: string): Promise<{ backward: boolean; forward: boolean }> {
+    const result = { backward: false, forward: false };
+    
+    // Skip if shutting down
+    if (continuousSyncShuttingDown) {
+        return result;
+    }
+    
+    // Skip if there's already a running job for this account
+    if (runningJobs.has(accountId)) {
+        console.log(`Skipping ${accountId} - job already running`);
+        return result;
+    }
+    
+    const outputFile = getAccountOutputFile(accountId);
+    const historyFile = loadAccountHistoryFile(accountId);
+    
+    // Check if history is complete (backward search done)
+    const historyComplete = historyFile?.metadata?.historyComplete === true;
+    
+    // Create job for tracking
+    const jobId = uuidv4();
+    const now = new Date().toISOString();
+    
+    try {
+        // If history is not complete, search backward first
+        if (!historyComplete) {
+            console.log(`[${accountId}] Searching backward (history incomplete)`);
+            result.backward = true;
+            
+            const backwardJob: Job = {
+                jobId,
+                accountId,
+                status: 'running',
+                createdAt: now,
+                startedAt: now,
+                options: {
+                    direction: 'backward',
+                    maxTransactions: SYNC_CONFIG.batchSize
+                }
+            };
+            
+            const jobsDb = loadJobs();
+            jobsDb.jobs[jobId] = backwardJob;
+            saveJobs(jobsDb);
+            
+            // Mark as running
+            const jobPromise = (async () => {
+                try {
+                    await getAccountHistory({
+                        accountId,
+                        outputFile,
+                        direction: 'backward',
+                        maxTransactions: SYNC_CONFIG.batchSize
+                    });
+                    
+                    // Mark as completed
+                    const updatedJobsDb = loadJobs();
+                    const completedJob = updatedJobsDb.jobs[jobId];
+                    if (completedJob) {
+                        completedJob.status = 'completed';
+                        completedJob.completedAt = new Date().toISOString();
+                        saveJobs(updatedJobsDb);
+                    }
+                } catch (error) {
+                    // Mark as failed
+                    const updatedJobsDb = loadJobs();
+                    const failedJob = updatedJobsDb.jobs[jobId];
+                    if (failedJob) {
+                        failedJob.status = 'failed';
+                        failedJob.error = error instanceof Error ? error.message : String(error);
+                        failedJob.completedAt = new Date().toISOString();
+                        saveJobs(updatedJobsDb);
+                    }
+                    console.error(`[${accountId}] Backward search failed:`, error);
+                }
+            })();
+            
+            runningJobs.set(accountId, jobPromise);
+            await jobPromise;
+            runningJobs.delete(accountId);
+        }
+        
+        // Skip forward search if shutting down
+        if (continuousSyncShuttingDown) {
+            return result;
+        }
+        
+        // Always search forward for new transactions
+        console.log(`[${accountId}] Searching forward (checking for new transactions)`);
+        result.forward = true;
+        
+        const forwardJobId = uuidv4();
+        const forwardJob: Job = {
+            jobId: forwardJobId,
+            accountId,
+            status: 'running',
+            createdAt: new Date().toISOString(),
+            startedAt: new Date().toISOString(),
+            options: {
+                direction: 'forward',
+                maxTransactions: SYNC_CONFIG.batchSize
+            }
+        };
+        
+        const jobsDb = loadJobs();
+        jobsDb.jobs[forwardJobId] = forwardJob;
+        saveJobs(jobsDb);
+        
+        const forwardPromise = (async () => {
+            try {
+                await getAccountHistory({
+                    accountId,
+                    outputFile,
+                    direction: 'forward',
+                    maxTransactions: SYNC_CONFIG.batchSize
+                });
+                
+                // Mark as completed
+                const updatedJobsDb = loadJobs();
+                const completedJob = updatedJobsDb.jobs[forwardJobId];
+                if (completedJob) {
+                    completedJob.status = 'completed';
+                    completedJob.completedAt = new Date().toISOString();
+                    saveJobs(updatedJobsDb);
+                }
+            } catch (error) {
+                // Mark as failed
+                const updatedJobsDb = loadJobs();
+                const failedJob = updatedJobsDb.jobs[forwardJobId];
+                if (failedJob) {
+                    failedJob.status = 'failed';
+                    failedJob.error = error instanceof Error ? error.message : String(error);
+                    failedJob.completedAt = new Date().toISOString();
+                    saveJobs(updatedJobsDb);
+                }
+                console.error(`[${accountId}] Forward search failed:`, error);
+            }
+        })();
+        
+        runningJobs.set(accountId, forwardPromise);
+        await forwardPromise;
+        runningJobs.delete(accountId);
+        
+    } catch (error) {
+        console.error(`[${accountId}] Error processing account cycle:`, error);
+        runningJobs.delete(accountId);
+    }
+    
+    return result;
+}
+
+/**
+ * Start the continuous sync loop
+ */
+export async function startContinuousLoop(): Promise<void> {
+    if (continuousSyncRunning) {
+        console.log('Continuous sync loop is already running');
+        return;
+    }
+    
+    continuousSyncRunning = true;
+    continuousSyncShuttingDown = false;
+    console.log(`Starting continuous sync loop (batch size: ${SYNC_CONFIG.batchSize}, cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms)`);
+    
+    while (!continuousSyncShuttingDown) {
+        try {
+            const accountsDb = loadAccounts();
+            const accounts = Object.values(accountsDb.accounts);
+            
+            console.log(`\n=== Starting sync cycle for ${accounts.length} registered account(s) ===`);
+            
+            let processedCount = 0;
+            let skippedCount = 0;
+            
+            for (const account of accounts) {
+                if (continuousSyncShuttingDown) {
+                    console.log('Shutdown signal received, stopping sync loop');
+                    break;
+                }
+                
+                // Check payment validity
+                if (!isPaymentValid(account)) {
+                    console.log(`Skipping ${account.accountId} - payment expired or missing`);
+                    skippedCount++;
+                    continue;
+                }
+                
+                await processAccountCycle(account.accountId);
+                processedCount++;
+            }
+            
+            console.log(`=== Sync cycle complete: ${processedCount} processed, ${skippedCount} skipped ===\n`);
+            
+            // Wait before next cycle (unless shutting down)
+            if (!continuousSyncShuttingDown) {
+                await new Promise(resolve => setTimeout(resolve, SYNC_CONFIG.cycleDelayMs));
+            }
+        } catch (error) {
+            console.error('Error in continuous sync loop:', error);
+            // Wait a bit before retrying
+            if (!continuousSyncShuttingDown) {
+                await new Promise(resolve => setTimeout(resolve, SYNC_CONFIG.cycleDelayMs));
+            }
+        }
+    }
+    
+    continuousSyncRunning = false;
+    console.log('Continuous sync loop stopped');
+}
+
+/**
+ * Stop the continuous sync loop
+ */
+export function stopContinuousLoop(): void {
+    console.log('Stopping continuous sync loop...');
+    continuousSyncShuttingDown = true;
+}
+
+/**
+ * Check if continuous sync is running
+ */
+export function isContinuousSyncRunning(): boolean {
+    return continuousSyncRunning;
+}
+
 // Validation helpers
 function isValidNearAccountId(accountId: string): boolean {
     return /^([a-z0-9_-]+\.)*[a-z0-9_-]+$/.test(accountId);
@@ -160,6 +454,7 @@ function isValidNearAccountId(accountId: string): boolean {
 interface PaymentVerificationResult {
     valid: boolean;
     senderAccountId?: string;
+    transactionTimestamp?: string;
     error?: string;
 }
 
@@ -352,9 +647,13 @@ async function verifyPaymentTransaction(txHash: string): Promise<PaymentVerifica
             return { valid: false, error: 'Transaction failed' };
         }
         
+        // Convert nanoseconds to ISO string
+        const txDate = new Date(txTimestamp / 1_000_000).toISOString();
+        
         return { 
             valid: true, 
-            senderAccountId: actualSenderAccountId 
+            senderAccountId: actualSenderAccountId,
+            transactionTimestamp: txDate
         };
         
     } catch (error) {
@@ -390,6 +689,7 @@ app.post('/api/accounts', async (req: Request, res: Response) => {
     const paymentRequired = PAYMENT_CONFIG.requiredAmount !== '0';
     
     let accountId: string;
+    let verificationResult: PaymentVerificationResult | undefined;
     
     if (paymentRequired) {
         // Payment verification mode
@@ -399,7 +699,7 @@ app.post('/api/accounts', async (req: Request, res: Response) => {
         
         try {
             // Verify the payment transaction
-            const verificationResult = await verifyPaymentTransaction(transactionHash);
+            verificationResult = await verifyPaymentTransaction(transactionHash);
             
             if (!verificationResult.valid) {
                 return res.status(400).json({ 
@@ -434,18 +734,41 @@ app.post('/api/accounts', async (req: Request, res: Response) => {
     
     const accountsDb = loadAccounts();
     
-    if (accountsDb.accounts[accountId]) {
+    // Check if account already exists
+    const existingAccount = accountsDb.accounts[accountId];
+    if (existingAccount) {
+        // If payment verification is required and transaction hash is provided,
+        // allow subscription renewal
+        if (paymentRequired && transactionHash && verificationResult) {
+            // Update payment info for subscription renewal
+            existingAccount.paymentTransactionHash = transactionHash;
+            existingAccount.paymentTransactionDate = verificationResult.transactionTimestamp!;
+            saveAccounts(accountsDb);
+            
+            return res.status(200).json({
+                message: 'Subscription renewed successfully',
+                account: existingAccount
+            });
+        }
+        
         return res.status(200).json({
             message: 'Account already registered',
-            account: accountsDb.accounts[accountId]
+            account: existingAccount
         });
     }
     
-    accountsDb.accounts[accountId] = {
+    // Create new account with payment info if payment was required
+    const newAccount: RegisteredAccount = {
         accountId,
         registeredAt: new Date().toISOString()
     };
     
+    if (paymentRequired && transactionHash && verificationResult) {
+        newAccount.paymentTransactionHash = transactionHash;
+        newAccount.paymentTransactionDate = verificationResult.transactionTimestamp!;
+    }
+    
+    accountsDb.accounts[accountId] = newAccount;
     saveAccounts(accountsDb);
     
     res.status(201).json({
@@ -462,70 +785,11 @@ app.get('/api/accounts', (req: Request, res: Response) => {
     });
 });
 
-// POST /api/jobs - Start a data collection job
+// POST /api/jobs - REMOVED - Jobs are now automatic via continuous sync
+// Kept as explicit 404 for backward compatibility with clients
 app.post('/api/jobs', (req: Request, res: Response) => {
-    const { accountId, options = {} } = req.body;
-    
-    if (!accountId || typeof accountId !== 'string') {
-        return res.status(400).json({ error: 'accountId is required and must be a string' });
-    }
-    
-    // Check if account is registered
-    const accountsDb = loadAccounts();
-    if (!accountsDb.accounts[accountId]) {
-        return res.status(403).json({ 
-            error: 'Account not registered. Please register the account first using POST /api/accounts' 
-        });
-    }
-    
-    // Validate options BEFORE checking for running jobs
-    if (options.direction && !['forward', 'backward'].includes(options.direction)) {
-        return res.status(400).json({ error: 'direction must be "forward" or "backward"' });
-    }
-    
-    if (options.maxTransactions !== undefined && (typeof options.maxTransactions !== 'number' || options.maxTransactions <= 0)) {
-        return res.status(400).json({ error: 'maxTransactions must be a positive number' });
-    }
-    
-    // Check if there's already a running job for this account
-    if (runningJobs.has(accountId)) {
-        return res.status(409).json({ 
-            error: 'A job is already running for this account. Only one job per account can run at a time.' 
-        });
-    }
-    
-    // Create job
-    const jobId = uuidv4();
-    const job: Job = {
-        jobId,
-        accountId,
-        status: 'pending',
-        createdAt: new Date().toISOString(),
-        options: {
-            direction: options.direction || 'backward',
-            maxTransactions: options.maxTransactions || 100,
-            startBlock: options.startBlock,
-            endBlock: options.endBlock
-        }
-    };
-    
-    const jobsDb = loadJobs();
-    jobsDb.jobs[jobId] = job;
-    saveJobs(jobsDb);
-    
-    // Start processing in background - track by accountId
-    const jobPromise = processJob(jobId);
-    runningJobs.set(accountId, jobPromise);
-    
-    res.status(201).json({
-        message: 'Job created successfully',
-        job: {
-            jobId: job.jobId,
-            accountId: job.accountId,
-            status: job.status,
-            createdAt: job.createdAt,
-            options: job.options
-        }
+    return res.status(404).json({ 
+        error: 'POST /api/jobs has been removed. Jobs are now processed automatically for registered accounts with valid payment.' 
     });
 });
 
@@ -713,22 +977,29 @@ const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
     console.log(`API Server running on port ${PORT}`);
     console.log(`Data directory: ${DATA_DIR}`);
+    console.log(`Batch size: ${SYNC_CONFIG.batchSize}`);
+    console.log(`Cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms`);
     console.log('');
     console.log('Available endpoints:');
-    console.log('  POST   /api/accounts - Register an account');
+    console.log('  POST   /api/accounts - Register an account (or renew subscription)');
     console.log('  GET    /api/accounts - List registered accounts');
     console.log('  GET    /api/accounts/:accountId/status - Get account status and data range');
     console.log('  GET    /api/accounts/:accountId/download/json - Download account data as JSON');
     console.log('  GET    /api/accounts/:accountId/download/csv - Download account data as CSV');
-    console.log('  POST   /api/jobs - Start a data collection job');
     console.log('  GET    /api/jobs - List all jobs');
     console.log('  GET    /api/jobs/:jobId - Get job status');
     console.log('  GET    /health - Health check');
+    console.log('');
+    console.log('Note: POST /api/jobs has been removed. Jobs run automatically.');
+    
+    // Start continuous sync loop
+    startContinuousLoop();
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('SIGTERM received, shutting down gracefully...');
+    stopContinuousLoop();
     server.close(() => {
         console.log('Server closed');
         process.exit(0);
@@ -737,6 +1008,7 @@ process.on('SIGTERM', () => {
 
 process.on('SIGINT', () => {
     console.log('SIGINT received, shutting down gracefully...');
+    stopContinuousLoop();
     server.close(() => {
         console.log('Server closed');
         process.exit(0);

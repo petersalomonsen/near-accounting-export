@@ -77,6 +77,7 @@ interface AccountHistory {
         firstBlock: number | null;
         lastBlock: number | null;
         totalTransactions: number;
+        historyComplete?: boolean;  // True when backward search found the beginning of account history
     };
 }
 
@@ -1249,10 +1250,11 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                 const existsAtStart = await accountExistsAtBlock(accountId, currentSearchStart);
                 if (!existsAtStart) {
                     console.log(`Account does not exist at block ${currentSearchStart} - reached the beginning of account history`);
-                    // Save progress and stop searching
+                    // Mark history as complete and save progress
+                    history.metadata.historyComplete = true;
                     history.updatedAt = new Date().toISOString();
                     saveHistory(outputFile, history);
-                    console.log(`Progress saved to ${outputFile}`);
+                    console.log(`Progress saved to ${outputFile} (history complete)`);
                     break;
                 }
             } catch (error: any) {
@@ -1289,10 +1291,13 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             }
             if (error.message.includes('does not exist')) {
                 console.log(`Account does not exist at block ${currentSearchStart} - reached the beginning of account history`);
-                // Save progress and stop searching in this direction
+                // Mark history as complete and save progress
+                if (direction === 'backward') {
+                    history.metadata.historyComplete = true;
+                }
                 history.updatedAt = new Date().toISOString();
                 saveHistory(outputFile, history);
-                console.log(`Progress saved to ${outputFile}`);
+                console.log(`Progress saved to ${outputFile} (history complete)`);
                 break;
             }
             throw error;
