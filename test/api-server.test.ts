@@ -438,3 +438,287 @@ describe('API Server - Payment Verification', function() {
         });
     });
 });
+
+// Test suite for CORS functionality
+describe('API Server - CORS Configuration', function() {
+    this.timeout(120000);
+
+    let serverProcess: any = null;
+    const TEST_DATA_DIR = path.join(__dirname, '..', '..', 'test-data', 'api-cors');
+    const CORS_TEST_PORT = 3004;
+
+    // Helper to make HTTP requests with Origin header
+    function makeRequestWithOrigin(
+        method: string,
+        requestPath: string,
+        origin: string,
+        body?: any
+    ): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
+        return new Promise((resolve, reject) => {
+            const options: http.RequestOptions = {
+                hostname: 'localhost',
+                port: CORS_TEST_PORT,
+                path: requestPath,
+                method,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Origin': origin
+                }
+            };
+
+            const req = http.request(options, (res) => {
+                let data = '';
+
+                res.on('data', (chunk) => {
+                    data += chunk;
+                });
+
+                res.on('end', () => {
+                    let parsedBody;
+                    try {
+                        parsedBody = JSON.parse(data);
+                    } catch {
+                        parsedBody = data;
+                    }
+
+                    resolve({
+                        statusCode: res.statusCode || 0,
+                        body: parsedBody,
+                        headers: res.headers
+                    });
+                });
+            });
+
+            req.on('error', reject);
+
+            if (body) {
+                req.write(JSON.stringify(body));
+            }
+
+            req.end();
+        });
+    }
+
+    describe('Default CORS Configuration (allow all)', function() {
+        before(async function() {
+            // Setup test data directory
+            if (fs.existsSync(TEST_DATA_DIR)) {
+                fs.rmSync(TEST_DATA_DIR, { recursive: true });
+            }
+            fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
+
+            // Start the API server without CORS_ALLOWED_ORIGINS (defaults to *)
+            const { spawn } = await import('child_process');
+            
+            serverProcess = spawn('node', ['dist/scripts/api-server.js'], {
+                env: {
+                    ...process.env,
+                    PORT: CORS_TEST_PORT.toString(),
+                    DATA_DIR: TEST_DATA_DIR,
+                    REGISTRATION_FEE_AMOUNT: '0' // Disable payment verification for tests
+                    // CORS_ALLOWED_ORIGINS not set - should default to '*'
+                },
+                stdio: 'inherit'
+            });
+
+            // Poll for server readiness
+            for (let i = 0; i < 20; i++) {
+                try {
+                    await makeRequestWithOrigin('GET', '/health', 'https://example.com');
+                    break;
+                } catch (error) {
+                    if (i === 19) {
+                        throw new Error('CORS test server failed to start within timeout');
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                }
+            }
+        });
+
+        after(function() {
+            if (serverProcess) {
+                serverProcess.kill();
+            }
+
+            if (fs.existsSync(TEST_DATA_DIR)) {
+                fs.rmSync(TEST_DATA_DIR, { recursive: true });
+            }
+        });
+
+        it('should allow requests from any origin when CORS_ALLOWED_ORIGINS is not set', async function() {
+            const response = await makeRequestWithOrigin('GET', '/health', 'https://example.com');
+            
+            assert.equal(response.statusCode, 200);
+            assert.ok(response.headers['access-control-allow-origin']);
+        });
+
+        it('should allow requests from different origins', async function() {
+            const response1 = await makeRequestWithOrigin('GET', '/health', 'https://app1.example.com');
+            const response2 = await makeRequestWithOrigin('GET', '/health', 'https://app2.example.com');
+            
+            assert.equal(response1.statusCode, 200);
+            assert.equal(response2.statusCode, 200);
+        });
+
+        it('should allow requests without Origin header', async function() {
+            // Make request without Origin header
+            const response = await new Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }>((resolve, reject) => {
+                const options: http.RequestOptions = {
+                    hostname: 'localhost',
+                    port: CORS_TEST_PORT,
+                    path: '/health',
+                    method: 'GET',
+                    headers: {
+                        'Content-Type': 'application/json'
+                        // No Origin header
+                    }
+                };
+
+                const req = http.request(options, (res) => {
+                    let data = '';
+
+                    res.on('data', (chunk) => {
+                        data += chunk;
+                    });
+
+                    res.on('end', () => {
+                        let parsedBody;
+                        try {
+                            parsedBody = JSON.parse(data);
+                        } catch {
+                            parsedBody = data;
+                        }
+
+                        resolve({
+                            statusCode: res.statusCode || 0,
+                            body: parsedBody,
+                            headers: res.headers
+                        });
+                    });
+                });
+
+                req.on('error', reject);
+                req.end();
+            });
+            
+            assert.equal(response.statusCode, 200);
+        });
+    });
+
+    describe('Restricted CORS Configuration', function() {
+        let restrictedServerProcess: any = null;
+        const RESTRICTED_TEST_DATA_DIR = path.join(__dirname, '..', '..', 'test-data', 'api-cors-restricted');
+        const RESTRICTED_TEST_PORT = 3005;
+
+        // Helper for restricted server requests - shared across tests
+        function makeRestrictedRequest(
+            method: string,
+            requestPath: string,
+            origin: string,
+            body?: any
+        ): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
+            return new Promise((resolve, reject) => {
+                const options: http.RequestOptions = {
+                    hostname: 'localhost',
+                    port: RESTRICTED_TEST_PORT,
+                    path: requestPath,
+                    method,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Origin': origin
+                    }
+                };
+
+                const req = http.request(options, (res) => {
+                    let data = '';
+
+                    res.on('data', (chunk) => {
+                        data += chunk;
+                    });
+
+                    res.on('end', () => {
+                        let parsedBody;
+                        try {
+                            parsedBody = JSON.parse(data);
+                        } catch {
+                            parsedBody = data;
+                        }
+
+                        resolve({
+                            statusCode: res.statusCode || 0,
+                            body: parsedBody,
+                            headers: res.headers
+                        });
+                    });
+                });
+
+                req.on('error', reject);
+
+                if (body) {
+                    req.write(JSON.stringify(body));
+                }
+
+                req.end();
+            });
+        }
+
+        before(async function() {
+            // Setup test data directory
+            if (fs.existsSync(RESTRICTED_TEST_DATA_DIR)) {
+                fs.rmSync(RESTRICTED_TEST_DATA_DIR, { recursive: true });
+            }
+            fs.mkdirSync(RESTRICTED_TEST_DATA_DIR, { recursive: true });
+
+            // Start the API server with restricted CORS origins
+            const { spawn } = await import('child_process');
+            
+            restrictedServerProcess = spawn('node', ['dist/scripts/api-server.js'], {
+                env: {
+                    ...process.env,
+                    PORT: RESTRICTED_TEST_PORT.toString(),
+                    DATA_DIR: RESTRICTED_TEST_DATA_DIR,
+                    REGISTRATION_FEE_AMOUNT: '0', // Disable payment verification for tests
+                    CORS_ALLOWED_ORIGINS: 'https://allowed1.example.com,https://allowed2.example.com'
+                },
+                stdio: 'inherit'
+            });
+
+            // Poll for server readiness
+            for (let i = 0; i < 20; i++) {
+                try {
+                    await makeRestrictedRequest('GET', '/health', 'https://allowed1.example.com');
+                    break;
+                } catch (error) {
+                    if (i === 19) {
+                        throw new Error('Restricted CORS test server failed to start within timeout');
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                }
+            }
+        });
+
+        after(function() {
+            if (restrictedServerProcess) {
+                restrictedServerProcess.kill();
+            }
+
+            if (fs.existsSync(RESTRICTED_TEST_DATA_DIR)) {
+                fs.rmSync(RESTRICTED_TEST_DATA_DIR, { recursive: true });
+            }
+        });
+
+        it('should allow requests from explicitly allowed origin', async function() {
+            const response = await makeRestrictedRequest('GET', '/health', 'https://allowed1.example.com');
+            
+            assert.equal(response.statusCode, 200);
+            assert.equal(response.headers['access-control-allow-origin'], 'https://allowed1.example.com');
+        });
+
+        it('should allow requests from second allowed origin', async function() {
+            const response = await makeRestrictedRequest('GET', '/health', 'https://allowed2.example.com');
+            
+            assert.equal(response.statusCode, 200);
+            assert.equal(response.headers['access-control-allow-origin'], 'https://allowed2.example.com');
+        });
+    });
+});

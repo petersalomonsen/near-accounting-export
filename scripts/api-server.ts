@@ -4,6 +4,8 @@
 
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
+import cors from 'cors';
+import type { CorsOptions } from 'cors';
 import fs from 'fs';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
@@ -28,6 +30,13 @@ const PAYMENT_CONFIG = {
 const SYNC_CONFIG = {
     batchSize: parseInt(process.env.BATCH_SIZE || '10', 10),
     cycleDelayMs: parseInt(process.env.CYCLE_DELAY_MS || '30000', 10)
+};
+
+// CORS configuration
+const CORS_CONFIG = {
+    allowedOrigins: process.env.CORS_ALLOWED_ORIGINS
+        ? process.env.CORS_ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
+        : ['*'] // Default to allow all origins if not configured
 };
 
 // Types
@@ -669,6 +678,28 @@ async function verifyPaymentTransaction(txHash: string): Promise<PaymentVerifica
 const app = express();
 app.use(express.json());
 
+// Configure CORS
+const corsOptions: CorsOptions = {
+    origin: (origin, callback) => {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) {
+            return callback(null, true);
+        }
+        
+        // Check if origin is allowed
+        if (CORS_CONFIG.allowedOrigins.includes('*') || CORS_CONFIG.allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error(`Origin ${origin} is not allowed by CORS policy`));
+        }
+    },
+    credentials: true, // Allow cookies and authorization headers
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+};
+
+app.use(cors(corsOptions));
+
 // Middleware to log requests
 app.use((req: Request, res: Response, next: NextFunction) => {
     console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
@@ -678,7 +709,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // NOTE: For production use, consider adding:
 // - Rate limiting middleware (e.g., express-rate-limit) to prevent abuse
 // - Authentication middleware to protect endpoints
-// - CORS configuration based on your needs
+// - Configure CORS_ALLOWED_ORIGINS environment variable to restrict origins
 // - Input sanitization and validation middleware
 
 // POST /api/accounts - Register an account
@@ -979,6 +1010,7 @@ const server = app.listen(PORT, () => {
     console.log(`Data directory: ${DATA_DIR}`);
     console.log(`Batch size: ${SYNC_CONFIG.batchSize}`);
     console.log(`Cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms`);
+    console.log(`CORS allowed origins: ${CORS_CONFIG.allowedOrigins.join(', ')}`);
     console.log('');
     console.log('Available endpoints:');
     console.log('  POST   /api/accounts - Register an account (or renew subscription)');
