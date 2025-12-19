@@ -53,6 +53,7 @@ CMD ["node", "dist/scripts/api-server.js"]
 |----------|-------------|---------|
 | `PORT` | API server port | `3000` |
 | `DATA_DIR` | Directory for storing accounts, jobs, and results | `./data` |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated list of allowed origins for cross-origin requests. Use `*` to allow all origins (not recommended for production). | `*` (allow all) |
 | `NEAR_RPC_ENDPOINT` | RPC endpoint URL | `https://archival-rpc.mainnet.fastnear.com` |
 | `FASTNEAR_API_KEY` | FastNEAR API key for higher rate limits | None |
 | `NEARBLOCKS_API_KEY` | NearBlocks API key for faster transaction discovery | None |
@@ -539,7 +540,19 @@ npm test
 
 1. **Account Registration**: The API requires explicit account registration to prevent arbitrary data collection.
 
-2. **Rate Limiting**: **Important for production** - Add rate limiting middleware to prevent abuse:
+2. **CORS (Cross-Origin Resource Sharing)**: Control which web applications can access your API:
+   - **Production**: Set `CORS_ALLOWED_ORIGINS` to a comma-separated list of allowed domains:
+     ```bash
+     CORS_ALLOWED_ORIGINS=https://app.example.com,https://dashboard.example.com
+     ```
+   - **Development**: Use `*` to allow all origins (default):
+     ```bash
+     CORS_ALLOWED_ORIGINS=*
+     ```
+   - The API includes CORS support out of the box. Configure via the `CORS_ALLOWED_ORIGINS` environment variable.
+   - Requests without an Origin header (e.g., curl, mobile apps) are always allowed.
+
+3. **Rate Limiting**: **Important for production** - Add rate limiting middleware to prevent abuse:
    ```javascript
    import rateLimit from 'express-rate-limit';
    
@@ -551,7 +564,7 @@ npm test
    app.use('/api/', limiter);
    ```
 
-3. **Authentication**: For production use, add authentication middleware to protect endpoints:
+4. **Authentication**: For production use, add authentication middleware to protect endpoints:
    ```javascript
    import jwt from 'jsonwebtoken';
    
@@ -564,20 +577,11 @@ npm test
    app.use('/api/', authenticateToken);
    ```
 
-4. **HTTPS**: Always use HTTPS in production to protect data in transit. Configure a reverse proxy (nginx, Caddy) with TLS certificates.
+5. **HTTPS**: Always use HTTPS in production to protect data in transit. Configure a reverse proxy (nginx, Caddy) with TLS certificates.
 
-5. **Input Validation**: All inputs are validated to prevent injection attacks. The validation helper ensures NEAR account ID format compliance.
+6. **Input Validation**: All inputs are validated to prevent injection attacks. The validation helper ensures NEAR account ID format compliance.
 
-6. **File Access**: Job outputs are isolated by UUID to prevent unauthorized access. Consider adding user-to-job ownership checks.
-
-7. **CORS**: Configure CORS based on your frontend requirements:
-   ```javascript
-   import cors from 'cors';
-   
-   app.use(cors({
-     origin: 'https://your-frontend-domain.com'
-   }));
-   ```
+7. **File Access**: Job outputs are isolated by UUID to prevent unauthorized access. Consider adding user-to-job ownership checks.
 
 8. **Environment Variables**: Never commit sensitive API keys or secrets. Use `.env` files (gitignored) or secure secret management.
 
