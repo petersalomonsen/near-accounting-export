@@ -632,12 +632,43 @@ async function fillGaps(
         let currentEnd = searchEnd;
         let foundInGap = 0;
         
+        // Keep track of the current "previous" balance for recalculating changes
+        let currentPrevBalanceAfter = prevBalanceAfter;
+        
         while (currentStart <= currentEnd && foundInGap < maxTransactionsToFill - totalFilled) {
             if (getStopSignal()) {
                 break;
             }
             
-            console.log(`Searching in range ${currentStart} - ${currentEnd}...`);
+            // Recalculate what changed between currentPrevBalanceAfter and nextBalanceBefore
+            // This is important because after finding a transaction, the remaining gap may have different changes
+            const recalcCheckNear = currentPrevBalanceAfter?.near !== nextBalanceBefore?.near;
+            
+            const recalcChangedFungibleTokens: string[] = [];
+            const recalcPrevFT = currentPrevBalanceAfter?.fungibleTokens || {};
+            const recalcAllFT = new Set([...Object.keys(recalcPrevFT), ...Object.keys(nextFT)]);
+            for (const token of recalcAllFT) {
+                if ((recalcPrevFT[token] || '0') !== (nextFT[token] || '0')) {
+                    recalcChangedFungibleTokens.push(token);
+                }
+            }
+            
+            const recalcChangedIntentsTokens: string[] = [];
+            const recalcPrevIntents = currentPrevBalanceAfter?.intentsTokens || {};
+            const recalcAllIntents = new Set([...Object.keys(recalcPrevIntents), ...Object.keys(nextIntents)]);
+            for (const token of recalcAllIntents) {
+                if ((recalcPrevIntents[token] || '0') !== (nextIntents[token] || '0')) {
+                    recalcChangedIntentsTokens.push(token);
+                }
+            }
+            
+            // If nothing changed anymore, we've filled all gaps
+            if (!recalcCheckNear && recalcChangedFungibleTokens.length === 0 && recalcChangedIntentsTokens.length === 0) {
+                console.log('No more changes detected in remaining gap range');
+                break;
+            }
+            
+            console.log(`Searching in range ${currentStart} - ${currentEnd}... (NEAR=${recalcCheckNear}, FT=${recalcChangedFungibleTokens.length}, Intents=${recalcChangedIntentsTokens.length})`);
             
             let balanceChange: BalanceChanges;
             try {
@@ -645,9 +676,9 @@ async function fillGaps(
                     history.accountId,
                     currentStart,
                     currentEnd,
-                    changedFungibleTokens.length > 0 ? changedFungibleTokens : null,
-                    changedIntentsTokens.length > 0 ? changedIntentsTokens : null,
-                    checkNear
+                    recalcChangedFungibleTokens.length > 0 ? recalcChangedFungibleTokens : null,
+                    recalcChangedIntentsTokens.length > 0 ? recalcChangedIntentsTokens : null,
+                    recalcCheckNear
                 );
             } catch (error: any) {
                 if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
@@ -723,6 +754,10 @@ async function fillGaps(
                 history.updatedAt = new Date().toISOString();
                 saveHistory(outputFile, history);
             }
+            
+            // Update the "previous" balance for the next iteration
+            // This is the balance AFTER the transaction we just found
+            currentPrevBalanceAfter = balanceChange.endBalance;
             
             // Search for more in the remaining range
             currentEnd = balanceChange.block - 1;
