@@ -147,7 +147,7 @@ The script automatically:
 | `FASTNEAR_API_KEY` | FastNEAR API key for higher rate limits | None |
 | `NEARBLOCKS_API_KEY` | NearBlocks API key for faster transaction discovery | None |
 | `INTENTS_EXPLORER_API_KEY` | NEAR Intents Explorer API key for faster intents transaction discovery | None |
-| `INTENTS_EXPLORER_API_URL` | NEAR Intents Explorer API base URL (set when API becomes available) | `https://api.intents.near.org/v1` |
+| `INTENTS_EXPLORER_API_URL` | NEAR Intents Explorer API base URL (set when API becomes available) | None |
 | `RPC_DELAY_MS` | Delay between RPC calls in ms | `50` |
 
 **Note:** 
