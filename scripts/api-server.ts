@@ -23,7 +23,10 @@ const PAYMENT_CONFIG = {
     requiredAmount: process.env.REGISTRATION_FEE_AMOUNT || '100000', // 0.1 ARIZ (6 decimals = 100000)
     recipientAccount: process.env.REGISTRATION_FEE_RECIPIENT || 'arizcredits.near',
     ftContractId: process.env.REGISTRATION_FEE_TOKEN || 'arizcredits.near', // Default to ARIZ
-    maxAge: parseInt(process.env.REGISTRATION_TX_MAX_AGE_MS || String(30 * 24 * 60 * 60 * 1000), 10) // Default 30 days
+    maxAge: parseInt(process.env.REGISTRATION_TX_MAX_AGE_MS || String(30 * 24 * 60 * 60 * 1000), 10), // Default 30 days
+    exemptAccounts: process.env.REGISTRATION_FEE_EXEMPT_ACCOUNTS
+        ? process.env.REGISTRATION_FEE_EXEMPT_ACCOUNTS.split(',').map(acc => acc.trim().toLowerCase())
+        : [] // Accounts that don't need to pay (e.g., for testing or special partnerships)
 };
 
 // Continuous sync configuration
@@ -176,11 +179,23 @@ let continuousSyncRunning = false;
 let continuousSyncShuttingDown = false;
 
 /**
+ * Check if an account is exempt from payment
+ */
+function isAccountExempt(accountId: string): boolean {
+    return PAYMENT_CONFIG.exemptAccounts.includes(accountId.toLowerCase());
+}
+
+/**
  * Check if an account has a valid (non-expired) payment
  */
 function isPaymentValid(account: RegisteredAccount): boolean {
     // If payment verification is disabled, all accounts are valid
     if (PAYMENT_CONFIG.requiredAmount === '0') {
+        return true;
+    }
+    
+    // If account is exempt from payment, it's always valid
+    if (isAccountExempt(account.accountId)) {
         return true;
     }
     
@@ -722,7 +737,10 @@ app.post('/api/accounts', async (req: Request, res: Response) => {
     let accountId: string;
     let verificationResult: PaymentVerificationResult | undefined;
     
-    if (paymentRequired) {
+    // Check if this is an exempt account (can register without payment)
+    const isExemptAccount = providedAccountId && isAccountExempt(providedAccountId);
+    
+    if (paymentRequired && !isExemptAccount) {
         // Payment verification mode
         if (!transactionHash || typeof transactionHash !== 'string') {
             return res.status(400).json({ error: 'transactionHash is required and must be a string' });
@@ -748,7 +766,7 @@ app.post('/api/accounts', async (req: Request, res: Response) => {
             });
         }
     } else {
-        // No payment required (testing mode) - accept accountId directly
+        // No payment required (testing mode) or exempt account - accept accountId directly
         if (!providedAccountId || typeof providedAccountId !== 'string') {
             return res.status(400).json({ error: 'accountId is required and must be a string' });
         }
