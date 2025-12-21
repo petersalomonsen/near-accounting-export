@@ -146,9 +146,12 @@ The script automatically:
 | `NEAR_RPC_ENDPOINT` | RPC endpoint URL | `https://archival-rpc.mainnet.fastnear.com` |
 | `FASTNEAR_API_KEY` | FastNEAR API key for higher rate limits | None |
 | `NEARBLOCKS_API_KEY` | NearBlocks API key for faster transaction discovery | None |
+| `INTENTS_EXPLORER_API_KEY` | NEAR Intents Explorer API key for faster intents transaction discovery | None |
 | `RPC_DELAY_MS` | Delay between RPC calls in ms | `50` |
 
-**Note:** When `NEARBLOCKS_API_KEY` is set, the script will first fetch known transaction blocks from the NearBlocks API, which is much faster than binary search. It then falls back to binary search for any remaining transactions or if the API is unavailable.
+**Note:** 
+- When `NEARBLOCKS_API_KEY` is set, the script will first fetch known transaction blocks from the NearBlocks API, which is much faster than binary search. It then falls back to binary search for any remaining transactions or if the API is unavailable.
+- When `INTENTS_EXPLORER_API_KEY` is set (or when the API is publicly accessible), the script will fetch known NEAR Intents transaction blocks from the NEAR Intents Explorer API, providing faster discovery of intents transactions. This is especially useful for accounts with significant intents portfolio activity.
 
 ## Output Format
 

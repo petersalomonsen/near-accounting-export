@@ -67,17 +67,20 @@ Built files are output to the `dist/` directory.
   - **Note**: The old rpc.mainnet.near.org endpoint is deprecated and returns error -429. Use fastnear.com or alternative providers from https://docs.near.org/api/rpc/providers
 - `FASTNEAR_API_KEY` - FastNEAR API key for higher rate limits (optional). When set, adds `Authorization: Bearer <key>` header to all RPC requests
 - `NEARBLOCKS_API_KEY` - NearBlocks API key for faster transaction discovery (optional). When set, fetches known transaction blocks from NearBlocks API before falling back to binary search
+- `INTENTS_EXPLORER_API_KEY` - NEAR Intents Explorer API key for faster intents transaction discovery (optional). When set, fetches known intents transaction blocks from the NEAR Intents Explorer API before falling back to binary search
 - `RPC_DELAY_MS` - Delay between RPC calls in milliseconds (default: 50)
 
 ## Key Conventions
 
 1. **Balance Verification**: Always verify that transactions are connected by checking that the balance after one transaction matches the balance before the next.
 
-2. **NearBlocks API**: When available, use the NearBlocks API to quickly discover known transaction blocks, then fetch balance changes only at those specific blocks.
+2. **NearBlocks API**: When available, use the NearBlocks API to quickly discover known transaction blocks (NEAR and FT), then fetch balance changes only at those specific blocks.
 
-3. **Binary Search**: Fall back to binary search to find balance-changing blocks efficiently when NearBlocks is not available or for intents transactions not indexed by NearBlocks.
+3. **Intents Explorer API**: When available, use the NEAR Intents Explorer API to quickly discover intents (multi-token) transaction blocks, then fetch balance changes only at those specific blocks. This is the primary source for NEAR Intents transaction history.
 
-4. **Continuous Search**: When no balance changes are found in a range, automatically move to the adjacent range of equal size and continue searching until interrupted, rate limited, or endpoint becomes unresponsive.
+4. **Binary Search**: Fall back to binary search to find balance-changing blocks efficiently when APIs are not available or cannot fill all balance gaps.
+
+5. **Continuous Search**: When no balance changes are found in a range, automatically move to the adjacent range of equal size and continue searching until interrupted, rate limited, or endpoint becomes unresponsive.
 
 5. **Error Handling**: Handle rate limiting and endpoint errors gracefully with a stop signal mechanism. Always save progress before stopping.
 
