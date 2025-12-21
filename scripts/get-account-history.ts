@@ -1293,19 +1293,22 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                 
                 try {
                     // Get balance changes at this specific block
-                    // Use specific token IDs from the Intents Explorer API to optimize queries
-                    // Pass null for fungible tokens (no FT checking) and specific intents tokens from API
+                    // Optimization: Use token IDs from Intents Explorer API to check only those specific tokens
+                    // This avoids unnecessary RPC calls for fungible tokens and unknown intents tokens
                     const balanceChange = await getBalanceChangesAtBlock(
                         accountId, 
                         txBlock.blockHeight,
-                        null, // Skip fungible token balance checking
-                        txBlock.tokenIds // Check these specific intents tokens from API
+                        null, // Skip fungible token balance checking (parameter: tokenContracts)
+                        txBlock.tokenIds // Check only these specific intents tokens from API (parameter: intentsTokens)
                     );
                     
                     if (!balanceChange.hasChanges) {
                         // No balance changes detected - the tokens from the API may have zero balance
                         // or may not be in our complete token tracking list
-                        console.log(`  Skipping block ${txBlock.blockHeight} - no tracked balance changes detected (intents tokens from API: ${txBlock.tokenIds.join(', ') || 'none'})`);
+                        const tokenDisplay = txBlock.tokenIds.length > 3 
+                            ? `${txBlock.tokenIds.slice(0, 3).join(', ')} and ${txBlock.tokenIds.length - 3} more`
+                            : txBlock.tokenIds.join(', ') || 'none';
+                        console.log(`  Skipping block ${txBlock.blockHeight} - no tracked balance changes (intents tokens: ${tokenDisplay})`);
                         continue;
                     }
                     
@@ -1363,7 +1366,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                     }
                     
                     transactionsFound++;
-                    console.log(`Transaction ${transactionsFound}/${maxTransactions} added at block ${txBlock.blockHeight} (intents)`);
+                    console.log(`Transaction ${transactionsFound}/${maxTransactions} added at block ${txBlock.blockHeight} (Intents Explorer API)`);
                     
                     // Update metadata
                     const allBlocks = history.transactions.map(t => t.block);

@@ -26,6 +26,14 @@ async function delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Get configured delay for API rate limiting
+ */
+function getRateLimitDelay(): number {
+    const envDelay = process.env.RPC_DELAY_MS;
+    return envDelay ? parseInt(envDelay, 10) : 100; // Default 100ms for API calls
+}
+
 // Transaction from Intents Explorer API
 export interface IntentsExplorerTxn {
     transaction_hash: string;
@@ -83,7 +91,7 @@ export async function fetchIntentsTransactions(
         url += `&before_block=${beforeBlock}`;
     }
     
-    await delay(100); // Rate limiting
+    await delay(getRateLimitDelay());
     
     const response = await fetch(url, { headers: getHeaders() });
     
