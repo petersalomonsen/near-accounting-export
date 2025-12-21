@@ -386,24 +386,16 @@ curl -X POST http://localhost:3000/api/accounts \
   -H "Content-Type: application/json" \
   -d '{"transactionHash": "YOUR_PAYMENT_TX_HASH_HERE"}'
 
-# Create a job (account ID is extracted from payment transaction)
-curl -X POST http://localhost:3000/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "accountId": "youraccountid.near",
-    "options": {
-      "maxTransactions": 50,
-      "direction": "backward"
-    }
-  }'
+# The server automatically starts collecting data for registered accounts
+# No manual job creation needed!
 
 # Check account status and data range
 curl http://localhost:3000/api/accounts/myaccount.near/status
 
-# Check job status (replace with actual job ID)
-curl http://localhost:3000/api/jobs/550e8400-e29b-41d4-a716-446655440000
+# View job history (jobs are created automatically by continuous sync)
+curl http://localhost:3000/api/jobs?accountId=myaccount.near
 
-# Download JSON result
+# Download JSON result (available anytime, even during collection)
 curl -O -J http://localhost:3000/api/accounts/myaccount.near/download/json
 
 # Download CSV result
@@ -422,27 +414,17 @@ const registerResponse = await fetch('http://localhost:3000/api/accounts', {
 const registration = await registerResponse.json();
 const accountId = registration.account.accountId; // Extracted from payment transaction
 
-// Create a job
-const jobResponse = await fetch('http://localhost:3000/api/jobs', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    accountId: accountId,
-    options: {
-      maxTransactions: 50,
-      direction: 'backward'
-    }
-  })
-});
-const { job } = await jobResponse.json();
-const accountId = job.accountId;
+// The server automatically starts collecting data
+// No manual job creation needed!
 
 // Check account status
 const statusResponse = await fetch(`http://localhost:3000/api/accounts/${accountId}/status`);
 const accountStatus = await statusResponse.json();
 console.log('Account status:', accountStatus);
+console.log('Data range:', accountStatus.dataRange);
+console.log('Ongoing job:', accountStatus.ongoingJob);
 
-// Download results (can be done anytime, even while job is running)
+// Download results (can be done anytime, even while collecting)
 const jsonResponse = await fetch(`http://localhost:3000/api/accounts/${accountId}/download/json`);
 const data = await jsonResponse.json();
 console.log('Downloaded data:', data);
@@ -465,24 +447,17 @@ registration = response.json()
 account_id = registration["account"]["accountId"]  # Extracted from payment transaction
 print(registration)
 
-# Create a job
-response = requests.post(
-    f"{BASE_URL}/api/jobs",
-    json={
-        "accountId": account_id,
-        "options": {
-            "maxTransactions": 50,
-            "direction": "backward"
-        }
-    }
-)
+# The server automatically starts collecting data
+# No manual job creation needed!
 
 # Check account status
 response = requests.get(f"{BASE_URL}/api/accounts/{account_id}/status")
 account_status = response.json()
 print(f"Account status: {account_status}")
+print(f"Data range: {account_status.get('dataRange')}")
+print(f"Ongoing job: {account_status.get('ongoingJob')}")
 
-# Download CSV (can be done anytime, even while job is running)
+# Download CSV (available anytime, even during collection)
 response = requests.get(f"{BASE_URL}/api/accounts/{account_id}/download/csv")
 with open("output.csv", "wb") as f:
     f.write(response.content)

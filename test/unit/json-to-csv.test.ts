@@ -15,8 +15,8 @@ import {
     formatTimestamp,
     getAssetName,
     getTokenBalance
-} from '../scripts/json-to-csv.js';
-import type { AccountHistory, TransferDetail, BalanceSnapshot, Changes, BalanceChange } from '../scripts/json-to-csv.js';
+} from '../../scripts/json-to-csv.js';
+import type { AccountHistory, TransferDetail, BalanceSnapshot, Changes, BalanceChange } from '../../scripts/json-to-csv.js';
 
 describe('JSON to CSV Converter', function() {
     describe('escapeCSV', function() {

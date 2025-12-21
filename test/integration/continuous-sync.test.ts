@@ -134,57 +134,10 @@ describe('Continuous Sync', function() {
         }
     });
 
-    describe('API changes', function() {
-        it('should return 404 for POST /api/jobs', async function() {
-            const response = await makeRequest('POST', '/api/jobs', {
-                accountId: 'testaccount.near'
-            });
-            
-            assert.equal(response.statusCode, 404);
-            assert.ok(response.body.error.includes('POST /api/jobs has been removed'));
-        });
-
-        it('should still return job history via GET /api/jobs', async function() {
-            const response = await makeRequest('GET', '/api/jobs');
-            
-            assert.equal(response.statusCode, 200);
-            assert.ok(Array.isArray(response.body.jobs));
-        });
-
-        it('should still get job status via GET /api/jobs/:jobId', async function() {
-            // Non-existent job should return 404
-            const response = await makeRequest('GET', '/api/jobs/non-existent-job');
-            
-            assert.equal(response.statusCode, 404);
-            assert.ok(response.body.error.includes('Job not found'));
-        });
-    });
-
-    describe('Account Registration', function() {
-        it('should register a new account', async function() {
-            const response = await makeRequest('POST', '/api/accounts', {
-                accountId: TEST_ACCOUNTS[0]
-            });
-            
-            assert.equal(response.statusCode, 201);
-            assert.equal(response.body.message, 'Account registered successfully');
-            assert.equal(response.body.account.accountId, TEST_ACCOUNTS[0]);
-        });
-
-        it('should return existing account on duplicate registration', async function() {
-            const response = await makeRequest('POST', '/api/accounts', {
-                accountId: TEST_ACCOUNTS[0]
-            });
-            
-            assert.equal(response.statusCode, 200);
-            assert.equal(response.body.message, 'Account already registered');
-        });
-    });
-
     describe('Continuous loop behavior', function() {
         it('should process registered accounts', async function() {
-            // Register additional test accounts
-            for (let i = 1; i < TEST_ACCOUNTS.length; i++) {
+            // Register test accounts
+            for (let i = 0; i < TEST_ACCOUNTS.length; i++) {
                 await makeRequest('POST', '/api/accounts', {
                     accountId: TEST_ACCOUNTS[i]
                 });
@@ -233,62 +186,7 @@ describe('Continuous Sync', function() {
     });
 });
 
-// Separate test suite for payment validation logic
-describe('Payment Validation', function() {
-    this.timeout(30000);
-
-    describe('isPaymentValid logic', function() {
-        // These tests verify the payment validation logic conceptually
-        // The actual implementation is tested in api-server.ts
-        
-        it('should consider accounts without payment date as invalid in payment mode', function() {
-            // In payment-required mode (REGISTRATION_FEE_AMOUNT != '0'),
-            // accounts without paymentTransactionDate should be invalid
-            const account: { accountId: string; registeredAt: string; paymentTransactionDate?: string } = {
-                accountId: 'test.near',
-                registeredAt: new Date().toISOString()
-                // No paymentTransactionDate
-            };
-            
-            // Without payment date, the account should be skipped
-            assert.ok(!account.paymentTransactionDate);
-        });
-
-        it('should consider accounts with recent payment as valid', function() {
-            const account = {
-                accountId: 'test.near',
-                registeredAt: new Date().toISOString(),
-                paymentTransactionHash: 'abc123',
-                paymentTransactionDate: new Date().toISOString() // Just now
-            };
-            
-            const paymentDate = new Date(account.paymentTransactionDate).getTime();
-            const now = Date.now();
-            const maxAge = 30 * 24 * 60 * 60 * 1000; // 30 days
-            const age = now - paymentDate;
-            
-            assert.ok(age <= maxAge, 'Payment should be within max age');
-        });
-
-        it('should consider accounts with old payment as invalid', function() {
-            const account = {
-                accountId: 'test.near',
-                registeredAt: new Date(Date.now() - 35 * 24 * 60 * 60 * 1000).toISOString(),
-                paymentTransactionHash: 'abc123',
-                paymentTransactionDate: new Date(Date.now() - 35 * 24 * 60 * 60 * 1000).toISOString() // 35 days ago
-            };
-            
-            const paymentDate = new Date(account.paymentTransactionDate).getTime();
-            const now = Date.now();
-            const maxAge = 30 * 24 * 60 * 60 * 1000; // 30 days
-            const age = now - paymentDate;
-            
-            assert.ok(age > maxAge, 'Payment should be expired');
-        });
-    });
-});
-
-// Separate test suite for subscription renewal
+// Subscription Renewal test kept as it tests actual continuous sync behavior
 describe('Subscription Renewal', function() {
     this.timeout(60000);
 

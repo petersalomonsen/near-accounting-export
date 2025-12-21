@@ -49,27 +49,21 @@ curl -X POST https://near-accounting-export.fly.dev/api/accounts \
   -d '{"transactionHash": "YOUR_TRANSACTION_ID"}'
 ```
 
-## Step 3: Collect Transaction History
+## Step 3: Automatic Data Collection
 
-### 3.1 Start a data collection job
+Once registered, the API server automatically collects your transaction history in a continuous sync loop. No manual job creation is needed!
 
-```bash
-curl -X POST https://near-accounting-export.fly.dev/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"accountId": "YOUR_ACCOUNT.near", "options": {"maxTransactions": 50}}'
-```
-
-Options:
-- `maxTransactions`: Number of transactions to collect (default: 100)
-- `direction`: `"backward"` (recent first) or `"forward"` (oldest first)
-
-### 3.2 Check job status
+### 3.1 Check collection status
 
 ```bash
 curl https://near-accounting-export.fly.dev/api/accounts/YOUR_ACCOUNT.near/status
 ```
 
-Wait until `ongoingJob` is `null` (job completed).
+This shows:
+- `dataRange`: The blocks and transactions already collected
+- `ongoingJob`: Currently running collection job (if any)
+
+The server processes accounts in round-robin fashion, continuously updating your data.
 
 ## Step 4: Download Your Data
 
@@ -113,15 +107,10 @@ curl -X POST https://near-accounting-export.fly.dev/api/accounts \
   -H "Content-Type: application/json" \
   -d '{"transactionHash": "YOUR_TRANSACTION_ID"}'
 
-# 5. Start data collection
-curl -X POST https://near-accounting-export.fly.dev/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"accountId": "myaccount.near", "options": {"maxTransactions": 100}}'
-
-# 6. Check status (repeat until ongoingJob is null)
+# 5. Wait for automatic collection (or check status anytime)
 curl https://near-accounting-export.fly.dev/api/accounts/myaccount.near/status
 
-# 7. Download data
+# 6. Download data (available anytime, even during collection)
 curl -o myaccount.csv \
   https://near-accounting-export.fly.dev/api/accounts/myaccount.near/download/csv
 ```

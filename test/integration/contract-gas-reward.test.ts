@@ -8,8 +8,8 @@ import {
     findLatestBalanceChangingBlock,
     findBalanceChangingTransaction,
     clearBalanceCache
-} from '../scripts/balance-tracker.js';
-import { fetchNeardataBlock, setStopSignal } from '../scripts/rpc.js';
+} from '../../scripts/balance-tracker.js';
+import { fetchNeardataBlock, setStopSignal } from '../../scripts/rpc.js';
 
 const TEST_ACCOUNT = 'romakqatesting.sputnik-dao.near';
 

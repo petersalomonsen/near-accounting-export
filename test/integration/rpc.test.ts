@@ -6,14 +6,14 @@ import dotenv from 'dotenv';
 
 // Load environment variables from .env file
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: path.join(__dirname, '..', '..', '.env') });
+dotenv.config({ path: path.join(__dirname, '..', '..', '..', '.env') });
 
 import {
     fetchNeardataBlock,
     fetchBlockData,
     getTransactionStatusWithReceipts,
     setStopSignal
-} from '../scripts/rpc.js';
+} from '../../scripts/rpc.js';
 
 describe('RPC Fallback for Neardata.xyz', function() {
     this.timeout(120000);
@@ -315,7 +315,7 @@ describe('RPC Fallback for Neardata.xyz', function() {
 
     it('should use RPC fallback when neardata.xyz returns null', async function() {
         // Import findBalanceChangingTransaction to test the full flow
-        const { findBalanceChangingTransaction } = await import('../scripts/balance-tracker.js');
+        const { findBalanceChangingTransaction } = await import('../../scripts/balance-tracker.js');
 
         // Test with a known block that has transactions
         // Even if neardata.xyz is rate limited, the function should fall back to RPC

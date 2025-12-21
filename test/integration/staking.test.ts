@@ -2,7 +2,7 @@
 // Tests the cross-contract call scenario where balance changes at a different block than receipt execution
 import { strict as assert } from 'assert';
 import { describe, it } from 'mocha';
-import { findBalanceChangingTransaction, getAllBalances, getStakingPoolBalances, findStakingBalanceChanges } from '../scripts/balance-tracker.js';
+import { findBalanceChangingTransaction, getAllBalances, getStakingPoolBalances, findStakingBalanceChanges } from '../../scripts/balance-tracker.js';
 
 describe('Staking Balance Tracking', () => {
     /**
