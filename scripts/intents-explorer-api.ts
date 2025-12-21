@@ -1,7 +1,9 @@
 // NEAR Intents Explorer API module for fetching intents transaction data
 // This provides a faster alternative to binary search for discovering intents transactions
 
-const INTENTS_EXPLORER_API_BASE = 'https://api.intents.near.org/v1';
+// API base URL can be configured via environment variable
+// Default placeholder - update when official API endpoint is available
+const INTENTS_EXPLORER_API_BASE = process.env.INTENTS_EXPLORER_API_URL || 'https://api.intents.near.org/v1';
 
 /**
  * Get headers for Intents Explorer API requests
@@ -155,10 +157,20 @@ export async function getAllIntentsTransactionBlocks(
 }
 
 /**
- * Check if Intents Explorer API is available (API key is set or public access)
+ * Check if Intents Explorer API is available
+ * The API is considered available if:
+ * 1. An API key is set (higher rate limits), OR
+ * 2. A custom API URL is configured
+ * 
+ * Note: The API may not be publicly available yet. When it becomes available,
+ * set INTENTS_EXPLORER_API_URL environment variable to the correct endpoint.
  */
 export function isIntentsExplorerAvailable(): boolean {
-    // The API may work without a key, but having a key provides higher rate limits
-    // For now, we'll make it always available and let the API call fail if it doesn't work
-    return true;
+    // Check if API key is set or custom URL is configured
+    const hasApiKey = !!process.env.INTENTS_EXPLORER_API_KEY;
+    const hasCustomUrl = !!process.env.INTENTS_EXPLORER_API_URL;
+    
+    // Only report as available if explicitly configured
+    // This prevents unnecessary API calls to non-existent endpoints
+    return hasApiKey || hasCustomUrl;
 }

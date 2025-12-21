@@ -68,6 +68,7 @@ Built files are output to the `dist/` directory.
 - `FASTNEAR_API_KEY` - FastNEAR API key for higher rate limits (optional). When set, adds `Authorization: Bearer <key>` header to all RPC requests
 - `NEARBLOCKS_API_KEY` - NearBlocks API key for faster transaction discovery (optional). When set, fetches known transaction blocks from NearBlocks API before falling back to binary search
 - `INTENTS_EXPLORER_API_KEY` - NEAR Intents Explorer API key for faster intents transaction discovery (optional). When set, fetches known intents transaction blocks from the NEAR Intents Explorer API before falling back to binary search
+- `INTENTS_EXPLORER_API_URL` - NEAR Intents Explorer API base URL (optional). Set this to the correct endpoint URL when the API becomes available (default: https://api.intents.near.org/v1)
 - `RPC_DELAY_MS` - Delay between RPC calls in milliseconds (default: 50)
 
 ## Key Conventions
