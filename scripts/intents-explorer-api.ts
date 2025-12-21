@@ -111,7 +111,7 @@ export async function getAllIntentsTransactionBlocks(
     const blocks: IntentsTransactionBlock[] = [];
     const seenBlocks = new Set<number>();
     
-    console.log(`Fetching intents transaction blocks from Intents Explorer API...`);
+    console.log(`Fetching intents transaction blocks from Intents Explorer API for account ${accountId} (blocks ${afterBlock || 'start'}-${beforeBlock || 'end'})...`);
     
     let cursor: string | undefined;
     let pages = 0;

@@ -1241,7 +1241,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             }
         } catch (error: any) {
             console.warn(`NearBlocks API error: ${error.message}`);
-            console.log('Falling back to intents explorer or binary search...');
+            console.log('Continuing to intents explorer or binary search...');
         }
     }
     
@@ -1293,18 +1293,19 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                 
                 try {
                     // Get balance changes at this specific block
-                    // Use the token IDs from the API to optimize the balance check
-                    // Pass null for fungible tokens to use defaults, and specific intents tokens from API
+                    // Use specific token IDs from the Intents Explorer API to optimize queries
+                    // Pass null for fungible tokens (no FT checking) and specific intents tokens from API
                     const balanceChange = await getBalanceChangesAtBlock(
                         accountId, 
                         txBlock.blockHeight,
-                        null, // Use default fungible token contracts
-                        txBlock.tokenIds // Check specific intents tokens (array may be empty)
+                        null, // Skip fungible token balance checking
+                        txBlock.tokenIds // Check these specific intents tokens from API
                     );
                     
                     if (!balanceChange.hasChanges) {
-                        // This can happen if the intents token is not in our tracking list
-                        console.log(`  Skipping block ${txBlock.blockHeight} - no tracked balance changes detected (intents tokens: ${txBlock.tokenIds.join(', ') || 'none'})`);
+                        // No balance changes detected - the tokens from the API may have zero balance
+                        // or may not be in our complete token tracking list
+                        console.log(`  Skipping block ${txBlock.blockHeight} - no tracked balance changes detected (intents tokens from API: ${txBlock.tokenIds.join(', ') || 'none'})`);
                         continue;
                     }
                     
