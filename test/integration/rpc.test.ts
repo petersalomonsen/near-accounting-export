@@ -6,14 +6,14 @@ import dotenv from 'dotenv';
 
 // Load environment variables from .env file
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: path.join(__dirname, '..', '..', '.env') });
+dotenv.config({ path: path.join(__dirname, '..', '..', '..', '.env') });
 
 import {
     fetchNeardataBlock,
     fetchBlockData,
     getTransactionStatusWithReceipts,
     setStopSignal
-} from '../scripts/rpc.js';
+} from '../../scripts/rpc.js';
 
 describe('RPC Fallback for Neardata.xyz', function() {
     this.timeout(120000);

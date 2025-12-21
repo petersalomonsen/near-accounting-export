@@ -9,13 +9,13 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Load environment variables
-dotenv.config({ path: path.join(__dirname, '..', '.env') });
+dotenv.config({ path: path.join(__dirname, '..', '..', '..', '.env') });
 
 import {
     getTokenMetadata,
     formatTokenAmount,
     clearMetadataCache
-} from '../scripts/token-metadata.js';
+} from '../../scripts/token-metadata.js';
 
 describe('Token Metadata', function() {
     // Increase timeout for RPC calls

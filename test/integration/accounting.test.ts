@@ -7,26 +7,26 @@ import dotenv from 'dotenv';
 
 // Load environment variables from .env file
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// Go up two levels: dist/test -> dist -> root
-dotenv.config({ path: path.join(__dirname, '..', '..', '.env') });
+// Go up three levels: dist/test/integration -> dist/test -> dist -> root
+dotenv.config({ path: path.join(__dirname, '..', '..', '..', '.env') });
 
 import {
     getCurrentBlockHeight,
     setStopSignal
-} from '../scripts/rpc.js';
+} from '../../scripts/rpc.js';
 import {
     getAllBalances,
     findLatestBalanceChangingBlock,
     findBalanceChangingTransaction,
     clearBalanceCache
-} from '../scripts/balance-tracker.js';
-import type { BalanceSnapshot } from '../scripts/balance-tracker.js';
+} from '../../scripts/balance-tracker.js';
+import type { BalanceSnapshot } from '../../scripts/balance-tracker.js';
 import {
     getAccountHistory,
     verifyHistoryFile,
     isStakingOnlyEntry
-} from '../scripts/get-account-history.js';
-import type { TransactionEntry } from '../scripts/get-account-history.js';
+} from '../../scripts/get-account-history.js';
+import type { TransactionEntry } from '../../scripts/get-account-history.js';
 
 describe('NEAR Accounting Export', function() {
     // These tests make real RPC calls and may take time
