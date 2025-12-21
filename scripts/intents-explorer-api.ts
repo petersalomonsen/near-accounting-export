@@ -2,8 +2,8 @@
 // This provides a faster alternative to binary search for discovering intents transactions
 
 // API base URL can be configured via environment variable
-// Default placeholder - update when official API endpoint is available
-const INTENTS_EXPLORER_API_BASE = process.env.INTENTS_EXPLORER_API_URL || 'https://api.intents.near.org/v1';
+// Default is empty - must be explicitly configured when API becomes available
+const INTENTS_EXPLORER_API_BASE = process.env.INTENTS_EXPLORER_API_URL || '';
 
 /**
  * Get headers for Intents Explorer API requests
@@ -65,6 +65,10 @@ export async function fetchIntentsTransactions(
         beforeBlock?: number;
     } = {}
 ): Promise<IntentsExplorerTxnResponse> {
+    if (!INTENTS_EXPLORER_API_BASE) {
+        throw new Error('INTENTS_EXPLORER_API_URL is not configured. Set the environment variable to use the Intents Explorer API.');
+    }
+    
     const { perPage = 25, cursor, afterBlock, beforeBlock } = options;
     
     let url = `${INTENTS_EXPLORER_API_BASE}/transactions/${accountId}?limit=${perPage}`;

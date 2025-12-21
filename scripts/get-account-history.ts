@@ -1298,11 +1298,12 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                         accountId, 
                         txBlock.blockHeight,
                         null, // Don't check fungible tokens
-                        txBlock.tokenIds.length > 0 ? txBlock.tokenIds : undefined // Check specific intents tokens
+                        txBlock.tokenIds.length > 0 ? txBlock.tokenIds : [] // Check specific intents tokens, or none if empty
                     );
                     
                     if (!balanceChange.hasChanges) {
                         // This can happen if the intents token is not in our tracking list
+                        console.log(`  Skipping block ${txBlock.blockHeight} - no tracked balance changes detected (intents tokens: ${txBlock.tokenIds.join(', ')})`);
                         continue;
                     }
                     
