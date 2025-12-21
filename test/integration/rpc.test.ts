@@ -315,7 +315,7 @@ describe('RPC Fallback for Neardata.xyz', function() {
 
     it('should use RPC fallback when neardata.xyz returns null', async function() {
         // Import findBalanceChangingTransaction to test the full flow
-        const { findBalanceChangingTransaction } = await import('../scripts/balance-tracker.js');
+        const { findBalanceChangingTransaction } = await import('../../scripts/balance-tracker.js');
 
         // Test with a known block that has transactions
         // Even if neardata.xyz is rate limited, the function should fall back to RPC
