@@ -6,7 +6,7 @@ This project is written in **TypeScript** and uses the official **@near-js/jsonr
 
 ## Features
 
-- **API Server**: REST API for managing data collection jobs, account registration, and downloads (see [API.md](API.md))
+- **API Server**: REST API for automatic data collection, account registration, and downloads (see [API.md](API.md))
 - **Binary Search Discovery**: Efficiently finds balance-changing transactions using binary search instead of scanning every block
 - **Gap Detection & Filling**: Automatically detects and fills gaps in transaction history where balance connectivity is broken
 - **Multiple Asset Types**: Tracks NEAR balance, fungible tokens (USDC, wNEAR, USDT, etc.), and NEAR Intents tokens
@@ -38,7 +38,7 @@ npm run dev
 
 ### API Server
 
-For production use with multiple accounts and job management, use the API server:
+For production use with multiple accounts and automatic data collection, use the API server:
 
 ```bash
 # Start the API server
@@ -49,8 +49,8 @@ npm run api
 
 See [API.md](API.md) for complete API documentation, including:
 - Account registration
-- Job creation and management
-- Status tracking
+- Automatic continuous sync
+- Job history tracking
 - JSON and CSV downloads
 - **Deployment options** (Fly.io, Docker Compose)
 
