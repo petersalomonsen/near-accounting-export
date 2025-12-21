@@ -146,13 +146,13 @@ The script automatically:
 | `NEAR_RPC_ENDPOINT` | RPC endpoint URL | `https://archival-rpc.mainnet.fastnear.com` |
 | `FASTNEAR_API_KEY` | FastNEAR API key for higher rate limits | None |
 | `NEARBLOCKS_API_KEY` | NearBlocks API key for faster transaction discovery | None |
-| `INTENTS_EXPLORER_API_KEY` | NEAR Intents Explorer API key for faster intents transaction discovery | None |
-| `INTENTS_EXPLORER_API_URL` | NEAR Intents Explorer API base URL (set when API becomes available) | None |
+| `INTENTS_EXPLORER_API_URL` | NEAR Intents Explorer API base URL (required to enable API) | None |
+| `INTENTS_EXPLORER_API_KEY` | NEAR Intents Explorer API key for authentication | None |
 | `RPC_DELAY_MS` | Delay between RPC calls in ms | `50` |
 
 **Note:** 
 - When `NEARBLOCKS_API_KEY` is set, the script will first fetch known transaction blocks from the NearBlocks API, which is much faster than binary search. It then falls back to binary search for any remaining transactions or if the API is unavailable.
-- When `INTENTS_EXPLORER_API_KEY` or `INTENTS_EXPLORER_API_URL` is set, the script will fetch known NEAR Intents transaction blocks from the NEAR Intents Explorer API, providing faster discovery of intents transactions. This is especially useful for accounts with significant intents portfolio activity. The API may not be publicly available yet - configure `INTENTS_EXPLORER_API_URL` with the correct endpoint when it becomes available.
+- When `INTENTS_EXPLORER_API_URL` is set, the script will fetch known NEAR Intents transaction blocks from the NEAR Intents Explorer API, providing faster discovery of intents transactions. Set `INTENTS_EXPLORER_API_KEY` for authenticated access. This is especially useful for accounts with significant intents portfolio activity. The API may not be publicly available yet - configure `INTENTS_EXPLORER_API_URL` with the correct endpoint when it becomes available.
 
 ## Output Format
 

@@ -1294,10 +1294,11 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                 try {
                     // Get balance changes at this specific block
                     // Use the token IDs from the API to optimize the balance check
+                    // Pass null for fungible tokens to use defaults, and specific intents tokens from API
                     const balanceChange = await getBalanceChangesAtBlock(
                         accountId, 
                         txBlock.blockHeight,
-                        null, // Don't check fungible tokens
+                        null, // Use default fungible token contracts
                         txBlock.tokenIds // Check specific intents tokens (array may be empty)
                     );
                     

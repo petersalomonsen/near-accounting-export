@@ -163,18 +163,15 @@ export async function getAllIntentsTransactionBlocks(
 /**
  * Check if Intents Explorer API is available
  * The API is considered available if:
- * 1. An API key is set (higher rate limits), OR
- * 2. A custom API URL is configured
+ * A custom API URL is configured (API key is optional for authentication)
  * 
  * Note: The API may not be publicly available yet. When it becomes available,
  * set INTENTS_EXPLORER_API_URL environment variable to the correct endpoint.
  */
 export function isIntentsExplorerAvailable(): boolean {
-    // Check if API key is set or custom URL is configured
-    const hasApiKey = !!process.env.INTENTS_EXPLORER_API_KEY;
+    // Only report as available if URL is explicitly configured
+    // This prevents unnecessary API calls to non-existent endpoints
     const hasCustomUrl = !!process.env.INTENTS_EXPLORER_API_URL;
     
-    // Only report as available if explicitly configured
-    // This prevents unnecessary API calls to non-existent endpoints
-    return hasApiKey || hasCustomUrl;
+    return hasCustomUrl;
 }
