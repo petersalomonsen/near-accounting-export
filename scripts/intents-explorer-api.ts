@@ -15,7 +15,7 @@ function getIntentsHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
         'Accept': 'application/json'
     };
-    const apiKey = process.env.NEAR_ONECLICK_API_EXPLORER_API_KEY;
+    const apiKey = process.env.INTENTS_EXPLORER_API_KEY;
     if (apiKey) {
         headers['Authorization'] = `Bearer ${apiKey}`;
     }
@@ -165,8 +165,8 @@ export async function fetchIntentsTransactions(
         statuses?: string;        // Comma-separated: FAILED,INCOMPLETE_DEPOSIT,PENDING_DEPOSIT,PROCESSING,REFUNDED,SUCCESS
     } = {}
 ): Promise<IntentsExplorerPaginatedResponse> {
-    if (!process.env.NEAR_ONECLICK_API_EXPLORER_API_KEY) {
-        throw new Error('NEAR_ONECLICK_API_EXPLORER_API_KEY is not configured. Obtain a JWT token from https://docs.google.com/forms/d/e/1FAIpQLSdrSrqSkKOMb_a8XhwF0f7N5xZ0Y5CYgyzxiAuoC2g4a2N68g/viewform');
+    if (!process.env.INTENTS_EXPLORER_API_KEY) {
+        throw new Error('INTENTS_EXPLORER_API_KEY is not configured. Obtain a JWT token from https://docs.google.com/forms/d/e/1FAIpQLSdrSrqSkKOMb_a8XhwF0f7N5xZ0Y5CYgyzxiAuoC2g4a2N68g/viewform');
     }
     
     const { 
@@ -200,7 +200,7 @@ export async function fetchIntentsTransactions(
     const response = await fetch(url, { headers: getIntentsHeaders() });
     
     if (response.status === 401) {
-        throw new Error('Intents Explorer API authentication failed. Check your NEAR_ONECLICK_API_EXPLORER_API_KEY.');
+        throw new Error('Intents Explorer API authentication failed. Check your INTENTS_EXPLORER_API_KEY.');
     }
     if (response.status === 429) {
         throw new Error('Intents Explorer API rate limit exceeded. Wait 5 seconds between requests.');
@@ -329,5 +329,5 @@ export async function getAllIntentsTransactionBlocks(
  * The API requires a JWT token obtained via application form
  */
 export function isIntentsExplorerAvailable(): boolean {
-    return !!process.env.NEAR_ONECLICK_API_EXPLORER_API_KEY;
+    return !!process.env.INTENTS_EXPLORER_API_KEY;
 }

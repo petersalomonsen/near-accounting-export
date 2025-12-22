@@ -8,7 +8,7 @@ import {
 describe('Intents Explorer API', () => {
     describe('isIntentsExplorerAvailable', () => {
         // The actual env var used by the module
-        const ENV_VAR = 'NEAR_ONECLICK_API_EXPLORER_API_KEY';
+        const ENV_VAR = 'INTENTS_EXPLORER_API_KEY';
         let originalApiKey: string | undefined;
         let hadOriginalKey: boolean;
 
