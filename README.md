@@ -146,9 +146,15 @@ The script automatically:
 | `NEAR_RPC_ENDPOINT` | RPC endpoint URL | `https://archival-rpc.mainnet.fastnear.com` |
 | `FASTNEAR_API_KEY` | FastNEAR API key for higher rate limits | None |
 | `NEARBLOCKS_API_KEY` | NearBlocks API key for faster transaction discovery | None |
+| `INTENTS_EXPLORER_API_KEY` | NEAR Intents Explorer API JWT token for 1Click Swap transaction discovery | None |
+| `INTENTS_EXPLORER_API_URL` | Custom Intents Explorer API URL | `https://explorer.near-intents.org` |
+| `INTENTS_EXPLORER_DELAY_MS` | Delay between Intents Explorer API calls | `5100` (5.1s rate limit) |
 | `RPC_DELAY_MS` | Delay between RPC calls in ms | `50` |
 
-**Note:** When `NEARBLOCKS_API_KEY` is set, the script will first fetch known transaction blocks from the NearBlocks API, which is much faster than binary search. It then falls back to binary search for any remaining transactions or if the API is unavailable.
+**Note:** 
+- When `NEARBLOCKS_API_KEY` is set, the script will first fetch known transaction blocks from the NearBlocks API, which is much faster than binary search.
+- When `INTENTS_EXPLORER_API_KEY` is set, the script will also fetch 1Click Swap transactions from the NEAR Intents Explorer API. This is useful for accounts with intents/swap activity. [Obtain an API key here](https://docs.google.com/forms/d/e/1FAIpQLSdrSrqSkKOMb_a8XhwF0f7N5xZ0Y5CYgyzxiAuoC2g4a2N68g/viewform).
+- The script falls back to binary search for any remaining transactions or if APIs are unavailable.
 
 ## Output Format
 

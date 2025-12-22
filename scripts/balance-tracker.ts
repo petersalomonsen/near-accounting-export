@@ -589,10 +589,17 @@ export async function findLatestBalanceChangingBlock(
     lastBlock: number,
     tokenContracts: string[] | null | undefined = undefined,
     intentsTokens: string[] | null | undefined = undefined,
-    checkNear = true
+    checkNear = true,
+    depth = 0
 ): Promise<BalanceChanges> {
     if (getStopSignal()) {
         throw new Error('Operation cancelled by user');
+    }
+
+    // Show progress during binary search
+    const rangeSize = lastBlock - firstBlock;
+    if (depth === 0 || rangeSize > 100000) {
+        process.stdout.write(`\r  Binary search: blocks ${firstBlock.toLocaleString()} - ${lastBlock.toLocaleString()} (range: ${rangeSize.toLocaleString()})   `);
     }
 
     // Note: stakingPools not included in binary search - staking rewards are tracked at epoch boundaries
@@ -602,6 +609,7 @@ export async function findLatestBalanceChangingBlock(
     const detectedChanges = detectBalanceChanges(startBalance, endBalance);
 
     if (!detectedChanges.hasChanges) {
+        if (depth === 0) console.log(''); // New line after progress
         return {
             hasChanges: false,
             block: lastBlock,
@@ -665,10 +673,12 @@ export async function findLatestBalanceChangingBlock(
         lastBlock,
         changedTokens.length > 0 ? changedTokens : null,
         changedIntentsTokens.length > 0 ? changedIntentsTokens : null,
-        detectedChanges.nearChanged
+        detectedChanges.nearChanged,
+        depth + 1
     );
 
     if (lastHalfChanges.hasChanges) {
+        if (depth === 0) console.log(''); // New line after progress
         return lastHalfChanges;
     } else {
         return await findLatestBalanceChangingBlock(
@@ -677,7 +687,8 @@ export async function findLatestBalanceChangingBlock(
             middleBlock,
             changedTokens.length > 0 ? changedTokens : null,
             changedIntentsTokens.length > 0 ? changedIntentsTokens : null,
-            detectedChanges.nearChanged
+            detectedChanges.nearChanged,
+            depth + 1
         );
     }
 }
