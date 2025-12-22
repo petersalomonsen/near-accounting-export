@@ -3,11 +3,11 @@ node_modules/
 
 # Test output
 test/test-output.json
-test-data/
 *.json
 !package.json
 !package-lock.json
 !tsconfig*.json
+!test-data/*.json
 
 # Data exports
 data/

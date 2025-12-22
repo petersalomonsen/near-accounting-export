@@ -1,0 +1,434 @@
+{
+  "txns": [
+    {
+      "id": "21093161893",
+      "receipt_id": "9ytX5KhHEQqZcYgMRDKCEqBWacuPhVyKaWKfVoTHHNCi",
+      "predecessor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receiver_account_id": "petersalomonsen.near",
+      "receipt_kind": "ACTION",
+      "receipt_block": {
+        "block_hash": "HwqvbZnAjtdcovYT5pCDRBMg27syEYujcTv5B3X9yFmA",
+        "block_height": 171108232,
+        "block_timestamp": 1762205351554046700
+      },
+      "receipt_outcome": {
+        "gas_burnt": 223182562500,
+        "tokens_burnt": 22318256250000000000,
+        "executor_account_id": "petersalomonsen.near",
+        "status": true
+      },
+      "transaction_hash": "DbxaQeD2PK2R3eGj7yf78wMVfpcxxLmhMghavGPBvmQz",
+      "included_in_block_hash": "8Ym23Sjuq5jWXzWB36MYMz4MopKfgXbafZojzvVtCYTp",
+      "block_timestamp": "1762205349191215698",
+      "block": {
+        "block_height": 171108228
+      },
+      "receipt_conversion_tokens_burnt": "32927875317500000000",
+      "actions": [
+        {
+          "action": "TRANSFER",
+          "method": null,
+          "deposit": 1E+23,
+          "fee": 22318256250000000000,
+          "args": null
+        }
+      ],
+      "actions_agg": {
+        "deposit": 0
+      },
+      "outcomes": {
+        "status": true
+      },
+      "outcomes_agg": {
+        "transaction_fee": 1.2312100686687E+21
+      }
+    },
+    {
+      "id": "21093161400",
+      "receipt_id": "6bqKjx8UVTzJZ5WgrQVikL4jZ23CRTgqJjFCLVSCdtBU",
+      "predecessor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receiver_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receipt_kind": "ACTION",
+      "receipt_block": {
+        "block_hash": "5yaMyWtm2E2uCyvUxW37FJeDtXve5Hgm4PUgZNgTfSm5",
+        "block_height": 171108230,
+        "block_timestamp": 1762205350446089700
+      },
+      "receipt_outcome": {
+        "gas_burnt": 3041036098056,
+        "tokens_burnt": 304103609805600000000,
+        "executor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+        "status": true
+      },
+      "transaction_hash": "DbxaQeD2PK2R3eGj7yf78wMVfpcxxLmhMghavGPBvmQz",
+      "included_in_block_hash": "8Ym23Sjuq5jWXzWB36MYMz4MopKfgXbafZojzvVtCYTp",
+      "block_timestamp": "1762205349191215698",
+      "block": {
+        "block_height": 171108228
+      },
+      "receipt_conversion_tokens_burnt": "32927875317500000000",
+      "actions": [
+        {
+          "action": "FUNCTION_CALL",
+          "method": "on_proposal_callback",
+          "deposit": 0,
+          "fee": 304103609805600000000,
+          "args": "{\"proposal_id\": 43}"
+        }
+      ],
+      "actions_agg": {
+        "deposit": 0
+      },
+      "outcomes": {
+        "status": true
+      },
+      "outcomes_agg": {
+        "transaction_fee": 1.2312100686687E+21
+      }
+    },
+    {
+      "id": "21093161399",
+      "receipt_id": "2cz84C29mYvABcqkUXXnnEa8PNjq9t8JtP4AsYia8ae1",
+      "predecessor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receiver_account_id": "intents.near",
+      "receipt_kind": "ACTION",
+      "receipt_block": {
+        "block_hash": "5yaMyWtm2E2uCyvUxW37FJeDtXve5Hgm4PUgZNgTfSm5",
+        "block_height": 171108230,
+        "block_timestamp": 1762205350446089700
+      },
+      "receipt_outcome": {
+        "gas_burnt": 4906690556474,
+        "tokens_burnt": 490669055647400000000,
+        "executor_account_id": "intents.near",
+        "status": true
+      },
+      "transaction_hash": "DbxaQeD2PK2R3eGj7yf78wMVfpcxxLmhMghavGPBvmQz",
+      "included_in_block_hash": "8Ym23Sjuq5jWXzWB36MYMz4MopKfgXbafZojzvVtCYTp",
+      "block_timestamp": "1762205349191215698",
+      "block": {
+        "block_height": 171108228
+      },
+      "receipt_conversion_tokens_burnt": "32927875317500000000",
+      "actions": [
+        {
+          "action": "FUNCTION_CALL",
+          "method": "mt_transfer",
+          "deposit": 1,
+          "fee": 490669055647400000000,
+          "args": "{\"amount\": \"10000000\", \"token_id\": \"nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1\", \"receiver_id\": \"2328784595e1950dfc2eeb3004030b2c8e61e64b5aae5f63e68b14016b3ce1e6\"}"
+        }
+      ],
+      "actions_agg": {
+        "deposit": 0
+      },
+      "outcomes": {
+        "status": true
+      },
+      "outcomes_agg": {
+        "transaction_fee": 1.2312100686687E+21
+      }
+    },
+    {
+      "id": "21093161202",
+      "receipt_id": "3HomN6ewxCfWYDvrvPmkXYT9W4iVkaqTwxFUYmWeyHMa",
+      "predecessor_account_id": "petersalomonsen.near",
+      "receiver_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receipt_kind": "ACTION",
+      "receipt_block": {
+        "block_hash": "32qyZVDUPoFaKBAgVL8P5up5GRG3fAaUabYSrCUQ7Bfc",
+        "block_height": 171108229,
+        "block_timestamp": 1762205349720700200
+      },
+      "receipt_outcome": {
+        "gas_burnt": 3811912716482,
+        "tokens_burnt": 381191271648200000000,
+        "executor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+        "status": true
+      },
+      "transaction_hash": "DbxaQeD2PK2R3eGj7yf78wMVfpcxxLmhMghavGPBvmQz",
+      "included_in_block_hash": "8Ym23Sjuq5jWXzWB36MYMz4MopKfgXbafZojzvVtCYTp",
+      "block_timestamp": "1762205349191215698",
+      "block": {
+        "block_height": 171108228
+      },
+      "receipt_conversion_tokens_burnt": "32927875317500000000",
+      "actions": [
+        {
+          "action": "FUNCTION_CALL",
+          "method": "act_proposal",
+          "deposit": 0,
+          "fee": 381191271648200000000,
+          "args": "{\"id\": 43, \"action\": \"VoteApprove\", \"proposal\": {\"FunctionCall\": {\"actions\": [{\"gas\": \"100000000000000\", \"args\": \"eyJyZWNlaXZlcl9pZCI6IjIzMjg3ODQ1OTVlMTk1MGRmYzJlZWIzMDA0MDMwYjJjOGU2MWU2NGI1YWFlNWY2M2U2OGIxNDAxNmIzY2UxZTYiLCJhbW91bnQiOiIxMDAwMDAwMCIsInRva2VuX2lkIjoibmVwMTQxOjE3MjA4NjI4Zjg0ZjVkNmFkMzNmMGRhM2JiYmViMjdmZmNiMzk4ZWFjNTAxYTMxYmQ2YWQyMDExZTM2MTMzYTEifQ==\", \"deposit\": \"1\", \"method_name\": \"mt_transfer\"}], \"receiver_id\": \"intents.near\"}}}"
+        }
+      ],
+      "actions_agg": {
+        "deposit": 0
+      },
+      "outcomes": {
+        "status": true
+      },
+      "outcomes_agg": {
+        "transaction_fee": 1.2312100686687E+21
+      }
+    },
+    {
+      "id": "21093135261",
+      "receipt_id": "Dr2d2aWn3B1AXbaPy7weFh4ALq17kRaCRwUcKi7GqTZ9",
+      "predecessor_account_id": "petersalomonsen.near",
+      "receiver_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receipt_kind": "ACTION",
+      "receipt_block": {
+        "block_hash": "5qqPS4bk28dxcTRg1yu8q2kWZSgnZ6vTUQTan2YJHJWQ",
+        "block_height": 171108063,
+        "block_timestamp": 1762205246722711300
+      },
+      "receipt_outcome": {
+        "gas_burnt": 2774239102947,
+        "tokens_burnt": 277423910294700000000,
+        "executor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+        "status": true
+      },
+      "transaction_hash": "Avg3Ac4YbwbjErotiGmJkoG5D1xyv8gMNuayZHHcb8dL",
+      "included_in_block_hash": "6CPGQZVw5f8dwN7YF3vqmmeCkSuuNgRSZPo32d8NMAbd",
+      "block_timestamp": "1762205246116830273",
+      "block": {
+        "block_height": 171108062
+      },
+      "receipt_conversion_tokens_burnt": "35750751245500000000",
+      "actions": [
+        {
+          "action": "FUNCTION_CALL",
+          "method": "add_proposal",
+          "deposit": 1E+23,
+          "fee": 277423910294700000000,
+          "args": "{\"proposal\": {\"kind\": {\"FunctionCall\": {\"actions\": [{\"gas\": \"100000000000000\", \"args\": \"eyJyZWNlaXZlcl9pZCI6IjIzMjg3ODQ1OTVlMTk1MGRmYzJlZWIzMDA0MDMwYjJjOGU2MWU2NGI1YWFlNWY2M2U2OGIxNDAxNmIzY2UxZTYiLCJhbW91bnQiOiIxMDAwMDAwMCIsInRva2VuX2lkIjoibmVwMTQxOjE3MjA4NjI4Zjg0ZjVkNmFkMzNmMGRhM2JiYmViMjdmZmNiMzk4ZWFjNTAxYTMxYmQ2YWQyMDExZTM2MTMzYTEifQ==\", \"deposit\": \"1\", \"method_name\": \"mt_transfer\"}], \"receiver_id\": \"intents.near\"}}, \"description\": \"* Proposal Action: asset-exchange <br>* Notes: **Must be executed before 2025-11-04T21:27:14.234Z** for transferring tokens to 1Click\\\\\\\\\\\\'s deposit address for swap execution. <br>* Token In: USDC <br>* Token Out: USDC <br>* Amount In: 10.0 <br>* Amount Out: 9.99998 <br>* Slippage: 1 <br>* Quote Deadline: 2025-11-04T21:27:14.234Z <br>* Destination Network: eth:8453 <br>* Time Estimate: 10 seconds <br>* Deposit Address: 2328784595e1950dfc2eeb3004030b2c8e61e64b5aae5f63e68b14016b3ce1e6 <br>* Signature: ed25519:4VsszFhiX1ZX8PhDUETCbY4LtN9VcbZpP6xtTdaYEXjwMLngzG7jimdifftkQGUFCiNauRqgf6KFCYFt3kmYqZbh\"}}"
+        }
+      ],
+      "actions_agg": {
+        "deposit": 1E+23
+      },
+      "outcomes": {
+        "status": true
+      },
+      "outcomes_agg": {
+        "transaction_fee": 313174661540200000000
+      }
+    },
+    {
+      "id": "21092105007",
+      "receipt_id": "HHi1P8EjEBYFC2KsmNcZVhCT7rcBuLvrS6Zpf7jkSLvF",
+      "predecessor_account_id": "system",
+      "receiver_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receipt_kind": "ACTION",
+      "receipt_block": {
+        "block_hash": "EyS1F3dNgKFbqhpg5W3A9VkehWtdjiHt95w2mRLGNLd3",
+        "block_height": 171101191,
+        "block_timestamp": 1762201097414581800
+      },
+      "receipt_outcome": {
+        "gas_burnt": 223182562500,
+        "tokens_burnt": 0,
+        "executor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+        "status": true
+      },
+      "transaction_hash": "DZfUf4r66s6xwgAx5hWZDWfdC1rfin71PVJmNkJ2c3do",
+      "included_in_block_hash": "4QKj8CyX9ufm4qr9Vw54rZ5wo4hi1Xuhr739L1nFyXYQ",
+      "block_timestamp": "1762201095514019386",
+      "block": {
+        "block_height": 171101188
+      },
+      "receipt_conversion_tokens_burnt": "32374744223500000000",
+      "actions": [
+        {
+          "action": "TRANSFER",
+          "method": null,
+          "deposit": 1,
+          "fee": 0,
+          "args": null
+        }
+      ],
+      "actions_agg": {
+        "deposit": 0
+      },
+      "outcomes": {
+        "status": true
+      },
+      "outcomes_agg": {
+        "transaction_fee": 887638427132100000000
+      }
+    },
+    {
+      "id": "21092104967",
+      "receipt_id": "E6GP2yxRCwLDnjsPdtxQNcYZHTYVinjg8Dj65rDkmZLg",
+      "predecessor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receiver_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receipt_kind": "ACTION",
+      "receipt_block": {
+        "block_hash": "DXqxxJ8pgcRE6w6gWaZXeZ1ots6qFx9Ap93GggDsPJd2",
+        "block_height": 171101190,
+        "block_timestamp": 1762201096706664000
+      },
+      "receipt_outcome": {
+        "gas_burnt": 2387494130733,
+        "tokens_burnt": 238749413073300000000,
+        "executor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+        "status": true
+      },
+      "transaction_hash": "DZfUf4r66s6xwgAx5hWZDWfdC1rfin71PVJmNkJ2c3do",
+      "included_in_block_hash": "4QKj8CyX9ufm4qr9Vw54rZ5wo4hi1Xuhr739L1nFyXYQ",
+      "block_timestamp": "1762201095514019386",
+      "block": {
+        "block_height": 171101188
+      },
+      "receipt_conversion_tokens_burnt": "32374744223500000000",
+      "actions": [
+        {
+          "action": "FUNCTION_CALL",
+          "method": "on_proposal_callback",
+          "deposit": 0,
+          "fee": 238749413073300000000,
+          "args": "{\"proposal_id\": 42}"
+        }
+      ],
+      "actions_agg": {
+        "deposit": 0
+      },
+      "outcomes": {
+        "status": true
+      },
+      "outcomes_agg": {
+        "transaction_fee": 887638427132100000000
+      }
+    },
+    {
+      "id": "21092104966",
+      "receipt_id": "12p4qw81nRjBdWM63zTwoJ2wj3VMcdUNM3jcpD8huPnW",
+      "predecessor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receiver_account_id": "intents.near",
+      "receipt_kind": "ACTION",
+      "receipt_block": {
+        "block_hash": "DXqxxJ8pgcRE6w6gWaZXeZ1ots6qFx9Ap93GggDsPJd2",
+        "block_height": 171101190,
+        "block_timestamp": 1762201096706664000
+      },
+      "receipt_outcome": {
+        "gas_burnt": 2455487749036,
+        "tokens_burnt": 245548774903600000000,
+        "executor_account_id": "intents.near",
+        "status": false
+      },
+      "transaction_hash": "DZfUf4r66s6xwgAx5hWZDWfdC1rfin71PVJmNkJ2c3do",
+      "included_in_block_hash": "4QKj8CyX9ufm4qr9Vw54rZ5wo4hi1Xuhr739L1nFyXYQ",
+      "block_timestamp": "1762201095514019386",
+      "block": {
+        "block_height": 171101188
+      },
+      "receipt_conversion_tokens_burnt": "32374744223500000000",
+      "actions": [
+        {
+          "action": "FUNCTION_CALL",
+          "method": "mt_transfer",
+          "deposit": 1,
+          "fee": 245548774903600000000,
+          "args": "{\"amount\": \"20.0\", \"token_id\": \"nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1\"}"
+        }
+      ],
+      "actions_agg": {
+        "deposit": 0
+      },
+      "outcomes": {
+        "status": true
+      },
+      "outcomes_agg": {
+        "transaction_fee": 887638427132100000000
+      }
+    },
+    {
+      "id": "21092104861",
+      "receipt_id": "BVinkygYXLNaahG5rXTGiWzmomAg9k2jHXEfw7fE6Hcq",
+      "predecessor_account_id": "petersalomonsen.near",
+      "receiver_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receipt_kind": "ACTION",
+      "receipt_block": {
+        "block_hash": "3tJiSQRsbWH2mFuSRUzXMKqRU8YmVDaehQcPBKSt3Ye1",
+        "block_height": 171101189,
+        "block_timestamp": 1762201096113623000
+      },
+      "receipt_outcome": {
+        "gas_burnt": 3709654949317,
+        "tokens_burnt": 370965494931700000000,
+        "executor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+        "status": true
+      },
+      "transaction_hash": "DZfUf4r66s6xwgAx5hWZDWfdC1rfin71PVJmNkJ2c3do",
+      "included_in_block_hash": "4QKj8CyX9ufm4qr9Vw54rZ5wo4hi1Xuhr739L1nFyXYQ",
+      "block_timestamp": "1762201095514019386",
+      "block": {
+        "block_height": 171101188
+      },
+      "receipt_conversion_tokens_burnt": "32374744223500000000",
+      "actions": [
+        {
+          "action": "FUNCTION_CALL",
+          "method": "act_proposal",
+          "deposit": 0,
+          "fee": 370965494931700000000,
+          "args": "{\"id\": 42, \"action\": \"VoteApprove\", \"proposal\": {\"FunctionCall\": {\"actions\": [{\"gas\": \"100000000000000\", \"args\": \"eyJhbW91bnQiOiIyMC4wIiwidG9rZW5faWQiOiJuZXAxNDE6MTcyMDg2MjhmODRmNWQ2YWQzM2YwZGEzYmJiZWIyN2ZmY2IzOThlYWM1MDFhMzFiZDZhZDIwMTFlMzYxMzNhMSJ9\", \"deposit\": \"1\", \"method_name\": \"mt_transfer\"}], \"receiver_id\": \"intents.near\"}}}"
+        }
+      ],
+      "actions_agg": {
+        "deposit": 0
+      },
+      "outcomes": {
+        "status": true
+      },
+      "outcomes_agg": {
+        "transaction_fee": 887638427132100000000
+      }
+    },
+    {
+      "id": "21092097315",
+      "receipt_id": "GsDRm8YgQKHcvW3UNJCR6rXUx11wGFsHfaWXKC5yKPZQ",
+      "predecessor_account_id": "petersalomonsen.near",
+      "receiver_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+      "receipt_kind": "ACTION",
+      "receipt_block": {
+        "block_hash": "2owxEdzuNYq35PftyUGzX9XgktXyutkY715mNgb8wTei",
+        "block_height": 171101057,
+        "block_timestamp": 1762201018101017600
+      },
+      "receipt_outcome": {
+        "gas_burnt": 2758222833323,
+        "tokens_burnt": 275822283332300000000,
+        "executor_account_id": "webassemblymusic-treasury.sputnik-dao.near",
+        "status": true
+      },
+      "transaction_hash": "GTfgrPuFgeEEjoMJWFiaWwckkkW7C55cUweyNn4uEcTa",
+      "included_in_block_hash": "6S2fs7ytbKn9zky2gbCWbDZvXL7U3SqE1HVTPHSFfyjg",
+      "block_timestamp": "1762201017585544420",
+      "block": {
+        "block_height": 171101056
+      },
+      "receipt_conversion_tokens_burnt": "35188083408500000000",
+      "actions": [
+        {
+          "action": "FUNCTION_CALL",
+          "method": "add_proposal",
+          "deposit": 1E+23,
+          "fee": 275822283332300000000,
+          "args": "{\"proposal\": {\"kind\": {\"FunctionCall\": {\"actions\": [{\"gas\": \"100000000000000\", \"args\": \"eyJhbW91bnQiOiIyMC4wIiwidG9rZW5faWQiOiJuZXAxNDE6MTcyMDg2MjhmODRmNWQ2YWQzM2YwZGEzYmJiZWIyN2ZmY2IzOThlYWM1MDFhMzFiZDZhZDIwMTFlMzYxMzNhMSJ9\", \"deposit\": \"1\", \"method_name\": \"mt_transfer\"}], \"receiver_id\": \"intents.near\"}}, \"description\": \"* Proposal Action: asset-exchange <br>* Notes: **Must be executed before 2025-11-04T20:16:25.079Z** for transferring tokens to 1Click\\\\\\\\\\\\'s deposit address for swap execution. <br>* Token In: USDC <br>* Token Out: USDC <br>* Amount In: 20.0 <br>* Amount Out: 19.99996 <br>* Slippage: 1 <br>* Quote Deadline: 2025-11-04T20:16:25.079Z <br>* Destination Network: eth:1 <br>* Time Estimate: 10 seconds <br>* Deposit Address: fc9c66f6221e8b005ee5cb77d37bdaa1ef16b3f6467d5c3a2ab0f4a54a4ceaef <br>* Signature: ed25519:5qxFqGeNA9Ce1Aew6GWTn2ff4pLNxsSt5aFbL3FwoEBeCYfP4ct1Y1utVeGLv8YgduPq9FArG98H3MkMqzFR3Uwn\"}}"
+        }
+      ],
+      "actions_agg": {
+        "deposit": 1E+23
+      },
+      "outcomes": {
+        "status": true
+      },
+      "outcomes_agg": {
+        "transaction_fee": 311010366740800000000
+      }
+    }
+  ]
+}

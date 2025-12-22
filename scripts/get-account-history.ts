@@ -30,8 +30,13 @@ import {
     getAllTransactionBlocks,
     isNearBlocksAvailable
 } from './nearblocks-api.js';
+import {
+    getAllIntentsTransactionBlocks,
+    isIntentsExplorerAvailable
+} from './intents-explorer-api.js';
 import type { BalanceSnapshot, BalanceChanges, TransactionInfo, TransferDetail, StakingBalanceChange } from './balance-tracker.js';
 import type { TransactionBlock } from './nearblocks-api.js';
+import type { IntentsTransactionBlock } from './intents-explorer-api.js';
 
 // Types
 interface VerificationError {
@@ -1236,6 +1241,182 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             }
         } catch (error: any) {
             console.warn(`NearBlocks API error: ${error.message}`);
+            console.log('Continuing to Intents Explorer or binary search...');
+        }
+    }
+    
+    // Try using Intents Explorer API for intents transactions (1Click Swap)
+    // This API provides faster discovery of swap transactions
+    const remainingAfterNearBlocks = maxTransactions - transactionsFound;
+    if (remainingAfterNearBlocks > 0 && !getStopSignal() && isIntentsExplorerAvailable()) {
+        console.log(`\nUsing Intents Explorer API for intents transaction discovery...`);
+        
+        try {
+            // Get known intents transaction blocks from Intents Explorer
+            const intentsBlocks = await getAllIntentsTransactionBlocks(accountId, {
+                afterBlock: searchStart,
+                beforeBlock: searchEnd,
+                maxPages: Math.ceil(remainingAfterNearBlocks / 25) + 2
+            });
+            
+            // Filter to blocks we haven't processed yet AND within our search range
+            // Filter to blocks we haven't processed yet AND within our search range
+            // Note: searchStart/searchEnd may be swapped in backward mode, so use min/max
+            const existingBlocks = new Set(history.transactions.map(t => t.block));
+            const rangeMin = Math.min(searchStart, searchEnd);
+            const rangeMax = Math.max(searchStart, searchEnd);
+            const newIntentsBlocks = intentsBlocks.filter(b => 
+                !existingBlocks.has(b.blockHeight) &&
+                b.blockHeight >= rangeMin &&
+                b.blockHeight <= rangeMax
+            );
+            
+            // Sort by block height based on direction
+            if (direction === 'backward') {
+                newIntentsBlocks.sort((a, b) => b.blockHeight - a.blockHeight);
+            } else {
+                newIntentsBlocks.sort((a, b) => a.blockHeight - b.blockHeight);
+            }
+            
+            console.log(`Found ${newIntentsBlocks.length} new intents transaction blocks to process`);
+            
+            // Process each known intents transaction block
+            for (const txBlock of newIntentsBlocks) {
+                if (getStopSignal()) {
+                    console.log('Stop signal received, saving progress...');
+                    history.updatedAt = new Date().toISOString();
+                    saveHistory(outputFile, history);
+                    console.log(`Progress saved to ${outputFile}`);
+                    break;
+                }
+                
+                if (transactionsFound >= maxTransactions) {
+                    break;
+                }
+                
+                // Clear cache periodically to avoid memory issues
+                if (transactionsFound % 10 === 0) {
+                    clearBalanceCache();
+                }
+                
+                try {
+                    // Get balance changes at this specific block
+                    // For intents transactions, include the tokens from the API response
+                    // so we can track even tokens we don't normally monitor
+                    const intentsTokensToCheck = txBlock.tokenIds.length > 0 ? txBlock.tokenIds : undefined;
+                    const balanceChange = await getBalanceChangesAtBlock(
+                        accountId, 
+                        txBlock.blockHeight,
+                        undefined,  // tokenContracts - use defaults from main tracking
+                        intentsTokensToCheck,  // intentsTokens - include tokens from API response
+                        undefined   // stakingPools - use defaults
+                    );
+                    
+                    if (!balanceChange.hasChanges) {
+                        // For intents transactions, we still want to record them even if no
+                        // tracked balance changes were detected (the swap itself is meaningful)
+                        console.log(`  Block ${txBlock.blockHeight} - no tracked balance changes, but recording intents transaction`);
+                    }
+                    
+                    // Find the transaction details
+                    const txInfo = await findBalanceChangingTransaction(accountId, txBlock.blockHeight);
+                    
+                    // Create transaction entry
+                    const entry: TransactionEntry = {
+                        block: txBlock.blockHeight,
+                        transactionBlock: txInfo.transactionBlock,
+                        timestamp: txInfo.blockTimestamp,
+                        transactionHashes: txInfo.transactionHashes,
+                        transactions: txInfo.transactions,
+                        transfers: txInfo.transfers,
+                        balanceBefore: balanceChange.startBalance,
+                        balanceAfter: balanceChange.endBalance,
+                        changes: {
+                            nearChanged: balanceChange.nearChanged,
+                            nearDiff: balanceChange.nearDiff,
+                            tokensChanged: balanceChange.tokensChanged,
+                            intentsChanged: balanceChange.intentsChanged
+                        }
+                    };
+                    
+                    // Verify connectivity with adjacent transactions
+                    if (direction === 'backward' && history.transactions.length > 0) {
+                        const nextTransaction = history.transactions[0];
+                        if (nextTransaction) {
+                            const verification = verifyTransactionConnectivity(nextTransaction, entry);
+                            entry.verificationWithNext = verification;
+                            
+                            if (!verification.valid) {
+                                console.warn(`Warning: Connectivity issue detected at block ${txBlock.blockHeight}`);
+                                verification.errors.forEach(err => console.warn(`  - ${err.message}`));
+                            }
+                        }
+                    } else if (direction === 'forward' && history.transactions.length > 0) {
+                        const prevTransaction = history.transactions[history.transactions.length - 1];
+                        if (prevTransaction) {
+                            const verification = verifyTransactionConnectivity(entry, prevTransaction);
+                            entry.verificationWithPrevious = verification;
+                            
+                            if (!verification.valid) {
+                                console.warn(`Warning: Connectivity issue detected at block ${txBlock.blockHeight}`);
+                                verification.errors.forEach(err => console.warn(`  - ${err.message}`));
+                            }
+                        }
+                    }
+                    
+                    // Add to history in correct order
+                    if (direction === 'backward') {
+                        history.transactions.unshift(entry);
+                    } else {
+                        history.transactions.push(entry);
+                    }
+                    
+                    transactionsFound++;
+                    console.log(`Transaction ${transactionsFound}/${maxTransactions} added at block ${txBlock.blockHeight} (Intents Explorer)`);
+                    
+                    // Update metadata
+                    const allBlocks = history.transactions.map(t => t.block);
+                    history.metadata.firstBlock = Math.min(...allBlocks);
+                    history.metadata.lastBlock = Math.max(...allBlocks);
+                    history.metadata.totalTransactions = history.transactions.length;
+                    history.updatedAt = new Date().toISOString();
+                    
+                    // Save progress periodically
+                    if (transactionsFound % 5 === 0) {
+                        saveHistory(outputFile, history);
+                        console.log(`Progress saved to ${outputFile}`);
+                    }
+                } catch (error: any) {
+                    if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                        console.log(`Error during Intents Explorer processing: ${error.message}`);
+                        console.log('Stopping and saving progress...');
+                        history.updatedAt = new Date().toISOString();
+                        saveHistory(outputFile, history);
+                        console.log(`Progress saved to ${outputFile}`);
+                        break;
+                    }
+                    console.warn(`Error processing intents block ${txBlock.blockHeight}: ${error.message}`);
+                    // Continue with next block
+                }
+            }
+            
+            // Final save after Intents Explorer processing
+            if (transactionsFound > 0) {
+                saveHistory(outputFile, history);
+                console.log(`\nIntents Explorer API processing complete. Found ${transactionsFound} total transactions.`);
+            }
+            
+            // If we found enough transactions, we're done
+            if (transactionsFound >= maxTransactions) {
+                saveHistory(outputFile, history);
+                console.log(`\n=== Export complete ===`);
+                console.log(`Total transactions: ${history.metadata.totalTransactions}`);
+                console.log(`Block range: ${history.metadata.firstBlock} - ${history.metadata.lastBlock}`);
+                console.log(`Output saved to: ${outputFile}`);
+                return history;
+            }
+        } catch (error: any) {
+            console.warn(`Intents Explorer API error: ${error.message}`);
             console.log('Falling back to binary search...');
         }
     }

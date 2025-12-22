@@ -67,23 +67,28 @@ Built files are output to the `dist/` directory.
   - **Note**: The old rpc.mainnet.near.org endpoint is deprecated and returns error -429. Use fastnear.com or alternative providers from https://docs.near.org/api/rpc/providers
 - `FASTNEAR_API_KEY` - FastNEAR API key for higher rate limits (optional). When set, adds `Authorization: Bearer <key>` header to all RPC requests
 - `NEARBLOCKS_API_KEY` - NearBlocks API key for faster transaction discovery (optional). When set, fetches known transaction blocks from NearBlocks API before falling back to binary search
+- `INTENTS_EXPLORER_API_KEY` - NEAR Intents Explorer API JWT token for 1Click Swap transaction discovery (optional). When set, fetches swap transactions from the Intents Explorer API. [Obtain token here](https://docs.google.com/forms/d/e/1FAIpQLSdrSrqSkKOMb_a8XhwF0f7N5xZ0Y5CYgyzxiAuoC2g4a2N68g/viewform)
+- `INTENTS_EXPLORER_API_URL` - Custom Intents Explorer API URL (default: https://explorer.near-intents.org)
+- `INTENTS_EXPLORER_DELAY_MS` - Delay between Intents Explorer API calls (default: 5100ms to respect rate limit)
 - `RPC_DELAY_MS` - Delay between RPC calls in milliseconds (default: 50)
 
 ## Key Conventions
 
 1. **Balance Verification**: Always verify that transactions are connected by checking that the balance after one transaction matches the balance before the next.
 
-2. **NearBlocks API**: When available, use the NearBlocks API to quickly discover known transaction blocks, then fetch balance changes only at those specific blocks.
+2. **NearBlocks API**: When available, use the NearBlocks API to quickly discover known transaction blocks (NEAR and FT), then fetch balance changes only at those specific blocks.
 
-3. **Binary Search**: Fall back to binary search to find balance-changing blocks efficiently when NearBlocks is not available or for intents transactions not indexed by NearBlocks.
+3. **Intents Explorer API**: When available, use the NEAR Intents Explorer API to discover 1Click Swap transactions. The API returns transaction hashes which are then resolved to block heights via NearBlocks. This is especially useful for accounts with swap activity.
 
-4. **Continuous Search**: When no balance changes are found in a range, automatically move to the adjacent range of equal size and continue searching until interrupted, rate limited, or endpoint becomes unresponsive.
+4. **Binary Search**: Fall back to binary search to find balance-changing blocks efficiently when APIs are not available or cannot fill balance gaps.
 
-5. **Error Handling**: Handle rate limiting and endpoint errors gracefully with a stop signal mechanism. Always save progress before stopping.
+5. **Continuous Search**: When no balance changes are found in a range, automatically move to the adjacent range of equal size and continue searching until interrupted, rate limited, or endpoint becomes unresponsive.
 
-5. **Progress Saving**: Save progress continuously - every 5 transactions and when moving to new search ranges - to ensure no data is lost on interruption.
+6. **Error Handling**: Handle rate limiting and endpoint errors gracefully with a stop signal mechanism. Always save progress before stopping.
 
-6. **BigInt for Balances**: Always use BigInt when comparing or calculating balance differences to avoid precision issues.
+7. **Progress Saving**: Save progress continuously - every 5 transactions and when moving to new search ranges - to ensure no data is lost on interruption.
+
+8. **BigInt for Balances**: Always use BigInt when comparing or calculating balance differences to avoid precision issues.
 
 ## Docker Usage
 
