@@ -70,6 +70,9 @@ Built files are output to the `dist/` directory.
 - `INTENTS_EXPLORER_API_KEY` - NEAR Intents Explorer API JWT token for 1Click Swap transaction discovery (optional). When set, fetches swap transactions from the Intents Explorer API. [Obtain token here](https://docs.google.com/forms/d/e/1FAIpQLSdrSrqSkKOMb_a8XhwF0f7N5xZ0Y5CYgyzxiAuoC2g4a2N68g/viewform)
 - `INTENTS_EXPLORER_API_URL` - Custom Intents Explorer API URL (default: https://explorer.near-intents.org)
 - `INTENTS_EXPLORER_DELAY_MS` - Delay between Intents Explorer API calls (default: 5100ms to respect rate limit)
+- `PIKESPEAK_API_KEY` - Pikespeak API key for comprehensive event history (optional). When set, fetches NEAR transfers, FT transfers, staking deposits, and DAO events from Pikespeak API. [Get API key here](https://pikespeak.ai/myaccount)
+- `PIKESPEAK_API_URL` - Custom Pikespeak API URL (default: https://api.pikespeak.ai)
+- `PIKESPEAK_DELAY_MS` - Delay between Pikespeak API calls (default: 100ms)
 - `RPC_DELAY_MS` - Delay between RPC calls in milliseconds (default: 50)
 
 ## Key Conventions
@@ -80,15 +83,17 @@ Built files are output to the `dist/` directory.
 
 3. **Intents Explorer API**: When available, use the NEAR Intents Explorer API to discover 1Click Swap transactions. The API returns transaction hashes which are then resolved to block heights via NearBlocks. This is especially useful for accounts with swap activity.
 
-4. **Binary Search**: Fall back to binary search to find balance-changing blocks efficiently when APIs are not available or cannot fill balance gaps.
+4. **Pikespeak API**: When available, use the Pikespeak API to fetch comprehensive event history including NEAR transfers, FT transfers, staking deposits, and DAO events. This provides additional coverage for transaction discovery.
 
-5. **Continuous Search**: When no balance changes are found in a range, automatically move to the adjacent range of equal size and continue searching until interrupted, rate limited, or endpoint becomes unresponsive.
+5. **Binary Search**: Fall back to binary search to find balance-changing blocks efficiently when APIs are not available or cannot fill balance gaps.
 
-6. **Error Handling**: Handle rate limiting and endpoint errors gracefully with a stop signal mechanism. Always save progress before stopping.
+6. **Continuous Search**: When no balance changes are found in a range, automatically move to the adjacent range of equal size and continue searching until interrupted, rate limited, or endpoint becomes unresponsive.
 
-7. **Progress Saving**: Save progress continuously - every 5 transactions and when moving to new search ranges - to ensure no data is lost on interruption.
+7. **Error Handling**: Handle rate limiting and endpoint errors gracefully with a stop signal mechanism. Always save progress before stopping.
 
-8. **BigInt for Balances**: Always use BigInt when comparing or calculating balance differences to avoid precision issues.
+8. **Progress Saving**: Save progress continuously - every 5 transactions and when moving to new search ranges - to ensure no data is lost on interruption.
+
+9. **BigInt for Balances**: Always use BigInt when comparing or calculating balance differences to avoid precision issues.
 
 ## Docker Usage
 

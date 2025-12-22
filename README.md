@@ -149,11 +149,15 @@ The script automatically:
 | `INTENTS_EXPLORER_API_KEY` | NEAR Intents Explorer API JWT token for 1Click Swap transaction discovery | None |
 | `INTENTS_EXPLORER_API_URL` | Custom Intents Explorer API URL | `https://explorer.near-intents.org` |
 | `INTENTS_EXPLORER_DELAY_MS` | Delay between Intents Explorer API calls | `5100` (5.1s rate limit) |
+| `PIKESPEAK_API_KEY` | Pikespeak API key for comprehensive event history | None |
+| `PIKESPEAK_API_URL` | Custom Pikespeak API URL | `https://api.pikespeak.ai` |
+| `PIKESPEAK_DELAY_MS` | Delay between Pikespeak API calls | `100` |
 | `RPC_DELAY_MS` | Delay between RPC calls in ms | `50` |
 
 **Note:** 
 - When `NEARBLOCKS_API_KEY` is set, the script will first fetch known transaction blocks from the NearBlocks API, which is much faster than binary search.
 - When `INTENTS_EXPLORER_API_KEY` is set, the script will also fetch 1Click Swap transactions from the NEAR Intents Explorer API. This is useful for accounts with intents/swap activity. [Obtain an API key here](https://docs.google.com/forms/d/e/1FAIpQLSdrSrqSkKOMb_a8XhwF0f7N5xZ0Y5CYgyzxiAuoC2g4a2N68g/viewform).
+- When `PIKESPEAK_API_KEY` is set, the script will fetch event history from Pikespeak API which includes NEAR transfers, FT transfers, staking deposits, and DAO events. [Get your API key here](https://pikespeak.ai/myaccount). [API documentation](https://doc.pikespeak.ai/).
 - The script falls back to binary search for any remaining transactions or if APIs are unavailable.
 
 ## Output Format

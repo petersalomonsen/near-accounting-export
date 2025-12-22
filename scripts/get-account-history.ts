@@ -34,9 +34,14 @@ import {
     getAllIntentsTransactionBlocks,
     isIntentsExplorerAvailable
 } from './intents-explorer-api.js';
+import {
+    getAllPikespeakTransactionBlocks,
+    isPikespeakAvailable
+} from './pikespeak-api.js';
 import type { BalanceSnapshot, BalanceChanges, TransactionInfo, TransferDetail, StakingBalanceChange } from './balance-tracker.js';
 import type { TransactionBlock } from './nearblocks-api.js';
 import type { IntentsTransactionBlock } from './intents-explorer-api.js';
+import type { PikespeakTransactionBlock } from './pikespeak-api.js';
 
 // Types
 interface VerificationError {
@@ -1096,8 +1101,8 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
     
     interface CombinedTransactionBlock {
         blockHeight: number;
-        source: 'nearblocks' | 'intents';
-        tokenIds?: string[];  // For intents transactions
+        source: 'nearblocks' | 'intents' | 'pikespeak';
+        tokenIds?: string[];  // For intents/pikespeak transactions
     }
     
     const allKnownBlocks: CombinedTransactionBlock[] = [];
@@ -1151,6 +1156,35 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             console.log(`  Found ${intentsBlocks.length} blocks from Intents Explorer (${newIntentsBlocks} new)`);
         } catch (error: any) {
             console.warn(`Intents Explorer API error: ${error.message}`);
+        }
+    }
+    
+    // Collect from Pikespeak API
+    if (isPikespeakAvailable()) {
+        console.log(`Fetching transaction blocks from Pikespeak API...`);
+        
+        try {
+            const pikespeakBlocks = await getAllPikespeakTransactionBlocks(accountId, {
+                maxEvents: maxTransactions * 5  // Events may include non-balance-changing ones
+            });
+            
+            let newPikespeakBlocks = 0;
+            for (const block of pikespeakBlocks) {
+                if (!seenBlockHeights.has(block.blockHeight)) {
+                    seenBlockHeights.add(block.blockHeight);
+                    // Pikespeak provides token info for FT transfers
+                    const tokenIds = block.token ? [block.token] : undefined;
+                    allKnownBlocks.push({
+                        blockHeight: block.blockHeight,
+                        source: 'pikespeak',
+                        tokenIds
+                    });
+                    newPikespeakBlocks++;
+                }
+            }
+            console.log(`  Found ${pikespeakBlocks.length} blocks from Pikespeak (${newPikespeakBlocks} new)`);
+        } catch (error: any) {
+            console.warn(`Pikespeak API error: ${error.message}`);
         }
     }
     
