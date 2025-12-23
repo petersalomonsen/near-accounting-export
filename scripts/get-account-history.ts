@@ -339,18 +339,92 @@ async function collectStakingRewards(
     // Find all staking balance changes at epoch boundaries for each pool's active range
     let allChanges: StakingBalanceChange[] = [];
     
+    // Build a map of existing staking data by block and pool
+    const existingStakingData = new Map<string, Set<string>>();
+    for (const tx of history.transactions) {
+        if (tx.balanceAfter?.stakingPools) {
+            for (const pool of Object.keys(tx.balanceAfter.stakingPools)) {
+                const key = `${tx.block}:${pool}`;
+                if (!existingStakingData.has(key)) {
+                    existingStakingData.set(key, new Set());
+                }
+                existingStakingData.get(key)!.add(pool);
+            }
+        }
+    }
+    
+    const EPOCH_LENGTH = 43200;
+    
     for (const range of activeRanges) {
         console.log(`\nChecking staking balance changes for ${range.pool}...`);
         console.log(`  Block range: ${range.startBlock} - ${range.endBlock}`);
         
-        const poolChanges = await findStakingBalanceChanges(
-            accountId,
-            range.startBlock,
-            range.endBlock,
-            [range.pool]
-        );
+        // Calculate which epoch boundaries need to be checked
+        const firstEpochBoundary = Math.ceil(range.startBlock / EPOCH_LENGTH) * EPOCH_LENGTH;
+        const epochBoundaries: number[] = [];
         
-        allChanges = allChanges.concat(poolChanges);
+        for (let block = firstEpochBoundary; block <= range.endBlock; block += EPOCH_LENGTH) {
+            const key = `${block}:${range.pool}`;
+            if (!existingStakingData.has(key)) {
+                epochBoundaries.push(block);
+            }
+        }
+        
+        // Also check the final block if it's not an epoch boundary
+        if (range.endBlock > firstEpochBoundary && range.endBlock % EPOCH_LENGTH !== 0) {
+            const key = `${range.endBlock}:${range.pool}`;
+            if (!existingStakingData.has(key)) {
+                epochBoundaries.push(range.endBlock);
+            }
+        }
+        
+        const totalEpochs = Math.ceil((range.endBlock - firstEpochBoundary) / EPOCH_LENGTH);
+        const alreadyChecked = totalEpochs - epochBoundaries.length;
+        if (alreadyChecked > 0) {
+            console.log(`  Skipping ${alreadyChecked} epoch(s) with existing staking data`);
+        }
+        
+        if (epochBoundaries.length === 0) {
+            console.log('  All epochs already have staking data');
+            continue;
+        }
+        
+        console.log(`  Checking ${epochBoundaries.length} epoch(s) without existing data`);
+        
+        // Manually check each epoch boundary that needs data
+        let prevBalances = await getStakingPoolBalances(accountId, range.startBlock, [range.pool]);
+        let prevBlock = range.startBlock;
+        
+        for (let i = 0; i < epochBoundaries.length; i++) {
+            if (getStopSignal()) {
+                throw new Error('Operation cancelled by user');
+            }
+            
+            const block = epochBoundaries[i];
+            if (block === undefined) {
+                continue;
+            }
+            
+            console.log(`    Checking epoch ${i + 1}/${epochBoundaries.length} at block ${block}...`);
+            
+            const currentBalances = await getStakingPoolBalances(accountId, block, [range.pool]);
+            
+            const prevBalance = BigInt(prevBalances[range.pool] || '0');
+            const currentBalance = BigInt(currentBalances[range.pool] || '0');
+            
+            if (prevBalance !== currentBalance) {
+                allChanges.push({
+                    block,
+                    pool: range.pool,
+                    startBalance: prevBalance.toString(),
+                    endBalance: currentBalance.toString(),
+                    diff: (currentBalance - prevBalance).toString()
+                });
+            }
+            
+            prevBalances = currentBalances;
+            prevBlock = block;
+        }
     }
     
     if (allChanges.length === 0) {
