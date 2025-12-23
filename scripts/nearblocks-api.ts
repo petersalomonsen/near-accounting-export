@@ -198,7 +198,9 @@ export async function getAllTransactionBlocks(
         maxPages?: number;
     } = {}
 ): Promise<TransactionBlock[]> {
-    const { afterBlock, beforeBlock, maxPages = 10 } = options;
+    const { afterBlock, beforeBlock } = options;
+    // If maxPages is undefined, use Infinity to fetch all pages
+    const maxPages = options.maxPages ?? Infinity;
     
     const blocks: TransactionBlock[] = [];
     const seenBlocks = new Set<number>();

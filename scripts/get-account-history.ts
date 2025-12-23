@@ -24,7 +24,8 @@ import {
     getBalanceChangesAtBlock,
     accountExistsAtBlock,
     getStakingPoolBalances,
-    findStakingBalanceChanges
+    findStakingBalanceChanges,
+    getAllBalances
 } from './balance-tracker.js';
 import {
     getAllTransactionBlocks,
@@ -34,9 +35,19 @@ import {
     getAllIntentsTransactionBlocks,
     isIntentsExplorerAvailable
 } from './intents-explorer-api.js';
+import {
+    getAllPikespeakTransactionBlocks,
+    isPikespeakAvailable
+} from './pikespeak-api.js';
+import {
+    detectGaps,
+    type Gap,
+    type GapAnalysis
+} from './gap-detection.js';
 import type { BalanceSnapshot, BalanceChanges, TransactionInfo, TransferDetail, StakingBalanceChange } from './balance-tracker.js';
 import type { TransactionBlock } from './nearblocks-api.js';
 import type { IntentsTransactionBlock } from './intents-explorer-api.js';
+import type { PikespeakTransactionBlock } from './pikespeak-api.js';
 
 // Types
 interface VerificationError {
@@ -328,18 +339,92 @@ async function collectStakingRewards(
     // Find all staking balance changes at epoch boundaries for each pool's active range
     let allChanges: StakingBalanceChange[] = [];
     
+    // Build a map of existing staking data by block and pool
+    const existingStakingData = new Map<string, Set<string>>();
+    for (const tx of history.transactions) {
+        if (tx.balanceAfter?.stakingPools) {
+            for (const pool of Object.keys(tx.balanceAfter.stakingPools)) {
+                const key = `${tx.block}:${pool}`;
+                if (!existingStakingData.has(key)) {
+                    existingStakingData.set(key, new Set());
+                }
+                existingStakingData.get(key)!.add(pool);
+            }
+        }
+    }
+    
+    const EPOCH_LENGTH = 43200;
+    
     for (const range of activeRanges) {
         console.log(`\nChecking staking balance changes for ${range.pool}...`);
         console.log(`  Block range: ${range.startBlock} - ${range.endBlock}`);
         
-        const poolChanges = await findStakingBalanceChanges(
-            accountId,
-            range.startBlock,
-            range.endBlock,
-            [range.pool]
-        );
+        // Calculate which epoch boundaries need to be checked
+        const firstEpochBoundary = Math.ceil(range.startBlock / EPOCH_LENGTH) * EPOCH_LENGTH;
+        const epochBoundaries: number[] = [];
         
-        allChanges = allChanges.concat(poolChanges);
+        for (let block = firstEpochBoundary; block <= range.endBlock; block += EPOCH_LENGTH) {
+            const key = `${block}:${range.pool}`;
+            if (!existingStakingData.has(key)) {
+                epochBoundaries.push(block);
+            }
+        }
+        
+        // Also check the final block if it's not an epoch boundary
+        if (range.endBlock > firstEpochBoundary && range.endBlock % EPOCH_LENGTH !== 0) {
+            const key = `${range.endBlock}:${range.pool}`;
+            if (!existingStakingData.has(key)) {
+                epochBoundaries.push(range.endBlock);
+            }
+        }
+        
+        const totalEpochs = Math.ceil((range.endBlock - firstEpochBoundary) / EPOCH_LENGTH);
+        const alreadyChecked = totalEpochs - epochBoundaries.length;
+        if (alreadyChecked > 0) {
+            console.log(`  Skipping ${alreadyChecked} epoch(s) with existing staking data`);
+        }
+        
+        if (epochBoundaries.length === 0) {
+            console.log('  All epochs already have staking data');
+            continue;
+        }
+        
+        console.log(`  Checking ${epochBoundaries.length} epoch(s) without existing data`);
+        
+        // Manually check each epoch boundary that needs data
+        let prevBalances = await getStakingPoolBalances(accountId, range.startBlock, [range.pool]);
+        let prevBlock = range.startBlock;
+        
+        for (let i = 0; i < epochBoundaries.length; i++) {
+            if (getStopSignal()) {
+                throw new Error('Operation cancelled by user');
+            }
+            
+            const block = epochBoundaries[i];
+            if (block === undefined) {
+                continue;
+            }
+            
+            console.log(`    Checking epoch ${i + 1}/${epochBoundaries.length} at block ${block}...`);
+            
+            const currentBalances = await getStakingPoolBalances(accountId, block, [range.pool]);
+            
+            const prevBalance = BigInt(prevBalances[range.pool] || '0');
+            const currentBalance = BigInt(currentBalances[range.pool] || '0');
+            
+            if (prevBalance !== currentBalance) {
+                allChanges.push({
+                    block,
+                    pool: range.pool,
+                    startBalance: prevBalance.toString(),
+                    endBalance: currentBalance.toString(),
+                    diff: (currentBalance - prevBalance).toString()
+                });
+            }
+            
+            prevBalances = currentBalances;
+            prevBlock = block;
+        }
     }
     
     if (allChanges.length === 0) {
@@ -528,201 +613,216 @@ export function isStakingOnlyEntry(tx: TransactionEntry): boolean {
     return hasNoTxHashes && hasStakingChanges && hasNoOtherChanges;
 }
 
+// Note: detectGaps is now imported from './gap-detection.js' module
+
 /**
- * Detect gaps in transaction history where balance connectivity is broken
+ * Combined transaction block info from any API source
  */
-function detectGaps(history: AccountHistory): Array<{ prevBlock: number; nextBlock: number; prevTx: TransactionEntry; nextTx: TransactionEntry }> {
-    const gaps: Array<{ prevBlock: number; nextBlock: number; prevTx: TransactionEntry; nextTx: TransactionEntry }> = [];
-    
-    if (history.transactions.length < 2) {
-        return gaps;
-    }
-    
-    // Sort transactions by block and filter out staking-only entries
-    // Staking-only entries are synthetic (no actual on-chain tx) and don't track NEAR/FT/intents balances
-    const sortedTransactions = [...history.transactions]
-        .filter(tx => !isStakingOnlyEntry(tx))
-        .sort((a, b) => a.block - b.block);
-    
-    for (let i = 1; i < sortedTransactions.length; i++) {
-        const prevTx = sortedTransactions[i - 1];
-        const currTx = sortedTransactions[i];
-        
-        if (prevTx && currTx) {
-            const verification = verifyTransactionConnectivity(currTx, prevTx);
-            
-            if (!verification.valid) {
-                gaps.push({
-                    prevBlock: prevTx.block,
-                    nextBlock: currTx.block,
-                    prevTx,
-                    nextTx: currTx
-                });
-            }
-        }
-    }
-    
-    return gaps;
+interface CombinedTransactionBlock {
+    blockHeight: number;
+    source: 'nearblocks' | 'intents' | 'pikespeak';
+    tokenIds?: string[];  // For intents/pikespeak transactions
 }
 
 /**
- * Fill gaps in transaction history
+ * Fetch transaction blocks from all available APIs within a specific block range.
+ * Returns blocks sorted by height (highest first for backward search, lowest first for forward).
  */
-async function fillGaps(
+async function fetchTransactionBlocksFromAPIs(
+    accountId: string,
+    options: {
+        afterBlock?: number;   // Only include blocks > afterBlock
+        beforeBlock?: number;  // Only include blocks < beforeBlock  
+        maxBlocks?: number;    // Maximum number of blocks to return
+        direction?: 'forward' | 'backward';
+    } = {}
+): Promise<CombinedTransactionBlock[]> {
+    const { afterBlock, beforeBlock, maxBlocks, direction = 'backward' } = options;
+    
+    const allKnownBlocks: CombinedTransactionBlock[] = [];
+    const seenBlockHeights = new Set<number>();
+    
+    const rangeDesc = afterBlock || beforeBlock 
+        ? ` (range: ${afterBlock ?? 0} - ${beforeBlock ?? 'latest'})`
+        : '';
+    
+    // Collect from NearBlocks API
+    if (isNearBlocksAvailable()) {
+        console.log(`  Fetching from NearBlocks API${rangeDesc}...`);
+        
+        try {
+            const maxPages = maxBlocks ? Math.ceil(maxBlocks / 25) + 10 : undefined;
+            const knownBlocks = await getAllTransactionBlocks(accountId, {
+                afterBlock,
+                beforeBlock,
+                maxPages
+            });
+            
+            for (const block of knownBlocks) {
+                // Apply range filter (NearBlocks already supports this but double-check)
+                if (afterBlock !== undefined && block.blockHeight <= afterBlock) continue;
+                if (beforeBlock !== undefined && block.blockHeight >= beforeBlock) continue;
+                
+                if (!seenBlockHeights.has(block.blockHeight)) {
+                    seenBlockHeights.add(block.blockHeight);
+                    allKnownBlocks.push({
+                        blockHeight: block.blockHeight,
+                        source: 'nearblocks'
+                    });
+                }
+            }
+            console.log(`    Found ${knownBlocks.length} blocks from NearBlocks`);
+        } catch (error: any) {
+            console.warn(`    NearBlocks API error: ${error.message}`);
+        }
+    }
+    
+    // Collect from Intents Explorer API
+    if (isIntentsExplorerAvailable()) {
+        console.log(`  Fetching from Intents Explorer API${rangeDesc}...`);
+        
+        try {
+            const maxPages = maxBlocks ? Math.ceil(maxBlocks / 25) + 10 : undefined;
+            const intentsBlocks = await getAllIntentsTransactionBlocks(accountId, {
+                afterBlock,
+                beforeBlock,
+                maxPages
+            });
+            
+            let newIntentsBlocks = 0;
+            for (const block of intentsBlocks) {
+                // Apply range filter
+                if (afterBlock !== undefined && block.blockHeight <= afterBlock) continue;
+                if (beforeBlock !== undefined && block.blockHeight >= beforeBlock) continue;
+                
+                if (!seenBlockHeights.has(block.blockHeight)) {
+                    seenBlockHeights.add(block.blockHeight);
+                    allKnownBlocks.push({
+                        blockHeight: block.blockHeight,
+                        source: 'intents',
+                        tokenIds: block.tokenIds
+                    });
+                    newIntentsBlocks++;
+                }
+            }
+            console.log(`    Found ${intentsBlocks.length} blocks from Intents Explorer (${newIntentsBlocks} new)`);
+        } catch (error: any) {
+            console.warn(`    Intents Explorer API error: ${error.message}`);
+        }
+    }
+    
+    // Collect from Pikespeak API
+    if (isPikespeakAvailable()) {
+        console.log(`  Fetching from Pikespeak API${rangeDesc}...`);
+        
+        try {
+            const maxEvents = maxBlocks ? maxBlocks * 5 : undefined;
+            const pikespeakBlocks = await getAllPikespeakTransactionBlocks(accountId, {
+                afterBlock,
+                beforeBlock,
+                maxEvents
+            });
+            
+            let newPikespeakBlocks = 0;
+            for (const block of pikespeakBlocks) {
+                // Apply range filter (Pikespeak module already filters but double-check)
+                if (afterBlock !== undefined && block.blockHeight <= afterBlock) continue;
+                if (beforeBlock !== undefined && block.blockHeight >= beforeBlock) continue;
+                
+                if (!seenBlockHeights.has(block.blockHeight)) {
+                    seenBlockHeights.add(block.blockHeight);
+                    const tokenIds = block.token ? [block.token] : undefined;
+                    allKnownBlocks.push({
+                        blockHeight: block.blockHeight,
+                        source: 'pikespeak',
+                        tokenIds
+                    });
+                    newPikespeakBlocks++;
+                }
+            }
+            console.log(`    Found ${pikespeakBlocks.length} blocks from Pikespeak (${newPikespeakBlocks} new)`);
+        } catch (error: any) {
+            console.warn(`    Pikespeak API error: ${error.message}`);
+        }
+    }
+    
+    // Sort by block height based on direction
+    if (direction === 'backward') {
+        allKnownBlocks.sort((a, b) => b.blockHeight - a.blockHeight);
+    } else {
+        allKnownBlocks.sort((a, b) => a.blockHeight - b.blockHeight);
+    }
+    
+    // Limit to maxBlocks if specified
+    if (maxBlocks && allKnownBlocks.length > maxBlocks) {
+        return allKnownBlocks.slice(0, maxBlocks);
+    }
+    
+    return allKnownBlocks;
+}
+
+/**
+ * Process API-discovered blocks and add balance changes to history.
+ * Returns the number of new transactions added.
+ */
+async function processDiscoveredBlocks(
+    accountId: string,
     history: AccountHistory,
     outputFile: string,
-    maxTransactionsToFill: number = 50
+    blocks: CombinedTransactionBlock[],
+    maxTransactions: number
 ): Promise<number> {
-    const gaps = detectGaps(history);
+    let transactionsFound = 0;
+    const existingBlocks = new Set(history.transactions.map(t => t.block));
     
-    if (gaps.length === 0) {
-        console.log('No gaps detected in transaction history');
+    // Filter out already processed blocks
+    const newBlocks = blocks.filter(b => !existingBlocks.has(b.blockHeight));
+    
+    if (newBlocks.length === 0) {
         return 0;
     }
     
-    console.log(`\n=== Detected ${gaps.length} gap(s) in transaction history ===`);
-    let totalFilled = 0;
+    console.log(`  Processing ${Math.min(newBlocks.length, maxTransactions)} blocks...`);
     
-    for (const gap of gaps) {
-        if (getStopSignal() || totalFilled >= maxTransactionsToFill) {
+    for (const txBlock of newBlocks) {
+        if (getStopSignal()) {
+            console.log('Stop signal received, saving progress...');
+            history.updatedAt = new Date().toISOString();
+            saveHistory(outputFile, history);
             break;
         }
         
-        console.log(`\nFilling gap between blocks ${gap.prevBlock} and ${gap.nextBlock}...`);
-        
-        // Note: We start from gap.prevBlock (not +1) because the change we're looking for
-        // could have happened at the block right after prevBlock. The balance at prevBlock
-        // is known (from prevTx.balanceAfter), so we need to compare from that point.
-        const searchStart = gap.prevBlock;
-        const searchEnd = gap.nextBlock - 1;
-        
-        if (searchStart > searchEnd) {
-            console.log('Gap is adjacent blocks, no intermediate transactions');
-            continue;
+        if (transactionsFound >= maxTransactions) {
+            break;
         }
         
-        // Extract tokens that changed in this gap to pass to the search
-        // This ensures we look for the right tokens, especially intents tokens
-        const prevBalanceAfter = gap.prevTx.balanceAfter;
-        const nextBalanceBefore = gap.nextTx.balanceBefore;
-        
-        // Check if NEAR balance changed
-        const checkNear = prevBalanceAfter?.near !== nextBalanceBefore?.near;
-        
-        // Find fungible tokens that changed
-        const changedFungibleTokens: string[] = [];
-        const prevFT = prevBalanceAfter?.fungibleTokens || {};
-        const nextFT = nextBalanceBefore?.fungibleTokens || {};
-        const allFT = new Set([...Object.keys(prevFT), ...Object.keys(nextFT)]);
-        for (const token of allFT) {
-            if ((prevFT[token] || '0') !== (nextFT[token] || '0')) {
-                changedFungibleTokens.push(token);
-            }
+        // Clear cache periodically
+        if (transactionsFound % 10 === 0) {
+            clearBalanceCache();
         }
         
-        // Find intents tokens that changed
-        const changedIntentsTokens: string[] = [];
-        const prevIntents = prevBalanceAfter?.intentsTokens || {};
-        const nextIntents = nextBalanceBefore?.intentsTokens || {};
-        const allIntents = new Set([...Object.keys(prevIntents), ...Object.keys(nextIntents)]);
-        for (const token of allIntents) {
-            if ((prevIntents[token] || '0') !== (nextIntents[token] || '0')) {
-                changedIntentsTokens.push(token);
-            }
-        }
-        
-        console.log(`Gap analysis: NEAR changed=${checkNear}, FT changed=${changedFungibleTokens.length > 0 ? changedFungibleTokens.join(',') : 'none'}, Intents changed=${changedIntentsTokens.length > 0 ? changedIntentsTokens.join(',') : 'none'}`);
-        
-        let currentStart = searchStart;
-        let currentEnd = searchEnd;
-        let foundInGap = 0;
-        
-        // Keep track of the current "previous" balance for recalculating changes
-        let currentPrevBalanceAfter = prevBalanceAfter;
-        
-        while (currentStart <= currentEnd && foundInGap < maxTransactionsToFill - totalFilled) {
-            if (getStopSignal()) {
-                break;
-            }
-            
-            // Recalculate what changed between currentPrevBalanceAfter and nextBalanceBefore
-            // This is important because after finding a transaction, the remaining gap may have different changes
-            const recalcCheckNear = currentPrevBalanceAfter?.near !== nextBalanceBefore?.near;
-            
-            const recalcChangedFungibleTokens: string[] = [];
-            const recalcPrevFT = currentPrevBalanceAfter?.fungibleTokens || {};
-            const recalcAllFT = new Set([...Object.keys(recalcPrevFT), ...Object.keys(nextFT)]);
-            for (const token of recalcAllFT) {
-                if ((recalcPrevFT[token] || '0') !== (nextFT[token] || '0')) {
-                    recalcChangedFungibleTokens.push(token);
-                }
-            }
-            
-            const recalcChangedIntentsTokens: string[] = [];
-            const recalcPrevIntents = currentPrevBalanceAfter?.intentsTokens || {};
-            const recalcAllIntents = new Set([...Object.keys(recalcPrevIntents), ...Object.keys(nextIntents)]);
-            for (const token of recalcAllIntents) {
-                if ((recalcPrevIntents[token] || '0') !== (nextIntents[token] || '0')) {
-                    recalcChangedIntentsTokens.push(token);
-                }
-            }
-            
-            // If nothing changed anymore, we've filled all gaps
-            if (!recalcCheckNear && recalcChangedFungibleTokens.length === 0 && recalcChangedIntentsTokens.length === 0) {
-                console.log('No more changes detected in remaining gap range');
-                break;
-            }
-            
-            console.log(`Searching in range ${currentStart} - ${currentEnd}... (NEAR=${recalcCheckNear}, FT=${recalcChangedFungibleTokens.length}, Intents=${recalcChangedIntentsTokens.length})`);
-            
-            let balanceChange: BalanceChanges;
-            try {
-                balanceChange = await findLatestBalanceChangingBlock(
-                    history.accountId,
-                    currentStart,
-                    currentEnd,
-                    recalcChangedFungibleTokens.length > 0 ? recalcChangedFungibleTokens : null,
-                    recalcChangedIntentsTokens.length > 0 ? recalcChangedIntentsTokens : null,
-                    recalcCheckNear
-                );
-            } catch (error: any) {
-                if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
-                    console.log(`Error during gap fill: ${error.message}`);
-                    break;
-                }
-                throw error;
-            }
+        try {
+            // Get balance changes at this specific block
+            const intentsTokensToCheck = txBlock.tokenIds && txBlock.tokenIds.length > 0 ? txBlock.tokenIds : undefined;
+            const balanceChange = await getBalanceChangesAtBlock(
+                accountId, 
+                txBlock.blockHeight,
+                undefined,
+                intentsTokensToCheck,
+                undefined
+            );
             
             if (!balanceChange.hasChanges) {
-                console.log('No balance changes found in gap range');
-                break;
-            }
-            
-            if (!balanceChange.block) {
-                console.log('Balance change has no block number');
-                break;
-            }
-            
-            // Find the transaction that caused the change
-            const txInfo = await findBalanceChangingTransaction(history.accountId, balanceChange.block);
-            
-            if (!txInfo) {
-                console.log(`Could not find transaction at block ${balanceChange.block}`);
-                currentEnd = balanceChange.block - 1;
+                // No balance changes for tracked tokens
                 continue;
             }
             
-            // Check for duplicate before adding
-            const existingEntry = history.transactions.find(t => t.block === balanceChange.block);
-            if (existingEntry) {
-                console.log(`Skipping duplicate entry at block ${balanceChange.block}`);
-                currentEnd = balanceChange.block - 1;
-                continue;
-            }
+            // Find the transaction details
+            const txInfo = await findBalanceChangingTransaction(accountId, txBlock.blockHeight);
             
             // Create transaction entry
             const entry: TransactionEntry = {
-                block: balanceChange.block,
+                block: txBlock.blockHeight,
                 transactionBlock: txInfo.transactionBlock,
                 timestamp: txInfo.blockTimestamp,
                 transactionHashes: txInfo.transactionHashes,
@@ -740,42 +840,383 @@ async function fillGaps(
             
             // Add to history
             history.transactions.push(entry);
-            foundInGap++;
-            totalFilled++;
+            transactionsFound++;
             
-            console.log(`Gap transaction ${foundInGap} added at block ${balanceChange.block}`);
+            const sourceLabel = txBlock.source !== 'nearblocks' ? ` (${txBlock.source})` : '';
+            console.log(`    Added transaction at block ${txBlock.blockHeight}${sourceLabel}`);
             
             // Update metadata
-            if (!history.metadata.firstBlock || balanceChange.block < history.metadata.firstBlock) {
-                history.metadata.firstBlock = balanceChange.block;
-            }
-            if (!history.metadata.lastBlock || balanceChange.block > history.metadata.lastBlock) {
-                history.metadata.lastBlock = balanceChange.block;
-            }
+            const allBlocks = history.transactions.map(t => t.block);
+            history.metadata.firstBlock = Math.min(...allBlocks);
+            history.metadata.lastBlock = Math.max(...allBlocks);
             history.metadata.totalTransactions = history.transactions.length;
+            history.updatedAt = new Date().toISOString();
             
-            // Save progress
-            if (foundInGap % 5 === 0) {
-                history.updatedAt = new Date().toISOString();
+            // Save progress periodically
+            if (transactionsFound % 5 === 0) {
                 saveHistory(outputFile, history);
             }
-            
-            // Update the "previous" balance for the next iteration
-            // This is the balance AFTER the transaction we just found
-            currentPrevBalanceAfter = balanceChange.endBalance;
-            
-            // Search for more in the remaining range
-            currentEnd = balanceChange.block - 1;
+        } catch (error: any) {
+            if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                console.log(`Error during processing: ${error.message}`);
+                history.updatedAt = new Date().toISOString();
+                saveHistory(outputFile, history);
+                break;
+            }
+            console.warn(`Error processing block ${txBlock.blockHeight}: ${error.message}`);
         }
-        
-        // Save after filling each gap
-        history.updatedAt = new Date().toISOString();
-        saveHistory(outputFile, history);
-        console.log(`Filled ${foundInGap} transaction(s) in this gap`);
     }
     
-    // After filling gaps, re-verify all transactions and update verification fields
+    return transactionsFound;
+}
+
+/**
+ * Reconcile a gap where no transactions were found.
+ * This happens when the gap is caused by incomplete token tracking in stored data.
+ * Re-fetches balances for the transactions at gap boundaries with a complete token list.
+ * Returns true if the gap was resolved by reconciliation.
+ */
+async function reconcileGap(
+    accountId: string,
+    history: AccountHistory,
+    outputFile: string,
+    gap: Gap
+): Promise<boolean> {
+    console.log(`  Reconciling gap: checking if balance data is incomplete...`);
+    
+    // Get all tokens tracked across the entire history
+    const allFungibleTokens = new Set<string>();
+    const allIntentsTokens = new Set<string>();
+    
+    for (const tx of history.transactions) {
+        if (tx.balanceBefore?.fungibleTokens) {
+            Object.keys(tx.balanceBefore.fungibleTokens).forEach(t => allFungibleTokens.add(t));
+        }
+        if (tx.balanceAfter?.fungibleTokens) {
+            Object.keys(tx.balanceAfter.fungibleTokens).forEach(t => allFungibleTokens.add(t));
+        }
+        if (tx.balanceBefore?.intentsTokens) {
+            Object.keys(tx.balanceBefore.intentsTokens).forEach(t => allIntentsTokens.add(t));
+        }
+        if (tx.balanceAfter?.intentsTokens) {
+            Object.keys(tx.balanceAfter.intentsTokens).forEach(t => allIntentsTokens.add(t));
+        }
+    }
+    
+    const ftTokens = [...allFungibleTokens];
+    const intentTokens = [...allIntentsTokens];
+    
+    // Find the transactions at the gap boundaries
+    const prevTx = history.transactions.find(tx => tx.block === gap.startBlock);
+    const nextTx = history.transactions.find(tx => tx.block === gap.endBlock);
+    
+    if (!prevTx || !nextTx) {
+        console.log(`    Could not find boundary transactions`);
+        return false;
+    }
+    
+    try {
+        // Re-fetch balance at the end of prevTx (balanceAfter)
+        console.log(`    Re-fetching balance at block ${gap.startBlock}...`);
+        const newBalanceAfterPrev = await getAllBalances(accountId, gap.startBlock, ftTokens, intentTokens);
+        
+        // Re-fetch balance at the start of nextTx (balanceBefore)
+        // Note: balanceBefore is the state just before the transaction, so we use block - 1
+        console.log(`    Re-fetching balance at block ${gap.endBlock - 1}...`);
+        const newBalanceBeforeNext = await getAllBalances(accountId, gap.endBlock - 1, ftTokens, intentTokens);
+        
+        // Check if the re-fetched balances match (no actual gap)
+        const nearMatches = newBalanceAfterPrev.near === newBalanceBeforeNext.near;
+        
+        let ftMatches = true;
+        for (const token of ftTokens) {
+            const prevVal = newBalanceAfterPrev.fungibleTokens?.[token] || '0';
+            const nextVal = newBalanceBeforeNext.fungibleTokens?.[token] || '0';
+            if (prevVal !== nextVal) {
+                ftMatches = false;
+                break;
+            }
+        }
+        
+        let intentsMatches = true;
+        for (const token of intentTokens) {
+            const prevVal = newBalanceAfterPrev.intentsTokens?.[token] || '0';
+            const nextVal = newBalanceBeforeNext.intentsTokens?.[token] || '0';
+            if (prevVal !== nextVal) {
+                intentsMatches = false;
+                break;
+            }
+        }
+        
+        if (nearMatches && ftMatches && intentsMatches) {
+            // The balances actually match - update the stored data
+            console.log(`    Gap resolved: balances match after re-fetch with complete token list`);
+            
+            // Update prevTx.balanceAfter
+            prevTx.balanceAfter = newBalanceAfterPrev;
+            
+            // Update nextTx.balanceBefore  
+            nextTx.balanceBefore = newBalanceBeforeNext;
+            
+            // Save the updated history
+            history.updatedAt = new Date().toISOString();
+            saveHistory(outputFile, history);
+            
+            return true;
+        } else {
+            console.log(`    Gap is real: balances differ even with complete token list`);
+            if (!nearMatches) console.log(`      NEAR: ${newBalanceAfterPrev.near} vs ${newBalanceBeforeNext.near}`);
+            return false;
+        }
+    } catch (error: any) {
+        console.log(`    Error reconciling gap: ${error.message}`);
+        return false;
+    }
+}
+
+/**
+ * Fill a single gap using binary search.
+ * Returns the number of transactions found and added.
+ */
+async function fillGapWithBinarySearch(
+    accountId: string,
+    history: AccountHistory,
+    outputFile: string,
+    gap: Gap,
+    maxTransactions: number
+): Promise<number> {
+    const searchStart = gap.startBlock;  // Start from the last known good block to detect changes at gap boundary
+    const searchEnd = gap.endBlock - 1;
+    
+    if (searchStart > searchEnd) {
+        return 0;
+    }
+    
+    // Extract which assets changed in this gap
+    const changedAssets = gap.verification.errors.reduce((acc, err) => {
+        if (err.type === 'near_balance_mismatch') acc.near = true;
+        if (err.type === 'token_balance_mismatch' && err.token) acc.tokens.push(err.token);
+        if (err.type === 'intents_balance_mismatch' && err.token) acc.intents.push(err.token);
+        return acc;
+    }, { near: false, tokens: [] as string[], intents: [] as string[] });
+    
+    console.log(`  Binary search: blocks ${searchStart} - ${searchEnd}`);
+    console.log(`    Assets changed: NEAR=${changedAssets.near}, FT=${changedAssets.tokens.length}, Intents=${changedAssets.intents.length}`);
+    
+    let currentStart = searchStart;
+    let currentEnd = searchEnd;
+    let totalFound = 0;
+    
+    while (currentStart <= currentEnd && totalFound < maxTransactions) {
+        if (getStopSignal()) break;
+        
+        // Clear cache periodically
+        if (totalFound % 10 === 0) {
+            clearBalanceCache();
+        }
+        
+        let balanceChange: BalanceChanges;
+        try {
+            balanceChange = await findLatestBalanceChangingBlock(
+                accountId,
+                currentStart,
+                currentEnd,
+                changedAssets.tokens.length > 0 ? changedAssets.tokens : null,
+                changedAssets.intents.length > 0 ? changedAssets.intents : null,
+                changedAssets.near
+            );
+        } catch (error: any) {
+            if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                console.log(`    Error during binary search: ${error.message}`);
+                break;
+            }
+            throw error;
+        }
+        
+        if (!balanceChange.hasChanges || !balanceChange.block) {
+            break;
+        }
+        
+        // Check for duplicate
+        const existingEntry = history.transactions.find(t => t.block === balanceChange.block);
+        if (existingEntry) {
+            currentEnd = balanceChange.block! - 1;
+            continue;
+        }
+        
+        // Find transaction details
+        const txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block);
+        
+        // Create transaction entry
+        const entry: TransactionEntry = {
+            block: balanceChange.block,
+            transactionBlock: txInfo.transactionBlock,
+            timestamp: txInfo.blockTimestamp,
+            transactionHashes: txInfo.transactionHashes,
+            transactions: txInfo.transactions,
+            transfers: txInfo.transfers,
+            balanceBefore: balanceChange.startBalance,
+            balanceAfter: balanceChange.endBalance,
+            changes: {
+                nearChanged: balanceChange.nearChanged,
+                nearDiff: balanceChange.nearDiff,
+                tokensChanged: balanceChange.tokensChanged,
+                intentsChanged: balanceChange.intentsChanged
+            }
+        };
+        
+        history.transactions.push(entry);
+        totalFound++;
+        
+        console.log(`    Found transaction at block ${balanceChange.block}`);
+        
+        // Update metadata
+        const allBlocks = history.transactions.map(t => t.block);
+        history.metadata.firstBlock = Math.min(...allBlocks);
+        history.metadata.lastBlock = Math.max(...allBlocks);
+        history.metadata.totalTransactions = history.transactions.length;
+        
+        // Save periodically
+        if (totalFound % 5 === 0) {
+            history.updatedAt = new Date().toISOString();
+            saveHistory(outputFile, history);
+        }
+        
+        // Continue searching in remaining range
+        currentEnd = balanceChange.block - 1;
+    }
+    
+    return totalFound;
+}
+
+/**
+ * Fill a single gap - first try APIs, then binary search.
+ * Returns the number of transactions found and added.
+ */
+async function fillGap(
+    accountId: string,
+    history: AccountHistory,
+    outputFile: string,
+    gap: Gap,
+    maxTransactions: number
+): Promise<number> {
+    console.log(`\nFilling gap: blocks ${gap.startBlock} - ${gap.endBlock}`);
+    
+    let totalFound = 0;
+    
+    // 1. First try fetching from APIs with block range constraint
+    const apiBlocks = await fetchTransactionBlocksFromAPIs(accountId, {
+        afterBlock: gap.startBlock,
+        beforeBlock: gap.endBlock,
+        maxBlocks: maxTransactions
+    });
+    
+    if (apiBlocks.length > 0) {
+        console.log(`  Found ${apiBlocks.length} potential blocks from APIs`);
+        const apiFound = await processDiscoveredBlocks(
+            accountId,
+            history,
+            outputFile,
+            apiBlocks,
+            maxTransactions - totalFound
+        );
+        totalFound += apiFound;
+        
+        if (totalFound >= maxTransactions) {
+            return totalFound;
+        }
+    }
+    
+    // 2. Re-detect if gap still exists after API processing
+    //    (The gap may have been partially or fully filled)
+    history.transactions.sort((a, b) => a.block - b.block);
+    const gapAnalysis = detectGaps(history.transactions);
+    
+    // Find the remaining gap in this range
+    const remainingGap = gapAnalysis.internalGaps.find(g => 
+        g.startBlock >= gap.startBlock && g.endBlock <= gap.endBlock
+    );
+    
+    if (!remainingGap) {
+        // Gap is fully filled
+        return totalFound;
+    }
+    
+    // 3. Binary search for remaining transactions
+    if (!getStopSignal() && totalFound < maxTransactions) {
+        console.log(`  Gap partially filled, continuing with binary search...`);
+        const binaryFound = await fillGapWithBinarySearch(
+            accountId,
+            history,
+            outputFile,
+            remainingGap,
+            maxTransactions - totalFound
+        );
+        totalFound += binaryFound;
+        
+        // 4. If binary search found nothing, try to reconcile the gap
+        //    This handles cases where the gap is due to incomplete token tracking
+        if (binaryFound === 0 && !getStopSignal()) {
+            const reconciled = await reconcileGap(accountId, history, outputFile, remainingGap);
+            if (reconciled) {
+                // Gap was resolved by reconciliation (data was incomplete, not missing transactions)
+                // Return 0 found but the gap is now closed
+                return totalFound;
+            }
+        }
+    }
+    
+    return totalFound;
+}
+
+/**
+ * Fill gaps in transaction history.
+ * Uses the gap-detection module to identify gaps, then fills them.
+ */
+async function fillGaps(
+    history: AccountHistory,
+    outputFile: string,
+    maxTransactionsToFill: number = 50
+): Promise<number> {
+    // Sort transactions before analysis
+    history.transactions.sort((a, b) => a.block - b.block);
+    
+    // Use the module's detectGaps function
+    const gapAnalysis = detectGaps(history.transactions);
+    
+    if (gapAnalysis.isComplete) {
+        console.log('No gaps detected in transaction history');
+        return 0;
+    }
+    
+    const totalGaps = gapAnalysis.internalGaps.length + 
+        (gapAnalysis.gapToCreation ? 1 : 0) + 
+        (gapAnalysis.gapToPresent ? 1 : 0);
+    
+    console.log(`\n=== Detected ${totalGaps} gap(s) in transaction history ===`);
+    console.log(`  Internal gaps: ${gapAnalysis.internalGaps.length}`);
+    if (gapAnalysis.gapToCreation) console.log(`  Gap to creation: yes (before block ${gapAnalysis.gapToCreation.endBlock})`);
+    if (gapAnalysis.gapToPresent) console.log(`  Gap to present: yes (after block ${gapAnalysis.gapToPresent.startBlock})`);
+    
+    let totalFilled = 0;
+    
+    // 1. Fill internal gaps first (highest priority)
+    for (const gap of gapAnalysis.internalGaps) {
+        if (getStopSignal() || totalFilled >= maxTransactionsToFill) break;
+        
+        const filled = await fillGap(
+            history.accountId,
+            history,
+            outputFile,
+            gap,
+            maxTransactionsToFill - totalFilled
+        );
+        totalFilled += filled;
+    }
+    
+    // Save and return - gap to creation/present are handled by main search
     if (totalFilled > 0) {
+        history.transactions.sort((a, b) => a.block - b.block);
         updateVerificationFields(history);
         saveHistory(outputFile, history);
     }
@@ -979,6 +1420,17 @@ function updateVerificationFields(history: AccountHistory): void {
 
 /**
  * Get accounting history for an account
+ * 
+ * Flow:
+ * 1. Load existing history
+ * 2. If history exists:
+ *    a. Detect gaps (internal gaps, gap to creation, gap to present)
+ *    b. Fill internal gaps first (API + binary search for each gap)
+ *    c. Look for new data (after lastBlock) - gap to present
+ *    d. Look for old data (before firstBlock) - gap to creation  
+ * 3. If no history: fetch from APIs first, then binary search
+ * 4. Enrichment phase (transfer details, transaction blocks)
+ * 5. Staking rewards collection
  */
 export async function getAccountHistory(options: GetAccountHistoryOptions): Promise<AccountHistory> {
     const {
@@ -990,11 +1442,15 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         stakingOnly = false
     } = options;
     
-    let maxTransactions = options.maxTransactions ?? 100;  // Use ?? to allow 0
+    // maxTransactions: 0 means "unlimited" (fetch all available)
+    let maxTransactions = options.maxTransactions === 0 ? Infinity : (options.maxTransactions ?? 100);
 
     console.log(`\n=== Getting accounting history for ${accountId} ===`);
     console.log(`Direction: ${direction}`);
     console.log(`Output file: ${outputFile}`);
+    if (maxTransactions === Infinity) {
+        console.log(`Max transactions: unlimited`);
+    }
     if (stakingOnly) {
         console.log(`Mode: staking rewards collection only`);
     }
@@ -1016,435 +1472,415 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         };
     }
 
-    // Check for and fill any gaps in existing history
-    if (history.transactions.length > 0) {
-        console.log(`\nLoaded ${history.transactions.length} existing transaction(s)`);
-        const gapsFilled = await fillGaps(history, outputFile, Math.min(50, maxTransactions));
-        if (gapsFilled > 0) {
-            console.log(`\nFilled ${gapsFilled} transaction(s) in gaps`);
-            // Reduce max transactions by the number we just filled
-            maxTransactions = Math.max(0, maxTransactions - gapsFilled);
-            if (maxTransactions === 0) {
-                console.log('Reached max transactions limit while filling gaps');
-                return history;
-            }
-        } else {
-            // Even if no gaps were filled, update verification fields to fix any stale data
-            updateVerificationFields(history);
-            saveHistory(outputFile, history);
-        }
-        
-        // Skip enrichment if stakingOnly mode
-        if (!stakingOnly) {
-            // Enrich existing transactions with transaction blocks if missing
-            const missingTransactionBlocks = history.transactions.filter(tx => 
-                (tx.transactionBlock === null || tx.transactionBlock === undefined) && 
-                tx.transactionHashes && tx.transactionHashes.length > 0
-            ).length;
-            
-            if (missingTransactionBlocks > 0) {
-                console.log(`\nFound ${missingTransactionBlocks} transaction(s) without transaction block information`);
-                const txBlocksEnriched = await enrichTransactionsWithTransactionBlock(history, outputFile, 10);
-                if (txBlocksEnriched > 0) {
-                    console.log(`Enriched ${txBlocksEnriched} transaction blocks. Run again to enrich more.`);
-                }
-            }
-            
-            // Enrich existing transactions with transfer details if missing
-            // Note: Enrichment doesn't count against maxTransactions since it doesn't add new transactions
-            const enriched = await enrichTransactionsWithTransfers(history, outputFile, 50);
-            if (enriched > 0) {
-                console.log(`\nEnriched ${enriched} transaction(s) with transfer details`);
-            }
-        }
-        
-        // Collect staking rewards at epoch boundaries
-        const stakingRewards = await collectStakingRewards(accountId, history, outputFile);
-        if (stakingRewards > 0) {
-            console.log(`\nAdded ${stakingRewards} staking reward entries`);
-        }
-        
-        // Early return if maxTransactions was 0 (user only wanted enrichment/gap fill) or stakingOnly
-        if (maxTransactions === 0 || stakingOnly) {
-            return history;
-        }
-    }
-
     // Get current block height
     const currentBlock = await getCurrentBlockHeight();
     console.log(`Current block height: ${currentBlock}`);
 
-    // Determine search range based on direction and existing data
-    let searchStart: number, searchEnd: number;
-    
-    if (direction === 'backward') {
-        searchEnd = startBlock || (history.metadata.firstBlock ? history.metadata.firstBlock - 1 : currentBlock);
-        searchStart = endBlock || Math.max(0, searchEnd - 1000000); // Default 1M blocks back
-    } else {
-        searchStart = startBlock || (history.metadata.lastBlock ? history.metadata.lastBlock + 1 : 0);
-        searchEnd = endBlock || currentBlock;
-    }
-
-    console.log(`Search range: ${searchStart} - ${searchEnd}`);
-
     let transactionsFound = 0;
-    
+
     // ===================================================================================
-    // PHASE 1: Collect ALL known transaction blocks from ALL APIs before processing
-    // This avoids triggering binary search gap-filling during API processing
+    // CASE 1: Existing history - detect and fill gaps
     // ===================================================================================
-    
-    interface CombinedTransactionBlock {
-        blockHeight: number;
-        source: 'nearblocks' | 'intents';
-        tokenIds?: string[];  // For intents transactions
-    }
-    
-    const allKnownBlocks: CombinedTransactionBlock[] = [];
-    const seenBlockHeights = new Set<number>();
-    
-    // Collect from NearBlocks API
-    if (isNearBlocksAvailable()) {
-        console.log(`\nFetching transaction blocks from NearBlocks API...`);
+    if (history.transactions.length > 0) {
+        console.log(`\nLoaded ${history.transactions.length} existing transaction(s)`);
+        console.log(`Block range: ${history.metadata.firstBlock} - ${history.metadata.lastBlock}`);
         
-        try {
-            const knownBlocks = await getAllTransactionBlocks(accountId, {
-                maxPages: Math.ceil(maxTransactions / 25) + 10
-            });
-            
-            for (const block of knownBlocks) {
-                if (!seenBlockHeights.has(block.blockHeight)) {
-                    seenBlockHeights.add(block.blockHeight);
-                    allKnownBlocks.push({
-                        blockHeight: block.blockHeight,
-                        source: 'nearblocks'
-                    });
-                }
+        // Early return if stakingOnly mode (only wanted staking rewards)
+        if (stakingOnly) {
+            const stakingRewards = await collectStakingRewards(accountId, history, outputFile);
+            if (stakingRewards > 0) {
+                console.log(`\nAdded ${stakingRewards} staking reward entries`);
             }
-            console.log(`  Found ${knownBlocks.length} blocks from NearBlocks`);
-        } catch (error: any) {
-            console.warn(`NearBlocks API error: ${error.message}`);
-        }
-    }
-    
-    // Collect from Intents Explorer API
-    if (isIntentsExplorerAvailable()) {
-        console.log(`Fetching transaction blocks from Intents Explorer API...`);
-        
-        try {
-            const intentsBlocks = await getAllIntentsTransactionBlocks(accountId, {
-                maxPages: Math.ceil(maxTransactions / 25) + 10
-            });
-            
-            let newIntentsBlocks = 0;
-            for (const block of intentsBlocks) {
-                if (!seenBlockHeights.has(block.blockHeight)) {
-                    seenBlockHeights.add(block.blockHeight);
-                    allKnownBlocks.push({
-                        blockHeight: block.blockHeight,
-                        source: 'intents',
-                        tokenIds: block.tokenIds
-                    });
-                    newIntentsBlocks++;
-                }
-            }
-            console.log(`  Found ${intentsBlocks.length} blocks from Intents Explorer (${newIntentsBlocks} new)`);
-        } catch (error: any) {
-            console.warn(`Intents Explorer API error: ${error.message}`);
-        }
-    }
-    
-    // Filter out already processed blocks
-    const existingBlocks = new Set(history.transactions.map(t => t.block));
-    const newBlocks = allKnownBlocks.filter(b => !existingBlocks.has(b.blockHeight));
-    
-    // Sort by block height based on direction
-    if (direction === 'backward') {
-        newBlocks.sort((a, b) => b.blockHeight - a.blockHeight);
-    } else {
-        newBlocks.sort((a, b) => a.blockHeight - b.blockHeight);
-    }
-    
-    console.log(`\nTotal: ${allKnownBlocks.length} unique blocks from APIs, ${newBlocks.length} new to process`);
-    
-    // ===================================================================================
-    // PHASE 2: Process all API-discovered blocks WITHOUT triggering gap-filling
-    // We process them in sorted order and skip connectivity verification during this phase
-    // ===================================================================================
-    
-    if (newBlocks.length > 0) {
-        console.log(`\nProcessing ${Math.min(newBlocks.length, maxTransactions)} API-discovered transaction blocks...`);
-        
-        for (const txBlock of newBlocks) {
-            if (getStopSignal()) {
-                console.log('Stop signal received, saving progress...');
-                history.updatedAt = new Date().toISOString();
-                saveHistory(outputFile, history);
-                console.log(`Progress saved to ${outputFile}`);
-                break;
-            }
-            
-            if (transactionsFound >= maxTransactions) {
-                break;
-            }
-            
-            // Clear cache periodically to avoid memory issues
-            if (transactionsFound % 10 === 0) {
-                clearBalanceCache();
-            }
-            
-            try {
-                // Get balance changes at this specific block
-                // For intents transactions, include the tokens from the API response
-                const intentsTokensToCheck = txBlock.tokenIds && txBlock.tokenIds.length > 0 ? txBlock.tokenIds : undefined;
-                const balanceChange = await getBalanceChangesAtBlock(
-                    accountId, 
-                    txBlock.blockHeight,
-                    undefined,  // tokenContracts - use defaults
-                    intentsTokensToCheck,  // intentsTokens - include tokens from API response
-                    undefined   // stakingPools - use defaults
-                );
-                
-                if (!balanceChange.hasChanges) {
-                    // This can happen for FT transactions where we're not tracking that token
-                    // or intents transactions with tokens we don't monitor
-                    continue;
-                }
-                
-                // Find the transaction details
-                const txInfo = await findBalanceChangingTransaction(accountId, txBlock.blockHeight);
-                
-                // Create transaction entry
-                const entry: TransactionEntry = {
-                    block: txBlock.blockHeight,
-                    transactionBlock: txInfo.transactionBlock,
-                    timestamp: txInfo.blockTimestamp,
-                    transactionHashes: txInfo.transactionHashes,
-                    transactions: txInfo.transactions,
-                    transfers: txInfo.transfers,
-                    balanceBefore: balanceChange.startBalance,
-                    balanceAfter: balanceChange.endBalance,
-                    changes: {
-                        nearChanged: balanceChange.nearChanged,
-                        nearDiff: balanceChange.nearDiff,
-                        tokensChanged: balanceChange.tokensChanged,
-                        intentsChanged: balanceChange.intentsChanged
-                    }
-                };
-                
-                // Add to history - we'll verify connectivity AFTER all API blocks are processed
-                if (direction === 'backward') {
-                    history.transactions.unshift(entry);
-                } else {
-                    history.transactions.push(entry);
-                }
-                
-                transactionsFound++;
-                const sourceLabel = txBlock.source === 'intents' ? ' (Intents)' : '';
-                console.log(`Transaction ${transactionsFound}/${maxTransactions} added at block ${txBlock.blockHeight}${sourceLabel}`);
-                
-                // Update metadata
-                const allBlocks = history.transactions.map(t => t.block);
-                history.metadata.firstBlock = Math.min(...allBlocks);
-                history.metadata.lastBlock = Math.max(...allBlocks);
-                history.metadata.totalTransactions = history.transactions.length;
-                history.updatedAt = new Date().toISOString();
-                
-                // Save progress periodically
-                if (transactionsFound % 5 === 0) {
-                    saveHistory(outputFile, history);
-                    console.log(`Progress saved to ${outputFile}`);
-                }
-            } catch (error: any) {
-                if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
-                    console.log(`Error during API processing: ${error.message}`);
-                    console.log('Stopping and saving progress...');
-                    history.updatedAt = new Date().toISOString();
-                    saveHistory(outputFile, history);
-                    console.log(`Progress saved to ${outputFile}`);
-                    break;
-                }
-                console.warn(`Error processing block ${txBlock.blockHeight}: ${error.message}`);
-                // Continue with next block
-            }
-        }
-        
-        // Save after API processing
-        if (transactionsFound > 0) {
-            saveHistory(outputFile, history);
-            console.log(`\nAPI processing complete. Found ${transactionsFound} transactions.`);
-        }
-        
-        // If we found enough transactions, we're done
-        if (transactionsFound >= maxTransactions) {
-            // Sort transactions by block before final save
-            history.transactions.sort((a, b) => a.block - b.block);
-            saveHistory(outputFile, history);
-            console.log(`\n=== Export complete ===`);
-            console.log(`Total transactions: ${history.metadata.totalTransactions}`);
-            console.log(`Block range: ${history.metadata.firstBlock} - ${history.metadata.lastBlock}`);
-            console.log(`Output saved to: ${outputFile}`);
             return history;
         }
+
+        // Sort transactions before analysis
+        history.transactions.sort((a, b) => a.block - b.block);
+        
+        // Detect gaps using the gap-detection module
+        const gapAnalysis = detectGaps(history.transactions);
+        
+        console.log(`\n=== Gap Analysis ===`);
+        console.log(`  Internal gaps: ${gapAnalysis.internalGaps.length}`);
+        console.log(`  Gap to creation: ${gapAnalysis.gapToCreation ? 'yes' : 'no'}`);
+        console.log(`  Gap to present: ${gapAnalysis.gapToPresent ? 'yes' : 'no'}`);
+        console.log(`  History complete: ${gapAnalysis.isComplete}`);
+
+        // -----------------------------------------------------------------------------
+        // PHASE 1: Fill internal gaps (highest priority)
+        // -----------------------------------------------------------------------------
+        if (gapAnalysis.internalGaps.length > 0 && !getStopSignal() && transactionsFound < maxTransactions) {
+            console.log(`\n=== Phase 1: Filling ${gapAnalysis.internalGaps.length} internal gap(s) ===`);
+            
+            for (const gap of gapAnalysis.internalGaps) {
+                if (getStopSignal() || transactionsFound >= maxTransactions) break;
+                
+                const filled = await fillGap(
+                    accountId,
+                    history,
+                    outputFile,
+                    gap,
+                    Math.min(50, maxTransactions - transactionsFound)
+                );
+                transactionsFound += filled;
+            }
+        }
+
+        // -----------------------------------------------------------------------------
+        // PHASE 2: Look for new data (after lastBlock) - "gap to present"
+        // -----------------------------------------------------------------------------
+        if (!getStopSignal() && transactionsFound < maxTransactions) {
+            const lastBlock = history.metadata.lastBlock || 0;
+            if (lastBlock < currentBlock) {
+                console.log(`\n=== Phase 2: Looking for new data (blocks ${lastBlock + 1} - ${currentBlock}) ===`);
+                
+                // Fetch from APIs with block range constraint
+                const newBlocks = await fetchTransactionBlocksFromAPIs(accountId, {
+                    afterBlock: lastBlock,
+                    beforeBlock: currentBlock + 1,
+                    direction: 'forward'
+                });
+                
+                if (newBlocks.length > 0) {
+                    console.log(`  Found ${newBlocks.length} potential blocks from APIs`);
+                    const apiFound = await processDiscoveredBlocks(
+                        accountId,
+                        history,
+                        outputFile,
+                        newBlocks,
+                        maxTransactions - transactionsFound
+                    );
+                    transactionsFound += apiFound;
+                }
+                
+                // Binary search for remaining new data
+                if (!getStopSignal() && transactionsFound < maxTransactions) {
+                    // Re-analyze to see if there's still a gap
+                    history.transactions.sort((a, b) => a.block - b.block);
+                    const newLastBlock = history.metadata.lastBlock || 0;
+                    
+                    if (newLastBlock < currentBlock - 1) {
+                        const found = await searchForTransactions(
+                            accountId,
+                            history,
+                            outputFile,
+                            newLastBlock + 1,
+                            currentBlock,
+                            'forward',
+                            Math.min(50, maxTransactions - transactionsFound),
+                            currentBlock  // pass current block height to cap forward search
+                        );
+                        transactionsFound += found;
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------------
+        // PHASE 3: Look for old data (before firstBlock) - "gap to creation"
+        // -----------------------------------------------------------------------------
+        if (!getStopSignal() && transactionsFound < maxTransactions && direction === 'backward') {
+            const firstBlock = history.metadata.firstBlock || currentBlock;
+            
+            // Check if the earliest transaction has non-zero balance before
+            // (indicating there's history before it)
+            const sortedTxs = [...history.transactions].sort((a, b) => a.block - b.block);
+            const earliestTx = sortedTxs.find(tx => !isStakingOnlyEntry(tx));
+            
+            // Use gapToCreation or user-specified range
+            const hasGapToCreation = gapAnalysis.gapToCreation !== null;
+            const searchEndBlock = startBlock || firstBlock - 1;
+            const searchStartBlock = endBlock || Math.max(0, searchEndBlock - 1000000);
+            
+            if (hasGapToCreation || (searchEndBlock > 0 && searchEndBlock > searchStartBlock)) {
+                console.log(`\n=== Phase 3: Looking for old data (blocks ${searchStartBlock} - ${searchEndBlock}) ===`);
+                
+                // Fetch from APIs with block range constraint
+                const oldBlocks = await fetchTransactionBlocksFromAPIs(accountId, {
+                    afterBlock: searchStartBlock > 0 ? searchStartBlock - 1 : undefined,
+                    beforeBlock: searchEndBlock + 1,
+                    direction: 'backward'
+                });
+                
+                if (oldBlocks.length > 0) {
+                    console.log(`  Found ${oldBlocks.length} potential blocks from APIs`);
+                    const apiFound = await processDiscoveredBlocks(
+                        accountId,
+                        history,
+                        outputFile,
+                        oldBlocks,
+                        maxTransactions - transactionsFound
+                    );
+                    transactionsFound += apiFound;
+                }
+                
+                // Binary search for remaining old data
+                if (!getStopSignal() && transactionsFound < maxTransactions) {
+                    // Re-check first block after API processing
+                    history.transactions.sort((a, b) => a.block - b.block);
+                    const newFirstBlock = history.metadata.firstBlock || currentBlock;
+                    
+                    if (newFirstBlock > searchStartBlock) {
+                        const found = await searchForTransactions(
+                            accountId,
+                            history,
+                            outputFile,
+                            searchStartBlock,
+                            newFirstBlock - 1,
+                            'backward',
+                            Math.min(50, maxTransactions - transactionsFound)
+                        );
+                        transactionsFound += found;
+                    }
+                }
+            }
+        }
     }
+    // ===================================================================================
+    // CASE 2: No existing history - full discovery
+    // ===================================================================================
+    else {
+        console.log(`\nNo existing history found. Starting full discovery...`);
+        
+        if (stakingOnly) {
+            // For staking-only mode, we need at least one transaction to anchor staking collection
+            console.log(`Staking-only mode requires existing history. Fetching initial data...`);
+        }
+        
+        // Determine search range
+        const searchEndBlock = startBlock || currentBlock;
+        const searchStartBlock = endBlock || Math.max(0, searchEndBlock - 1000000);
+        
+        console.log(`Search range: ${searchStartBlock} - ${searchEndBlock}`);
+        
+        // Fetch from all APIs (no range constraint for initial discovery)
+        console.log(`\n=== Fetching transaction data from APIs ===`);
+        const allBlocks = await fetchTransactionBlocksFromAPIs(accountId, {
+            afterBlock: searchStartBlock > 0 ? searchStartBlock - 1 : undefined,
+            beforeBlock: searchEndBlock + 1,
+            maxBlocks: maxTransactions === Infinity ? undefined : maxTransactions * 2,
+            direction
+        });
+        
+        if (allBlocks.length > 0) {
+            console.log(`\nTotal: ${allBlocks.length} blocks from APIs`);
+            const apiFound = await processDiscoveredBlocks(
+                accountId,
+                history,
+                outputFile,
+                allBlocks,
+                maxTransactions
+            );
+            transactionsFound += apiFound;
+        }
+        
+        // Binary search for additional transactions
+        if (!getStopSignal() && transactionsFound < maxTransactions) {
+            // Determine remaining search range based on what we found
+            let binarySearchStart: number, binarySearchEnd: number;
+            
+            if (history.transactions.length > 0) {
+                if (direction === 'backward') {
+                    binarySearchEnd = history.metadata.firstBlock! - 1;
+                    binarySearchStart = searchStartBlock;
+                } else {
+                    binarySearchStart = history.metadata.lastBlock! + 1;
+                    binarySearchEnd = searchEndBlock;
+                }
+            } else {
+                binarySearchStart = searchStartBlock;
+                binarySearchEnd = searchEndBlock;
+            }
+            
+            if (binarySearchStart <= binarySearchEnd) {
+                console.log(`\n=== Binary search: blocks ${binarySearchStart} - ${binarySearchEnd} ===`);
+                const found = await searchForTransactions(
+                    accountId,
+                    history,
+                    outputFile,
+                    binarySearchStart,
+                    binarySearchEnd,
+                    direction,
+                    maxTransactions - transactionsFound,
+                    currentBlock  // pass current block height to cap forward search
+                );
+                transactionsFound += found;
+            }
+        }
+    }
+
+    // ===================================================================================
+    // PHASE 4: Enrichment (transfer details, transaction blocks)
+    // ===================================================================================
+    if (!stakingOnly && !getStopSignal() && history.transactions.length > 0) {
+        // Enrich with transaction blocks if missing
+        const missingTxBlocks = history.transactions.filter(tx => 
+            (tx.transactionBlock === null || tx.transactionBlock === undefined) && 
+            tx.transactionHashes && tx.transactionHashes.length > 0
+        ).length;
+        
+        if (missingTxBlocks > 0) {
+            console.log(`\nFound ${missingTxBlocks} transaction(s) without transaction block info`);
+            const enriched = await enrichTransactionsWithTransactionBlock(history, outputFile, 10);
+            if (enriched > 0) {
+                console.log(`Enriched ${enriched} transaction blocks`);
+            }
+        }
+        
+        // Enrich with transfer details if missing
+        const enriched = await enrichTransactionsWithTransfers(history, outputFile, 50);
+        if (enriched > 0) {
+            console.log(`\nEnriched ${enriched} transaction(s) with transfer details`);
+        }
+    }
+
+    // ===================================================================================
+    // PHASE 5: Staking rewards collection
+    // ===================================================================================
+    if (!getStopSignal() && history.transactions.length > 0) {
+        const stakingRewards = await collectStakingRewards(accountId, history, outputFile);
+        if (stakingRewards > 0) {
+            console.log(`\nAdded ${stakingRewards} staking reward entries`);
+        }
+    }
+
+    // Final sort and save
+    history.transactions.sort((a, b) => a.block - b.block);
+    updateVerificationFields(history);
+    saveHistory(outputFile, history);
     
-    // Fall back to binary search for remaining transactions or if NearBlocks is not available
-    const remainingTransactions = maxTransactions - transactionsFound;
-    if (remainingTransactions > 0 && !getStopSignal()) {
-        console.log(`\nUsing binary search to find ${remainingTransactions} more transactions...`);
+    console.log(`\n=== Export complete ===`);
+    console.log(`Total transactions: ${history.metadata.totalTransactions}`);
+    console.log(`Block range: ${history.metadata.firstBlock} - ${history.metadata.lastBlock}`);
+    console.log(`Output saved to: ${outputFile}`);
+
+    return history;
+}
+
+/**
+ * Binary search for transactions in a block range.
+ * Returns the number of transactions found and added.
+ */
+async function searchForTransactions(
+    accountId: string,
+    history: AccountHistory,
+    outputFile: string,
+    searchStart: number,
+    searchEnd: number,
+    direction: 'forward' | 'backward',
+    maxTransactions: number,
+    currentBlockHeight?: number
+): Promise<number> {
+    let transactionsFound = 0;
+    let currentStart = searchStart;
+    let currentEnd = searchEnd;
+    const initialRangeSize = searchEnd - searchStart;
+    let currentRangeSize = initialRangeSize;
+    const maxRangeSize = Math.max(initialRangeSize * 32, 32000000);
+    
+    // For forward search, use provided currentBlockHeight or get it once
+    const blockHeightLimit = direction === 'forward' 
+        ? (currentBlockHeight || await getCurrentBlockHeight())
+        : undefined;
+    
+    while (transactionsFound < maxTransactions && !getStopSignal()) {
+        // Validate range
+        if (direction === 'backward' && currentEnd < 0) break;
+        if (direction === 'forward' && currentStart > currentEnd) break;
+        // For forward search, stop if we've reached the current block
+        if (direction === 'forward' && blockHeightLimit && currentStart >= blockHeightLimit) break;
         
-        let currentSearchEnd = searchEnd;
-        let currentSearchStart = searchStart;
-        const initialRangeSize = searchEnd - searchStart;
-        let currentRangeSize = initialRangeSize;
-        const maxRangeSize = initialRangeSize * 32; // Cap at 32x the initial range (~32M blocks max)
-        let consecutiveEmptyRanges = 0;
-
-    while (transactionsFound < maxTransactions) {
-        if (getStopSignal()) {
-            console.log('Stop signal received, saving progress...');
-            // Save immediately before breaking
-            history.updatedAt = new Date().toISOString();
-            saveHistory(outputFile, history);
-            console.log(`Progress saved to ${outputFile}`);
-            break;
-        }
-
-        // Check if current range is valid
-        if (direction === 'backward' && currentSearchEnd < 0) {
-            console.log('Reached the beginning of the blockchain');
-            break;
-        } else if (direction === 'forward' && currentSearchStart > currentBlock) {
-            console.log('Reached the current block height');
-            break;
-        }
-
-        console.log(`\nSearching for balance changes in blocks ${currentSearchStart} - ${currentSearchEnd}...`);
+        console.log(`  Searching blocks ${currentStart} - ${currentEnd}...`);
         
-        // Clear cache periodically to avoid memory issues
+        // Clear cache periodically
         if (transactionsFound % 10 === 0) {
             clearBalanceCache();
         }
-
-        // When searching backward, check if the account exists at the start of the range
-        // If it doesn't exist, we've reached the beginning of the account's history
+        
+        // Check account existence when searching backward
         if (direction === 'backward') {
             try {
-                const existsAtStart = await accountExistsAtBlock(accountId, currentSearchStart);
-                if (!existsAtStart) {
-                    console.log(`Account does not exist at block ${currentSearchStart} - reached the beginning of account history`);
-                    // Mark history as complete and save progress
+                const exists = await accountExistsAtBlock(accountId, currentStart);
+                if (!exists) {
+                    console.log(`  Account doesn't exist at block ${currentStart} - reached beginning`);
                     history.metadata.historyComplete = true;
-                    history.updatedAt = new Date().toISOString();
                     saveHistory(outputFile, history);
-                    console.log(`Progress saved to ${outputFile} (history complete)`);
                     break;
                 }
             } catch (error: any) {
-                if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
-                    console.log(`Error checking account existence: ${error.message}`);
-                    console.log('Stopping and saving progress...');
-                    history.updatedAt = new Date().toISOString();
+                if (error.message.includes('rate limit') || error.message.includes('cancelled')) {
                     saveHistory(outputFile, history);
-                    console.log(`Progress saved to ${outputFile}`);
                     break;
                 }
-                // For other errors (like missing blocks), continue with the search
-                console.warn(`Warning: Could not check account existence at block ${currentSearchStart}: ${error.message}`);
             }
         }
-
+        
         let balanceChange: BalanceChanges;
         try {
-            // Find the block where balance changed
-            balanceChange = await findLatestBalanceChangingBlock(
-                accountId,
-                currentSearchStart,
-                currentSearchEnd
-            );
+            balanceChange = await findLatestBalanceChangingBlock(accountId, currentStart, currentEnd);
         } catch (error: any) {
-            if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
-                console.log(`Error during search: ${error.message}`);
-                console.log('Stopping and saving progress...');
-                // Save immediately before breaking
-                history.updatedAt = new Date().toISOString();
+            if (error.message.includes('rate limit') || error.message.includes('cancelled')) {
                 saveHistory(outputFile, history);
-                console.log(`Progress saved to ${outputFile}`);
                 break;
             }
             if (error.message.includes('does not exist')) {
-                console.log(`Account does not exist at block ${currentSearchStart} - reached the beginning of account history`);
-                // Mark history as complete and save progress
                 if (direction === 'backward') {
                     history.metadata.historyComplete = true;
                 }
-                history.updatedAt = new Date().toISOString();
                 saveHistory(outputFile, history);
-                console.log(`Progress saved to ${outputFile} (history complete)`);
                 break;
             }
             throw error;
         }
-
-        if (!balanceChange.hasChanges) {
-            consecutiveEmptyRanges++;
-            
-            // Expand range size when we find no changes (double it each time, up to max)
+        
+        if (!balanceChange.hasChanges || !balanceChange.block) {
+            // No changes found - expand range
             if (currentRangeSize < maxRangeSize) {
                 currentRangeSize = Math.min(currentRangeSize * 2, maxRangeSize);
-                console.log(`No balance changes found. Expanding search range to ${currentRangeSize.toLocaleString()} blocks`);
-            } else {
-                console.log('No balance changes found in current range');
             }
             
-            // Move to adjacent range with (potentially expanded) size
             if (direction === 'backward') {
-                currentSearchEnd = currentSearchStart - 1;
-                currentSearchStart = Math.max(0, currentSearchEnd - currentRangeSize);
-                console.log(`Moving to previous range: ${currentSearchStart.toLocaleString()} - ${currentSearchEnd.toLocaleString()}`);
+                currentEnd = currentStart - 1;
+                currentStart = Math.max(0, currentEnd - currentRangeSize);
             } else {
-                currentSearchStart = currentSearchEnd + 1;
-                currentSearchEnd = Math.min(currentBlock, currentSearchStart + currentRangeSize);
-                console.log(`Moving to next range: ${currentSearchStart.toLocaleString()} - ${currentSearchEnd.toLocaleString()}`);
+                currentStart = currentEnd + 1;
+                // Cap at current block height to avoid searching future blocks
+                if (blockHeightLimit) {
+                    currentEnd = Math.min(currentStart + currentRangeSize, blockHeightLimit);
+                } else {
+                    currentEnd = currentStart + currentRangeSize;
+                }
+                // If we've already searched up to the current block, stop
+                if (currentStart >= currentEnd) {
+                    console.log(`  Reached current block height (${blockHeightLimit}) - stopping forward search`);
+                    break;
+                }
             }
             
-            // Save progress even when no transactions found
-            history.updatedAt = new Date().toISOString();
             saveHistory(outputFile, history);
-            console.log(`Progress saved to ${outputFile}`);
-            
             continue;
         }
-
-        // Found a balance change - reset range size to initial for more precise searching
-        if (currentRangeSize !== initialRangeSize) {
-            console.log(`Found balance change - resetting search range to ${initialRangeSize.toLocaleString()} blocks`);
-            currentRangeSize = initialRangeSize;
-        }
-        consecutiveEmptyRanges = 0;
-
-        console.log(`Found balance change at block ${balanceChange.block}`);
-
-        let txInfo: TransactionInfo;
-        try {
-            // Find the transaction that caused the change
-            txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block!);
-        } catch (error: any) {
-            if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
-                console.log(`Error fetching transaction details: ${error.message}`);
-                console.log('Stopping and saving progress...');
-                // Save immediately before breaking
-                history.updatedAt = new Date().toISOString();
-                saveHistory(outputFile, history);
-                console.log(`Progress saved to ${outputFile}`);
-                break;
+        
+        // Reset range size when we find something
+        currentRangeSize = initialRangeSize;
+        
+        // Check for duplicate
+        const existingEntry = history.transactions.find(t => t.block === balanceChange.block);
+        if (existingEntry) {
+            if (direction === 'backward') {
+                currentEnd = balanceChange.block! - 1;
+            } else {
+                currentStart = balanceChange.block! + 1;
             }
-            throw error;
+            continue;
         }
-
-        // Create transaction entry
+        
+        // Find transaction details
+        const txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block);
+        
+        // Create and add entry
         const entry: TransactionEntry = {
-            block: balanceChange.block!,
+            block: balanceChange.block,
             transactionBlock: txInfo.transactionBlock,
             timestamp: txInfo.blockTimestamp,
             transactionHashes: txInfo.transactionHashes,
@@ -1459,178 +1895,33 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
                 intentsChanged: balanceChange.intentsChanged
             }
         };
-
-        // Verify connectivity with adjacent transactions
-        if (direction === 'backward' && history.transactions.length > 0) {
-            const nextTransaction = history.transactions[0]; // Most recent in list
-            if (nextTransaction) {
-                const verification = verifyTransactionConnectivity(nextTransaction, entry);
-                entry.verificationWithNext = verification;
-                
-                if (!verification.valid) {
-                    console.warn(`Warning: Connectivity issue detected at block ${balanceChange.block}`);
-                    verification.errors.forEach(err => console.warn(`  - ${err.message}`));
-                    
-                    // There might be missing transactions between this block and the next
-                    // First check the block immediately after this one
-                    const immediateNextBlock = balanceChange.block! + 1;
-                    if (immediateNextBlock < nextTransaction.block && transactionsFound < maxTransactions) {
-                        console.log(`Checking for immediate balance change at block ${immediateNextBlock}`);
-                        try {
-                            // Skip if we already have this block
-                            const existingImmediate = history.transactions.find(t => t.block === immediateNextBlock);
-                            if (existingImmediate) {
-                                console.log(`Skipping duplicate immediate gap entry at block ${immediateNextBlock}`);
-                            } else {
-                                const immediateChange = await getBalanceChangesAtBlock(accountId, immediateNextBlock);
-                                if (immediateChange.hasChanges) {
-                                    // Found a missing transaction right after
-                                    const immTxInfo = await findBalanceChangingTransaction(accountId, immediateNextBlock);
-                                    const immEntry: TransactionEntry = {
-                                        block: immediateNextBlock,
-                                        timestamp: immTxInfo.blockTimestamp,
-                                        transactionHashes: immTxInfo.transactionHashes,
-                                        transactions: immTxInfo.transactions,
-                                        transfers: immTxInfo.transfers,
-                                        balanceBefore: immediateChange.startBalance,
-                                        balanceAfter: immediateChange.endBalance,
-                                        changes: {
-                                            nearChanged: immediateChange.nearChanged,
-                                            nearDiff: immediateChange.nearDiff,
-                                            tokensChanged: immediateChange.tokensChanged,
-                                            intentsChanged: immediateChange.intentsChanged
-                                        }
-                                    };
-                                    // Insert after the current entry (before nextTransaction)
-                                    history.transactions.splice(1, 0, immEntry);
-                                    transactionsFound++;
-                                    console.log(`Immediate gap transaction added at block ${immediateNextBlock}`);
-                                    
-                                    // Re-verify the chain
-                                    const newVerification = verifyTransactionConnectivity(immEntry, entry);
-                                    entry.verificationWithNext = newVerification;
-                                }
-                            }
-                        } catch (gapError: any) {
-                            console.warn(`Could not check immediate block: ${gapError.message}`);
-                        }
-                    }
-                    
-                    // If still not valid, search in the remaining gap
-                    if (entry.verificationWithNext && !entry.verificationWithNext.valid) {
-                        const gapStart = balanceChange.block! + 2; // Start after the immediate block we just checked
-                        const gapEnd = nextTransaction.block - 1;
-                        if (gapEnd >= gapStart && transactionsFound < maxTransactions) {
-                            console.log(`Searching for missing transactions in gap: ${gapStart} - ${gapEnd}`);
-                            try {
-                                const gapChange = await findLatestBalanceChangingBlock(accountId, gapStart, gapEnd);
-                                if (gapChange.hasChanges && gapChange.block) {
-                                    // Found a missing transaction, add it
-                                    const gapTxInfo = await findBalanceChangingTransaction(accountId, gapChange.block);
-                                    const gapEntry: TransactionEntry = {
-                                        block: gapChange.block,
-                                        timestamp: gapTxInfo.blockTimestamp,
-                                        transactionHashes: gapTxInfo.transactionHashes,
-                                        transactions: gapTxInfo.transactions,
-                                        transfers: gapTxInfo.transfers,
-                                        balanceBefore: gapChange.startBalance,
-                                        balanceAfter: gapChange.endBalance,
-                                        changes: {
-                                            nearChanged: gapChange.nearChanged,
-                                            nearDiff: gapChange.nearDiff,
-                                            tokensChanged: gapChange.tokensChanged,
-                                            intentsChanged: gapChange.intentsChanged
-                                        }
-                                    };
-                                    // Insert in the right position if not duplicate
-                                    const gapBlock = gapChange.block!;
-                                    const existingGapEntry = history.transactions.find(t => t.block === gapBlock);
-                                    if (!existingGapEntry) {
-                                        const insertPos = history.transactions.findIndex(t => t.block > gapBlock);
-                                        if (insertPos >= 0) {
-                                            history.transactions.splice(insertPos, 0, gapEntry);
-                                        } else {
-                                            history.transactions.push(gapEntry);
-                                        }
-                                        transactionsFound++;
-                                        console.log(`Gap transaction added at block ${gapBlock}`);
-                                    } else {
-                                        console.log(`Skipping duplicate gap entry at block ${gapBlock}`);
-                                    }
-                                }
-                            } catch (gapError: any) {
-                                console.warn(`Could not search gap: ${gapError.message}`);
-                            }
-                        }
-                    }
-                }
-            }
-        } else if (direction === 'forward' && history.transactions.length > 0) {
-            const prevTransaction = history.transactions[history.transactions.length - 1];
-            if (prevTransaction) {
-                const verification = verifyTransactionConnectivity(entry, prevTransaction);
-                entry.verificationWithPrevious = verification;
-                
-                if (!verification.valid) {
-                    console.warn(`Warning: Connectivity issue detected at block ${balanceChange.block}`);
-                    verification.errors.forEach(err => console.warn(`  - ${err.message}`));
-                }
-            }
-        }
-
-        // Check for duplicate block before adding
-        const existingAtBlock = history.transactions.find(t => t.block === entry.block);
-        if (existingAtBlock) {
-            console.log(`Skipping duplicate entry at block ${entry.block}`);
-            // Still update search range to move past this block
-            if (direction === 'backward') {
-                currentSearchEnd = entry.block - 1;
-            } else {
-                currentSearchStart = entry.block + 1;
-            }
-            continue;
-        }
-
-        // Add to history in correct order
-        if (direction === 'backward') {
-            history.transactions.unshift(entry);
-        } else {
-            history.transactions.push(entry);
-        }
-
+        
+        history.transactions.push(entry);
         transactionsFound++;
-        console.log(`Transaction ${transactionsFound}/${maxTransactions} added`);
-
-        // Update search range for next iteration
-        if (direction === 'backward') {
-            currentSearchEnd = balanceChange.block! - 1;
-        } else {
-            currentSearchStart = balanceChange.block! + 1;
-        }
-
+        
+        console.log(`    Found transaction at block ${balanceChange.block}`);
+        
         // Update metadata
         const allBlocks = history.transactions.map(t => t.block);
         history.metadata.firstBlock = Math.min(...allBlocks);
         history.metadata.lastBlock = Math.max(...allBlocks);
         history.metadata.totalTransactions = history.transactions.length;
-        history.updatedAt = new Date().toISOString();
-
-        // Save progress periodically
+        
+        // Update search range
+        if (direction === 'backward') {
+            currentEnd = balanceChange.block - 1;
+        } else {
+            currentStart = balanceChange.block + 1;
+        }
+        
+        // Save periodically
         if (transactionsFound % 5 === 0) {
+            history.updatedAt = new Date().toISOString();
             saveHistory(outputFile, history);
-            console.log(`Progress saved to ${outputFile}`);
         }
     }
-    } // End of binary search fallback block
-
-    // Final save
-    saveHistory(outputFile, history);
-    console.log(`\n=== Export complete ===`);
-    console.log(`Total transactions: ${history.metadata.totalTransactions}`);
-    console.log(`Block range: ${history.metadata.firstBlock} - ${history.metadata.lastBlock}`);
-    console.log(`Output saved to: ${outputFile}`);
-
-    return history;
+    
+    return transactionsFound;
 }
 
 /**
@@ -1780,30 +2071,62 @@ function parseArgs(): ParsedArgs {
     };
 
     for (let i = 0; i < args.length; i++) {
-        const arg = args[i];
+        let arg = args[i];
+        let value: string | undefined;
+        
+        // Handle --option=value style arguments
+        if (arg && arg.includes('=')) {
+            const [key, val] = arg.split('=', 2);
+            arg = key;
+            value = val;
+        }
         
         switch (arg) {
             case '--account':
             case '-a':
-                if (args[i + 1]) options.accountId = args[++i] ?? null;
+                if (value !== undefined) {
+                    options.accountId = value;
+                } else if (args[i + 1]) {
+                    options.accountId = args[++i] ?? null;
+                }
                 break;
             case '--output':
             case '-o':
-                if (args[i + 1]) options.outputFile = args[++i] ?? null;
+                if (value !== undefined) {
+                    options.outputFile = value;
+                } else if (args[i + 1]) {
+                    options.outputFile = args[++i] ?? null;
+                }
                 break;
             case '--direction':
             case '-d':
-                if (args[i + 1]) options.direction = args[++i] as 'forward' | 'backward';
+                if (value !== undefined) {
+                    options.direction = value as 'forward' | 'backward';
+                } else if (args[i + 1]) {
+                    options.direction = args[++i] as 'forward' | 'backward';
+                }
                 break;
             case '--max':
             case '-m':
-                if (args[i + 1]) options.maxTransactions = parseInt(args[++i]!, 10);
+                if (value !== undefined) {
+                    options.maxTransactions = parseInt(value, 10);
+                } else if (args[i + 1]) {
+                    options.maxTransactions = parseInt(args[++i]!, 10);
+                }
                 break;
             case '--start-block':
-                if (args[i + 1]) options.startBlock = parseInt(args[++i]!, 10);
+                if (value !== undefined) {
+                    options.startBlock = parseInt(value, 10);
+                } else if (args[i + 1]) {
+                    options.startBlock = parseInt(args[++i]!, 10);
+                }
                 break;
             case '--end-block':
-                if (args[i + 1]) options.endBlock = parseInt(args[++i]!, 10);
+                if (value !== undefined) {
+                    options.endBlock = parseInt(value, 10);
+                } else if (args[i + 1]) {
+                    options.endBlock = parseInt(args[++i]!, 10);
+                }
                 break;
             case '--verify':
             case '-v':

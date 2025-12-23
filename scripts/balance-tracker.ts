@@ -628,8 +628,8 @@ export async function findLatestBalanceChangingBlock(
 
     if (numBlocks <= 0) {
         // Re-fetch complete balances to ensure we have full snapshot
-        const completeStartBalance = await getAllBalances(accountId, firstBlock - 1, undefined, undefined, true);
-        const completeEndBalance = await getAllBalances(accountId, firstBlock, undefined, undefined, true);
+        const completeStartBalance = await getAllBalances(accountId, firstBlock - 1, tokenContracts, intentsTokens, checkNear);
+        const completeEndBalance = await getAllBalances(accountId, firstBlock, tokenContracts, intentsTokens, checkNear);
         const completeChanges = detectBalanceChanges(completeStartBalance, completeEndBalance);
         completeChanges.block = firstBlock;
         completeChanges.startBalance = completeStartBalance;
@@ -639,8 +639,8 @@ export async function findLatestBalanceChangingBlock(
 
     if (numBlocks === 1) {
         // Re-fetch complete balances to ensure we have full snapshot
-        const completeStartBalance = await getAllBalances(accountId, lastBlock - 1, undefined, undefined, true);
-        const completeEndBalance = await getAllBalances(accountId, lastBlock, undefined, undefined, true);
+        const completeStartBalance = await getAllBalances(accountId, lastBlock - 1, tokenContracts, intentsTokens, checkNear);
+        const completeEndBalance = await getAllBalances(accountId, lastBlock, tokenContracts, intentsTokens, checkNear);
         const completeChanges = detectBalanceChanges(completeStartBalance, completeEndBalance);
         completeChanges.block = lastBlock;
         completeChanges.startBalance = completeStartBalance;
