@@ -116,10 +116,35 @@ docker run -v $(pwd)/data:/data near-accounting-export \
   --max 50
 ```
 
+## Test-Driven Development
+
+When fixing issues, always follow a test-driven approach:
+
+1. **Create a Failing Test First**: Write an integration test that reproduces the issue and asserts the expected behavior. The test should fail until the issue is fixed.
+
+2. **Make the Test Specific**: Use real data from the failing scenario to ensure the test accurately reproduces the problem.
+
+3. **Assert the Fix**: The test should assert that after applying the fix, the problem is resolved. For example:
+   - If fixing gap-filling: assert that gaps are filled after running the logic
+   - If fixing balance tracking: assert that balances are correctly calculated
+   - If fixing API integration: assert that data is correctly fetched and processed
+
+4. **Run the Test**: Verify the test fails with a clear error message showing what needs to be fixed.
+
+5. **Implement the Fix**: Modify the code to make the test pass.
+
+6. **Verify**: Run the test again to confirm it passes.
+
+Example: For the gap-filling issue at block 158500929, we created `test/integration/gap-investigation.test.ts` that:
+- Reproduces the exact gap scenario with real balance data
+- Runs the binary search logic that's failing
+- Asserts that binary search SHOULD detect balance changes (fails until fixed)
+- Asserts that after filling, there should be NO gaps remaining
+
 ## Contributing
 
 When adding new features:
 1. Follow the existing module pattern (ES modules with named exports)
-2. Add appropriate tests
+2. Add appropriate tests (see Test-Driven Development above)
 3. Handle the stop signal for graceful cancellation
 4. Update this documentation if adding new functionality
