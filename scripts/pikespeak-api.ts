@@ -288,19 +288,30 @@ const BALANCE_CHANGING_EVENT_TYPES: PikespeakEventType[] = [
 /**
  * Get all transaction blocks from Pikespeak API using /event-historic endpoint
  * Returns unique block heights where balance-changing events occurred
+ * 
+ * Note: Pikespeak API doesn't support block-based filtering, so we fetch all events
+ * and filter by block range in-memory after fetching. For large accounts with many
+ * events, this may be slower than NearBlocks API when filtering to a specific range.
  */
 export async function getAllPikespeakTransactionBlocks(
     accountId: string,
     options: {
+        afterBlock?: number;   // Only include blocks > afterBlock
+        beforeBlock?: number;  // Only include blocks < beforeBlock
         maxEvents?: number;
     } = {}
 ): Promise<PikespeakTransactionBlock[]> {
-    const { maxEvents = 1000 } = options;
+    const { afterBlock, beforeBlock } = options;
+    // If maxEvents is undefined, use Infinity to fetch all available events
+    const maxEvents = options.maxEvents ?? Infinity;
     
     const transactions: PikespeakTransactionBlock[] = [];
     const seenBlocks = new Set<number>();
     
     console.log(`Fetching transaction blocks from Pikespeak API for account ${accountId}...`);
+    if (afterBlock || beforeBlock) {
+        console.log(`  Block range filter: ${afterBlock ?? 0} - ${beforeBlock ?? 'latest'}`);
+    }
     
     // First get total count
     let totalCount: number;
@@ -309,14 +320,23 @@ export async function getAllPikespeakTransactionBlocks(
         console.log(`  Total events: ${totalCount}`);
     } catch (error: any) {
         console.warn(`  Could not get event count: ${error.message}`);
-        totalCount = maxEvents;
+        totalCount = maxEvents === Infinity ? 10000 : maxEvents;
     }
     
     const limit = 50;
     let offset = 0;
     let fetchedEvents = 0;
+    let skippedByRange = 0;
     
-    while (offset < Math.min(totalCount, maxEvents)) {
+    // When maxEvents is Infinity, only limit by totalCount
+    const effectiveMax = maxEvents === Infinity ? totalCount : Math.min(totalCount, maxEvents);
+    
+    // Track if we've seen any blocks in range (to enable early exit for sorted data)
+    let seenBlocksInRange = false;
+    let consecutiveOutOfRange = 0;
+    const MAX_CONSECUTIVE_OUT_OF_RANGE = 200; // Stop if we've passed the range
+    
+    while (offset < effectiveMax) {
         try {
             const events = await fetchEventHistoric(accountId, { limit, offset });
             
@@ -333,6 +353,29 @@ export async function getAllPikespeakTransactionBlocks(
                 }
                 
                 const blockHeight = parseInt(event.block_height, 10);
+                
+                // Apply block range filter
+                if (afterBlock !== undefined && blockHeight <= afterBlock) {
+                    skippedByRange++;
+                    consecutiveOutOfRange++;
+                    // If we've seen blocks in range and now we're consistently out of range,
+                    // we can stop early (events are sorted by time/block descending)
+                    if (seenBlocksInRange && consecutiveOutOfRange > MAX_CONSECUTIVE_OUT_OF_RANGE) {
+                        console.log(`  Early exit: passed block range filter (${consecutiveOutOfRange} consecutive out-of-range)`);
+                        offset = effectiveMax; // Force exit from outer loop
+                        break;
+                    }
+                    continue;
+                }
+                if (beforeBlock !== undefined && blockHeight >= beforeBlock) {
+                    skippedByRange++;
+                    // Don't increment consecutiveOutOfRange here - we haven't reached the range yet
+                    continue;
+                }
+                
+                // Reset consecutive counter when we find an in-range block
+                consecutiveOutOfRange = 0;
+                seenBlocksInRange = true;
                 
                 // Skip if we've already seen this block
                 // (We want unique blocks, not duplicate events in same block)
@@ -355,7 +398,8 @@ export async function getAllPikespeakTransactionBlocks(
                 });
             }
             
-            console.log(`  Fetched ${fetchedEvents}/${Math.min(totalCount, maxEvents)} events, ${transactions.length} unique balance-changing blocks`);
+            const rangeInfo = skippedByRange > 0 ? `, ${skippedByRange} filtered by range` : '';
+            console.log(`  Fetched ${fetchedEvents}/${effectiveMax} events, ${transactions.length} unique balance-changing blocks${rangeInfo}`);
             
             offset += limit;
             

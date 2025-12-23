@@ -1,0 +1,417 @@
+/**
+ * Gap Detection Module
+ * 
+ * Pure functions for detecting gaps in transaction history.
+ * Gaps are detected by comparing balances between consecutive records.
+ * 
+ * This module is stateless and performs no I/O - it operates purely on in-memory data.
+ */
+
+/**
+ * A balance snapshot at a specific block
+ */
+export interface BalanceSnapshot {
+    near: string;
+    fungibleTokens: Record<string, string>;
+    intentsTokens: Record<string, string>;
+    stakingPools?: Record<string, string>;
+}
+
+/**
+ * A transfer detail record
+ */
+export interface TransferDetail {
+    type: 'near' | 'ft' | 'mt' | 'staking_reward' | 'action_receipt_gas_reward';
+    direction: 'in' | 'out';
+    amount: string;
+    counterparty: string;
+    tokenId?: string;
+    memo?: string;
+    txHash?: string;
+    receiptId?: string;
+}
+
+/**
+ * A transaction entry representing a block with balance changes
+ */
+export interface TransactionEntry {
+    block: number;
+    transactionBlock?: number | null;
+    timestamp?: number | null;
+    transactionHashes?: string[];
+    transactions?: any[];
+    transfers?: TransferDetail[];
+    balanceBefore?: BalanceSnapshot;
+    balanceAfter?: BalanceSnapshot;
+    changes: {
+        nearChanged: boolean;
+        nearDiff?: string;
+        tokensChanged: Record<string, { start: string; end: string; diff: string }>;
+        intentsChanged: Record<string, { start: string; end: string; diff: string }>;
+        stakingChanged?: Record<string, { start: string; end: string; diff: string }>;
+    };
+}
+
+/**
+ * A verification result for balance connectivity between two records
+ */
+export interface VerificationResult {
+    valid: boolean;
+    errors: VerificationError[];
+}
+
+export interface VerificationError {
+    type: 'near_balance_mismatch' | 'token_balance_mismatch' | 'intents_balance_mismatch' | 'staking_balance_mismatch';
+    token?: string;
+    pool?: string;
+    expected: string;
+    actual: string;
+    message: string;
+}
+
+/**
+ * A detected gap in the transaction history
+ */
+export interface Gap {
+    /** Block number of the earlier record */
+    startBlock: number;
+    /** Block number of the later record */
+    endBlock: number;
+    /** The earlier transaction record */
+    prevTransaction: TransactionEntry;
+    /** The later transaction record */
+    nextTransaction: TransactionEntry;
+    /** Details about what changed in the gap */
+    verification: VerificationResult;
+}
+
+/**
+ * Summary of all gaps detected in the history
+ */
+export interface GapAnalysis {
+    /** Total number of gaps detected */
+    totalGaps: number;
+    /** Gaps between existing records */
+    internalGaps: Gap[];
+    /** Gap from earliest record back to account creation (if balanceBefore is non-zero) */
+    gapToCreation: Gap | null;
+    /** Gap from latest record to current on-chain state (requires external balance check) */
+    gapToPresent: Gap | null;
+    /** Whether the history is complete (no gaps) */
+    isComplete: boolean;
+}
+
+/**
+ * Check if a transaction entry is a staking-only entry (synthetic staking reward).
+ * Staking-only entries don't track NEAR/FT/intents balances and should be excluded from gap detection.
+ */
+export function isStakingOnlyEntry(tx: TransactionEntry): boolean {
+    // Staking-only entries have:
+    // - No transaction hashes (synthetic entry)
+    // - stakingChanged in changes
+    // - near balance of '0' (not tracked)
+    const hasNoTxHashes = !tx.transactionHashes || tx.transactionHashes.length === 0;
+    const hasStakingChanges = Boolean(tx.changes?.stakingChanged && Object.keys(tx.changes.stakingChanged).length > 0);
+    const hasNoOtherChanges = !tx.changes?.nearChanged && 
+        Object.keys(tx.changes?.tokensChanged || {}).length === 0 &&
+        Object.keys(tx.changes?.intentsChanged || {}).length === 0;
+    
+    return hasNoTxHashes && hasStakingChanges && hasNoOtherChanges;
+}
+
+/**
+ * Compare two balance snapshots and return verification result.
+ * The expected balance is what we have after the previous record.
+ * The actual balance is what we have before the current record.
+ */
+export function compareBalances(
+    expected: BalanceSnapshot | undefined,
+    actual: BalanceSnapshot | undefined
+): VerificationResult {
+    const result: VerificationResult = {
+        valid: true,
+        errors: []
+    };
+
+    // Compare NEAR balance
+    const expectedNear = expected?.near || '0';
+    const actualNear = actual?.near || '0';
+
+    if (expectedNear !== actualNear) {
+        result.valid = false;
+        result.errors.push({
+            type: 'near_balance_mismatch',
+            expected: expectedNear,
+            actual: actualNear,
+            message: `NEAR balance mismatch: expected ${expectedNear} but got ${actualNear}`
+        });
+    }
+
+    // Compare fungible token balances
+    const expectedTokens = expected?.fungibleTokens || {};
+    const actualTokens = actual?.fungibleTokens || {};
+    const allTokens = new Set([...Object.keys(expectedTokens), ...Object.keys(actualTokens)]);
+
+    for (const token of allTokens) {
+        const expectedVal = expectedTokens[token] || '0';
+        const actualVal = actualTokens[token] || '0';
+        if (expectedVal !== actualVal) {
+            result.valid = false;
+            result.errors.push({
+                type: 'token_balance_mismatch',
+                token,
+                expected: expectedVal,
+                actual: actualVal,
+                message: `Token ${token} balance mismatch: expected ${expectedVal} but got ${actualVal}`
+            });
+        }
+    }
+
+    // Compare intents token balances
+    const expectedIntents = expected?.intentsTokens || {};
+    const actualIntents = actual?.intentsTokens || {};
+    const allIntents = new Set([...Object.keys(expectedIntents), ...Object.keys(actualIntents)]);
+
+    for (const token of allIntents) {
+        const expectedVal = expectedIntents[token] || '0';
+        const actualVal = actualIntents[token] || '0';
+        if (expectedVal !== actualVal) {
+            result.valid = false;
+            result.errors.push({
+                type: 'intents_balance_mismatch',
+                token,
+                expected: expectedVal,
+                actual: actualVal,
+                message: `Intents token ${token} balance mismatch: expected ${expectedVal} but got ${actualVal}`
+            });
+        }
+    }
+
+    // Compare staking pool balances
+    const expectedStaking = expected?.stakingPools || {};
+    const actualStaking = actual?.stakingPools || {};
+    const allPools = new Set([...Object.keys(expectedStaking), ...Object.keys(actualStaking)]);
+
+    for (const pool of allPools) {
+        const expectedVal = expectedStaking[pool] || '0';
+        const actualVal = actualStaking[pool] || '0';
+        if (expectedVal !== actualVal) {
+            result.valid = false;
+            result.errors.push({
+                type: 'staking_balance_mismatch',
+                pool,
+                expected: expectedVal,
+                actual: actualVal,
+                message: `Staking pool ${pool} balance mismatch: expected ${expectedVal} but got ${actualVal}`
+            });
+        }
+    }
+
+    return result;
+}
+
+/**
+ * Check if a balance snapshot represents a zero/empty state (account not yet created).
+ */
+export function isZeroBalance(balance: BalanceSnapshot | undefined): boolean {
+    if (!balance) return true;
+    
+    // Check NEAR
+    if (balance.near && balance.near !== '0') return false;
+    
+    // Check fungible tokens
+    for (const val of Object.values(balance.fungibleTokens || {})) {
+        if (val && val !== '0') return false;
+    }
+    
+    // Check intents tokens
+    for (const val of Object.values(balance.intentsTokens || {})) {
+        if (val && val !== '0') return false;
+    }
+    
+    // Check staking pools
+    for (const val of Object.values(balance.stakingPools || {})) {
+        if (val && val !== '0') return false;
+    }
+    
+    return true;
+}
+
+/**
+ * Detect all gaps in a transaction history.
+ * 
+ * This is a pure function that operates on in-memory data.
+ * It does NOT perform any I/O or blockchain queries.
+ * 
+ * @param transactions - Array of transaction entries (will be sorted internally)
+ * @param currentBalance - Optional: current on-chain balance to detect gap to present
+ * @returns Analysis of all detected gaps
+ */
+export function detectGaps(
+    transactions: TransactionEntry[],
+    currentBalance?: BalanceSnapshot
+): GapAnalysis {
+    const analysis: GapAnalysis = {
+        totalGaps: 0,
+        internalGaps: [],
+        gapToCreation: null,
+        gapToPresent: null,
+        isComplete: true
+    };
+
+    if (transactions.length === 0) {
+        // No data - we can't detect gaps without at least one record
+        // The caller needs to fetch initial data first
+        return analysis;
+    }
+
+    // Sort transactions by block and filter out staking-only entries
+    // Staking-only entries are synthetic (no actual on-chain tx) and don't track NEAR/FT/intents balances
+    const sortedTransactions = [...transactions]
+        .filter(tx => !isStakingOnlyEntry(tx))
+        .sort((a, b) => a.block - b.block);
+
+    if (sortedTransactions.length === 0) {
+        return analysis;
+    }
+
+    // 1. Detect internal gaps (between consecutive records)
+    for (let i = 1; i < sortedTransactions.length; i++) {
+        const prevTx = sortedTransactions[i - 1]!;
+        const currTx = sortedTransactions[i]!;
+
+        const verification = compareBalances(prevTx.balanceAfter, currTx.balanceBefore);
+
+        if (!verification.valid) {
+            analysis.internalGaps.push({
+                startBlock: prevTx.block,
+                endBlock: currTx.block,
+                prevTransaction: prevTx,
+                nextTransaction: currTx,
+                verification
+            });
+            analysis.isComplete = false;
+        }
+    }
+
+    // 2. Detect gap to account creation (if earliest balance is non-zero)
+    const earliestTx = sortedTransactions[0]!;
+    if (!isZeroBalance(earliestTx.balanceBefore)) {
+        // Create a synthetic "zero balance" record representing account creation
+        const zeroBalance: BalanceSnapshot = {
+            near: '0',
+            fungibleTokens: {},
+            intentsTokens: {},
+            stakingPools: {}
+        };
+        
+        const verification = compareBalances(zeroBalance, earliestTx.balanceBefore);
+        
+        analysis.gapToCreation = {
+            startBlock: 0, // Account creation block (unknown)
+            endBlock: earliestTx.block,
+            prevTransaction: {
+                block: 0,
+                balanceBefore: zeroBalance,
+                balanceAfter: zeroBalance,
+                changes: { nearChanged: false, tokensChanged: {}, intentsChanged: {} }
+            } as TransactionEntry,
+            nextTransaction: earliestTx,
+            verification
+        };
+        analysis.isComplete = false;
+    }
+
+    // 3. Detect gap to present (if current balance is provided and differs from latest)
+    if (currentBalance) {
+        const latestTx = sortedTransactions[sortedTransactions.length - 1]!;
+        const verification = compareBalances(latestTx.balanceAfter, currentBalance);
+
+        if (!verification.valid) {
+            analysis.gapToPresent = {
+                startBlock: latestTx.block,
+                endBlock: Infinity, // Current block (unknown)
+                prevTransaction: latestTx,
+                nextTransaction: {
+                    block: Infinity,
+                    balanceBefore: currentBalance,
+                    balanceAfter: currentBalance,
+                    changes: { nearChanged: false, tokensChanged: {}, intentsChanged: {} }
+                } as TransactionEntry,
+                verification
+            };
+            analysis.isComplete = false;
+        }
+    }
+
+    // Calculate total gaps
+    analysis.totalGaps = analysis.internalGaps.length + 
+        (analysis.gapToCreation ? 1 : 0) + 
+        (analysis.gapToPresent ? 1 : 0);
+
+    return analysis;
+}
+
+/**
+ * Get a summary of which tokens/assets changed in a gap.
+ * Useful for knowing which tokens to query when filling the gap.
+ */
+export function getGapChangedAssets(gap: Gap): {
+    nearChanged: boolean;
+    fungibleTokensChanged: string[];
+    intentsTokensChanged: string[];
+    stakingPoolsChanged: string[];
+} {
+    const result = {
+        nearChanged: false,
+        fungibleTokensChanged: [] as string[],
+        intentsTokensChanged: [] as string[],
+        stakingPoolsChanged: [] as string[]
+    };
+
+    for (const error of gap.verification.errors) {
+        switch (error.type) {
+            case 'near_balance_mismatch':
+                result.nearChanged = true;
+                break;
+            case 'token_balance_mismatch':
+                if (error.token) result.fungibleTokensChanged.push(error.token);
+                break;
+            case 'intents_balance_mismatch':
+                if (error.token) result.intentsTokensChanged.push(error.token);
+                break;
+            case 'staking_balance_mismatch':
+                if (error.pool) result.stakingPoolsChanged.push(error.pool);
+                break;
+        }
+    }
+
+    return result;
+}
+
+/**
+ * Get all unique tokens that appear in a list of gaps.
+ * Useful for knowing which tokens to track when filling gaps.
+ */
+export function getAllTokensFromGaps(gaps: Gap[]): {
+    fungibleTokens: string[];
+    intentsTokens: string[];
+    stakingPools: string[];
+} {
+    const fungibleTokens = new Set<string>();
+    const intentsTokens = new Set<string>();
+    const stakingPools = new Set<string>();
+
+    for (const gap of gaps) {
+        const changed = getGapChangedAssets(gap);
+        changed.fungibleTokensChanged.forEach(t => fungibleTokens.add(t));
+        changed.intentsTokensChanged.forEach(t => intentsTokens.add(t));
+        changed.stakingPoolsChanged.forEach(t => stakingPools.add(t));
+    }
+
+    return {
+        fungibleTokens: [...fungibleTokens],
+        intentsTokens: [...intentsTokens],
+        stakingPools: [...stakingPools]
+    };
+}
