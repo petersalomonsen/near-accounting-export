@@ -985,7 +985,7 @@ async function fillGapWithBinarySearch(
     gap: Gap,
     maxTransactions: number
 ): Promise<number> {
-    const searchStart = gap.startBlock + 1;
+    const searchStart = gap.startBlock;  // Start from the last known good block to detect changes at gap boundary
     const searchEnd = gap.endBlock - 1;
     
     if (searchStart > searchEnd) {

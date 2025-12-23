@@ -202,8 +202,8 @@ describe('Gap Filling Failure - Block 158500928-158500955', function() {
         console.log('\n=== Running Binary Search ===');
         const result = await findLatestBalanceChangingBlock(
             accountId,
-            gap.startBlock + 1, // Search from 158500929
-            gap.endBlock - 1,    // to 158500954
+            gap.startBlock,      // Search from 158500928 (the last known good block)
+            gap.endBlock - 1,    // to 158500954 (the block before the next transaction)
             tokenContracts,
             intentsTokens
         );
