@@ -230,6 +230,32 @@ The gap analysis tool will:
 
 This is useful for verifying data completeness and identifying missing transactions.
 
+## JSON File Sanitization
+
+Remove large binary data payloads from existing account JSON files to reduce file sizes:
+
+```bash
+# Dry run to see what would be sanitized
+npm run sanitize-json -- --dry-run myaccount.near.json
+
+# Create a sanitized copy (myaccount.near.sanitized.json)
+npm run sanitize-json -- myaccount.near.json
+
+# Sanitize in place (overwrites original file)
+npm run sanitize-json -- --in-place myaccount.near.json
+
+# Sanitize multiple files
+npm run sanitize-json -- --in-place *.near.json
+```
+
+The sanitizer:
+- Replaces binary data in transaction args with `"BINARY_DATA"` marker
+- Preserves JSON-decodable args (contract call parameters)
+- Can reduce file sizes by 90%+ for files with large binary payloads
+- Automatically applied to new data collection
+
+**Note**: Going forward, newly collected transaction data will be automatically sanitized to prevent large binary payloads from being stored.
+
 ## CSV Export
 
 Convert the JSON accounting history to CSV format for import into spreadsheet software:

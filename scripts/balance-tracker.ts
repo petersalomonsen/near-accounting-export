@@ -13,6 +13,7 @@ import {
 } from './rpc.js';
 import type { RpcBlockResponse } from '@near-js/jsonrpc-types';
 import type { ReceiptExecutionOutcome, NeardataBlockResponse } from './rpc.js';
+import { sanitizeTransaction } from './transaction-sanitizer.js';
 
 // Types
 export interface BalanceSnapshot {
@@ -1228,12 +1229,14 @@ export async function findBalanceChangingTransaction(
 
                                 if (txResult?.transaction) {
                                     const txInfo = txResult.transaction;
-                                    fetchedTransactions.push({
+                                    const txData = {
                                         hash: txHash,
                                         signerId: txInfo.signer_id,
                                         receiverId: txInfo.receiver_id,
                                         actions: txInfo.actions || []
-                                    });
+                                    };
+                                    // Sanitize transaction to remove large binary payloads
+                                    fetchedTransactions.push(sanitizeTransaction(txData));
                                 }
                             } catch (error: any) {
                                 console.error(`Error fetching transaction ${txHash}:`, error.message);
@@ -1279,12 +1282,14 @@ export async function findBalanceChangingTransaction(
                             const txResult = await getTransactionStatusWithReceipts(txHash, signerId);
                             
                             if (txResult?.transaction) {
-                                fetchedTransactions.push({
+                                const txData = {
                                     hash: txHash,
                                     signerId: txResult.transaction.signer_id,
                                     receiverId: txResult.transaction.receiver_id,
                                     actions: txResult.transaction.actions || []
-                                });
+                                };
+                                // Sanitize transaction to remove large binary payloads
+                                fetchedTransactions.push(sanitizeTransaction(txData));
                                 
                                 // Extract transfers from receipts_outcome
                                 for (const receiptOutcome of txResult.receipts_outcome || []) {
