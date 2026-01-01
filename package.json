@@ -13,6 +13,7 @@
     "start": "npm run build && node dist/scripts/get-account-history.js",
     "api": "npm run build && node dist/scripts/api-server.js",
     "json-to-csv": "npm run build && node dist/scripts/json-to-csv.js",
+    "analyze-gaps": "npm run build && node dist/scripts/analyze-gaps.js",
     "test": "npm run build && mocha --timeout 60000 'dist/test/**/*.test.js'",
     "test:unit": "npm run build && mocha --timeout 60000 'dist/test/unit/**/*.test.js'",
     "test:integration": "npm run build && mocha --timeout 60000 'dist/test/integration/**/*.test.js'",

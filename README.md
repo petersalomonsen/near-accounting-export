@@ -207,6 +207,29 @@ The output JSON file contains:
 npm test
 ```
 
+## Gap Analysis
+
+Analyze account history files to detect balance gaps where `balanceBefore` does not match `balanceAfter` of the previous entry:
+
+```bash
+# Analyze gaps in an account history file
+npm run analyze-gaps -- myaccount.near.json
+
+# Or use the compiled script directly
+node dist/scripts/analyze-gaps.js myaccount.near.json
+
+# Using long options
+node dist/scripts/analyze-gaps.js --input myaccount.near.json
+```
+
+The gap analysis tool will:
+- Detect internal gaps between consecutive transactions
+- Detect gaps from account creation (if earliest balance is non-zero)
+- Show detailed mismatch information for each gap
+- Exit with code 0 if no gaps found, code 1 if gaps detected
+
+This is useful for verifying data completeness and identifying missing transactions.
+
 ## CSV Export
 
 Convert the JSON accounting history to CSV format for import into spreadsheet software:
