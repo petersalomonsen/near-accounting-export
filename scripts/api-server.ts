@@ -266,64 +266,26 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
     
     // Check if history is complete (backward search done)
     const historyComplete = historyFile?.metadata?.historyComplete === true;
-    
-    // Create job for tracking
-    const jobId = uuidv4();
-    const now = new Date().toISOString();
-    
+
     try {
         // ALWAYS search forward FIRST to get latest data (priority: freshness over completeness)
         console.log(`[${accountId}] Searching forward (checking for new transactions)`);
         result.forward = true;
-        
-        const forwardJobId = uuidv4();
-        const forwardJob: Job = {
-            jobId: forwardJobId,
-            accountId,
-            status: 'running',
-            createdAt: new Date().toISOString(),
-            startedAt: new Date().toISOString(),
-            options: {
-                direction: 'forward',
-                maxTransactions: SYNC_CONFIG.batchSize
-            }
-        };
-        
-        const jobsDb = loadJobs();
-        jobsDb.jobs[forwardJobId] = forwardJob;
-        saveJobs(jobsDb);
-        
+
         const forwardPromise = (async () => {
             try {
                 await getAccountHistory({
                     accountId,
                     outputFile,
                     direction: 'forward',
-                    maxTransactions: SYNC_CONFIG.batchSize
+                    maxTransactions: SYNC_CONFIG.batchSize,
+                    maxEpochsToCheck: SYNC_CONFIG.maxEpochsPerCycle
                 });
-                
-                // Mark as completed
-                const updatedJobsDb = loadJobs();
-                const completedJob = updatedJobsDb.jobs[forwardJobId];
-                if (completedJob) {
-                    completedJob.status = 'completed';
-                    completedJob.completedAt = new Date().toISOString();
-                    saveJobs(updatedJobsDb);
-                }
             } catch (error) {
-                // Mark as failed
-                const updatedJobsDb = loadJobs();
-                const failedJob = updatedJobsDb.jobs[forwardJobId];
-                if (failedJob) {
-                    failedJob.status = 'failed';
-                    failedJob.error = error instanceof Error ? error.message : String(error);
-                    failedJob.completedAt = new Date().toISOString();
-                    saveJobs(updatedJobsDb);
-                }
                 console.error(`[${accountId}] Forward search failed:`, error);
             }
         })();
-        
+
         runningJobs.set(accountId, forwardPromise);
         await forwardPromise;
         runningJobs.delete(accountId);
@@ -338,23 +300,6 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
             console.log(`[${accountId}] Searching backward (incremental - history incomplete)`);
             result.backward = true;
 
-            const backwardJobId = uuidv4();
-            const backwardJob: Job = {
-                jobId: backwardJobId,
-                accountId,
-                status: 'running',
-                createdAt: new Date().toISOString(),
-                startedAt: new Date().toISOString(),
-                options: {
-                    direction: 'backward',
-                    maxTransactions: SYNC_CONFIG.batchSize
-                }
-            };
-
-            const backwardJobsDb = loadJobs();
-            backwardJobsDb.jobs[backwardJobId] = backwardJob;
-            saveJobs(backwardJobsDb);
-
             const backwardPromise = (async () => {
                 try {
                     await getAccountHistory({
@@ -364,25 +309,7 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
                         maxTransactions: SYNC_CONFIG.batchSize,
                         maxEpochsToCheck: SYNC_CONFIG.maxEpochsPerCycle
                     });
-
-                    // Mark as completed
-                    const updatedJobsDb = loadJobs();
-                    const completedJob = updatedJobsDb.jobs[backwardJobId];
-                    if (completedJob) {
-                        completedJob.status = 'completed';
-                        completedJob.completedAt = new Date().toISOString();
-                        saveJobs(updatedJobsDb);
-                    }
                 } catch (error) {
-                    // Mark as failed
-                    const updatedJobsDb = loadJobs();
-                    const failedJob = updatedJobsDb.jobs[backwardJobId];
-                    if (failedJob) {
-                        failedJob.status = 'failed';
-                        failedJob.error = error instanceof Error ? error.message : String(error);
-                        failedJob.completedAt = new Date().toISOString();
-                        saveJobs(updatedJobsDb);
-                    }
                     console.error(`[${accountId}] Backward search failed:`, error);
                 }
             })();
@@ -917,11 +844,9 @@ app.get('/api/accounts/:accountId/status', (req: Request, res: Response) => {
         return res.status(404).json({ error: 'Account not registered' });
     }
     
-    // Check for running job
-    const jobsDb = loadJobs();
-    const accountJobs = Object.values(jobsDb.jobs).filter(job => job.accountId === accountId);
-    const runningJob = accountJobs.find(job => job.status === 'running' || job.status === 'pending');
-    
+    // Check for running job (use in-memory Map, not jobs.json)
+    const isRunning = runningJobs.has(accountId);
+
     // Check if data file exists and get metadata
     const outputFile = getAccountOutputFile(accountId);
     let dataRange = null;
@@ -947,13 +872,7 @@ app.get('/api/accounts/:accountId/status', (req: Request, res: Response) => {
         accountId,
         hasData,
         dataRange,
-        ongoingJob: runningJob ? {
-            jobId: runningJob.jobId,
-            status: runningJob.status,
-            createdAt: runningJob.createdAt,
-            startedAt: runningJob.startedAt,
-            options: runningJob.options
-        } : null
+        isRunning
     });
 });
 
