@@ -376,6 +376,70 @@ Download the collected data as CSV for the specified account.
 - `404 Not Found` - Account not registered or no data file exists for this account yet
 - `500 Internal Server Error` - Error converting to CSV
 
+---
+
+**GET /api/accounts/:accountId/gap-analysis**
+
+Get a gap analysis report showing where balance continuity is broken in the transaction history.
+
+**Note:**
+- Analyzes the account's JSON file for balance gaps
+- Returns a structured report of all detected gaps
+- Useful for verifying data completeness
+
+**Response:**
+- Content-Type: `application/json`
+
+```json
+{
+  "accountId": "myaccount.near",
+  "analyzedAt": "2024-01-01T12:00:00.000Z",
+  "summary": {
+    "totalGaps": 1,
+    "internalGaps": 0,
+    "hasGapToCreation": true,
+    "hasGapToPresent": false,
+    "isComplete": false
+  },
+  "metadata": {
+    "totalTransactions": 150,
+    "firstBlock": 100000000,
+    "lastBlock": 100500000
+  },
+  "gaps": [
+    {
+      "type": "gap_to_creation",
+      "startBlock": 0,
+      "endBlock": 100000000,
+      "mismatches": [
+        {
+          "type": "near_balance_mismatch",
+          "expected": "0",
+          "actual": "5000000000000000000000000",
+          "message": "NEAR balance mismatch: expected 0 but got 5000000000000000000000000"
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Gap Types:**
+- `gap_to_creation` - History doesn't go back to account creation (earliest balance is non-zero)
+- `internal_gap` - Gap between consecutive transactions (balanceAfter ≠ next balanceBefore)
+- `gap_to_present` - History doesn't include recent transactions (would require current balance check)
+
+**Mismatch Types:**
+- `near_balance_mismatch` - NEAR balance discrepancy
+- `token_balance_mismatch` - Fungible token balance discrepancy (includes `token` field)
+- `intents_balance_mismatch` - NEAR Intents token balance discrepancy (includes `token` field)
+- `staking_balance_mismatch` - Staking pool balance discrepancy (includes `pool` field)
+
+**Error Responses:**
+- `400 Bad Request` - Missing accountId
+- `404 Not Found` - Account not registered or no data file exists for this account yet
+- `500 Internal Server Error` - Error reading or analyzing data
+
 ## Usage Examples
 
 ### cURL
@@ -400,6 +464,9 @@ curl -O -J http://localhost:3000/api/accounts/myaccount.near/download/json
 
 # Download CSV result
 curl -O -J http://localhost:3000/api/accounts/myaccount.near/download/csv
+
+# Get gap analysis report
+curl http://localhost:3000/api/accounts/myaccount.near/gap-analysis
 ```
 
 ### JavaScript/TypeScript
@@ -428,6 +495,12 @@ console.log('Ongoing job:', accountStatus.ongoingJob);
 const jsonResponse = await fetch(`http://localhost:3000/api/accounts/${accountId}/download/json`);
 const data = await jsonResponse.json();
 console.log('Downloaded data:', data);
+
+// Get gap analysis
+const gapResponse = await fetch(`http://localhost:3000/api/accounts/${accountId}/gap-analysis`);
+const gaps = await gapResponse.json();
+console.log('Gap analysis:', gaps);
+console.log('Is complete:', gaps.summary.isComplete);
 ```
 
 ### Python
