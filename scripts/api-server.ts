@@ -34,7 +34,9 @@ const PAYMENT_CONFIG = {
 // Continuous sync configuration
 const SYNC_CONFIG = {
     batchSize: parseInt(process.env.BATCH_SIZE || '10', 10),
-    cycleDelayMs: parseInt(process.env.CYCLE_DELAY_MS || '30000', 10)
+    cycleDelayMs: parseInt(process.env.CYCLE_DELAY_MS || '30000', 10),
+    maxEpochsPerCycle: parseInt(process.env.MAX_EPOCHS_PER_CYCLE || '50', 10),
+    accountTimeoutMs: parseInt(process.env.ACCOUNT_TIMEOUT_MS || '300000', 10) // 5 minutes default
 };
 
 // CORS configuration
@@ -270,70 +272,7 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
     const now = new Date().toISOString();
     
     try {
-        // If history is not complete, search backward first
-        if (!historyComplete) {
-            console.log(`[${accountId}] Searching backward (history incomplete)`);
-            result.backward = true;
-            
-            const backwardJob: Job = {
-                jobId,
-                accountId,
-                status: 'running',
-                createdAt: now,
-                startedAt: now,
-                options: {
-                    direction: 'backward',
-                    maxTransactions: SYNC_CONFIG.batchSize
-                }
-            };
-            
-            const jobsDb = loadJobs();
-            jobsDb.jobs[jobId] = backwardJob;
-            saveJobs(jobsDb);
-            
-            // Mark as running
-            const jobPromise = (async () => {
-                try {
-                    await getAccountHistory({
-                        accountId,
-                        outputFile,
-                        direction: 'backward',
-                        maxTransactions: SYNC_CONFIG.batchSize
-                    });
-                    
-                    // Mark as completed
-                    const updatedJobsDb = loadJobs();
-                    const completedJob = updatedJobsDb.jobs[jobId];
-                    if (completedJob) {
-                        completedJob.status = 'completed';
-                        completedJob.completedAt = new Date().toISOString();
-                        saveJobs(updatedJobsDb);
-                    }
-                } catch (error) {
-                    // Mark as failed
-                    const updatedJobsDb = loadJobs();
-                    const failedJob = updatedJobsDb.jobs[jobId];
-                    if (failedJob) {
-                        failedJob.status = 'failed';
-                        failedJob.error = error instanceof Error ? error.message : String(error);
-                        failedJob.completedAt = new Date().toISOString();
-                        saveJobs(updatedJobsDb);
-                    }
-                    console.error(`[${accountId}] Backward search failed:`, error);
-                }
-            })();
-            
-            runningJobs.set(accountId, jobPromise);
-            await jobPromise;
-            runningJobs.delete(accountId);
-        }
-        
-        // Skip forward search if shutting down
-        if (continuousSyncShuttingDown) {
-            return result;
-        }
-        
-        // Always search forward for new transactions
+        // ALWAYS search forward FIRST to get latest data (priority: freshness over completeness)
         console.log(`[${accountId}] Searching forward (checking for new transactions)`);
         result.forward = true;
         
@@ -388,12 +327,76 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
         runningJobs.set(accountId, forwardPromise);
         await forwardPromise;
         runningJobs.delete(accountId);
-        
+
+        // Skip backward search if shutting down
+        if (continuousSyncShuttingDown) {
+            return result;
+        }
+
+        // Then do incremental backward search if history is not complete
+        if (!historyComplete) {
+            console.log(`[${accountId}] Searching backward (incremental - history incomplete)`);
+            result.backward = true;
+
+            const backwardJobId = uuidv4();
+            const backwardJob: Job = {
+                jobId: backwardJobId,
+                accountId,
+                status: 'running',
+                createdAt: new Date().toISOString(),
+                startedAt: new Date().toISOString(),
+                options: {
+                    direction: 'backward',
+                    maxTransactions: SYNC_CONFIG.batchSize
+                }
+            };
+
+            const backwardJobsDb = loadJobs();
+            backwardJobsDb.jobs[backwardJobId] = backwardJob;
+            saveJobs(backwardJobsDb);
+
+            const backwardPromise = (async () => {
+                try {
+                    await getAccountHistory({
+                        accountId,
+                        outputFile,
+                        direction: 'backward',
+                        maxTransactions: SYNC_CONFIG.batchSize,
+                        maxEpochsToCheck: SYNC_CONFIG.maxEpochsPerCycle
+                    });
+
+                    // Mark as completed
+                    const updatedJobsDb = loadJobs();
+                    const completedJob = updatedJobsDb.jobs[backwardJobId];
+                    if (completedJob) {
+                        completedJob.status = 'completed';
+                        completedJob.completedAt = new Date().toISOString();
+                        saveJobs(updatedJobsDb);
+                    }
+                } catch (error) {
+                    // Mark as failed
+                    const updatedJobsDb = loadJobs();
+                    const failedJob = updatedJobsDb.jobs[backwardJobId];
+                    if (failedJob) {
+                        failedJob.status = 'failed';
+                        failedJob.error = error instanceof Error ? error.message : String(error);
+                        failedJob.completedAt = new Date().toISOString();
+                        saveJobs(updatedJobsDb);
+                    }
+                    console.error(`[${accountId}] Backward search failed:`, error);
+                }
+            })();
+
+            runningJobs.set(accountId, backwardPromise);
+            await backwardPromise;
+            runningJobs.delete(accountId);
+        }
+
     } catch (error) {
         console.error(`[${accountId}] Error processing account cycle:`, error);
         runningJobs.delete(accountId);
     }
-    
+
     return result;
 }
 
@@ -408,7 +411,12 @@ export async function startContinuousLoop(): Promise<void> {
     
     continuousSyncRunning = true;
     continuousSyncShuttingDown = false;
-    console.log(`Starting continuous sync loop (batch size: ${SYNC_CONFIG.batchSize}, cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms)`);
+    console.log(`Starting continuous sync loop`);
+    console.log(`  Priority: Forward sync first (latest data), then backward sync (historical data)`);
+    console.log(`  Batch size: ${SYNC_CONFIG.batchSize} transactions`);
+    console.log(`  Cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms`);
+    console.log(`  Max epochs/cycle: ${SYNC_CONFIG.maxEpochsPerCycle}`);
+    console.log(`  Account timeout: ${SYNC_CONFIG.accountTimeoutMs}ms`);
     
     while (!continuousSyncShuttingDown) {
         try {
@@ -432,9 +440,27 @@ export async function startContinuousLoop(): Promise<void> {
                     skippedCount++;
                     continue;
                 }
-                
-                await processAccountCycle(account.accountId);
-                processedCount++;
+
+                // Process account with timeout to prevent one account from blocking others
+                try {
+                    const timeoutPromise = new Promise<never>((_, reject) =>
+                        setTimeout(() => reject(new Error('Account timeout')), SYNC_CONFIG.accountTimeoutMs)
+                    );
+
+                    await Promise.race([
+                        processAccountCycle(account.accountId),
+                        timeoutPromise
+                    ]);
+                    processedCount++;
+                } catch (error) {
+                    if (error instanceof Error && error.message === 'Account timeout') {
+                        console.log(`[${account.accountId}] ⏱️  Timeout reached (${SYNC_CONFIG.accountTimeoutMs}ms), moving to next account`);
+                        processedCount++;
+                    } else {
+                        console.error(`[${account.accountId}] Error in sync cycle:`, error);
+                        skippedCount++;
+                    }
+                }
             }
             
             console.log(`=== Sync cycle complete: ${processedCount} processed, ${skippedCount} skipped ===\n`);
@@ -1134,6 +1160,8 @@ const server = app.listen(PORT, () => {
     console.log(`Data directory: ${DATA_DIR}`);
     console.log(`Batch size: ${SYNC_CONFIG.batchSize}`);
     console.log(`Cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms`);
+    console.log(`Max epochs per cycle: ${SYNC_CONFIG.maxEpochsPerCycle}`);
+    console.log(`Account timeout: ${SYNC_CONFIG.accountTimeoutMs}ms`);
     console.log(`CORS allowed origins: ${CORS_CONFIG.allowedOrigins.join(', ')}`);
     console.log('');
     console.log('Available endpoints:');

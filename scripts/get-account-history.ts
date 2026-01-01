@@ -105,6 +105,7 @@ interface GetAccountHistoryOptions {
     startBlock?: number;
     endBlock?: number;
     stakingOnly?: boolean;
+    maxEpochsToCheck?: number;  // Max staking epochs to check per call (for incremental sync)
 }
 
 interface ParsedArgs {
@@ -284,7 +285,8 @@ function discoverStakingPools(history: AccountHistory): string[] {
 async function collectStakingRewards(
     accountId: string,
     history: AccountHistory,
-    outputFile: string
+    outputFile: string,
+    maxEpochsToCheck?: number
 ): Promise<number> {
     const poolRanges = discoverStakingPoolsWithRanges(history);
     
@@ -389,23 +391,32 @@ async function collectStakingRewards(
             continue;
         }
         
-        console.log(`  Checking ${epochBoundaries.length} epoch(s) without existing data`);
-        
+        // Limit epochs to check if maxEpochsToCheck is set (for incremental sync)
+        const epochsToCheck = maxEpochsToCheck && maxEpochsToCheck < epochBoundaries.length
+            ? epochBoundaries.slice(0, maxEpochsToCheck)
+            : epochBoundaries;
+
+        if (maxEpochsToCheck && epochsToCheck.length < epochBoundaries.length) {
+            console.log(`  Limited to ${epochsToCheck.length} epoch(s) this cycle (${epochBoundaries.length - epochsToCheck.length} remaining for next cycle)`);
+        }
+
+        console.log(`  Checking ${epochsToCheck.length} epoch(s) without existing data`);
+
         // Manually check each epoch boundary that needs data
         let prevBalances = await getStakingPoolBalances(accountId, range.startBlock, [range.pool]);
         let prevBlock = range.startBlock;
-        
-        for (let i = 0; i < epochBoundaries.length; i++) {
+
+        for (let i = 0; i < epochsToCheck.length; i++) {
             if (getStopSignal()) {
                 throw new Error('Operation cancelled by user');
             }
-            
-            const block = epochBoundaries[i];
+
+            const block = epochsToCheck[i];
             if (block === undefined) {
                 continue;
             }
-            
-            console.log(`    Checking epoch ${i + 1}/${epochBoundaries.length} at block ${block}...`);
+
+            console.log(`    Checking epoch ${i + 1}/${epochsToCheck.length} at block ${block}...`);
             
             const currentBalances = await getStakingPoolBalances(accountId, block, [range.pool]);
             
@@ -1487,7 +1498,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         
         // Early return if stakingOnly mode (only wanted staking rewards)
         if (stakingOnly) {
-            const stakingRewards = await collectStakingRewards(accountId, history, outputFile);
+            const stakingRewards = await collectStakingRewards(accountId, history, outputFile, options.maxEpochsToCheck);
             if (stakingRewards > 0) {
                 console.log(`\nAdded ${stakingRewards} staking reward entries`);
             }
@@ -1738,7 +1749,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
     // PHASE 5: Staking rewards collection
     // ===================================================================================
     if (!getStopSignal() && history.transactions.length > 0) {
-        const stakingRewards = await collectStakingRewards(accountId, history, outputFile);
+        const stakingRewards = await collectStakingRewards(accountId, history, outputFile, options.maxEpochsToCheck);
         if (stakingRewards > 0) {
             console.log(`\nAdded ${stakingRewards} staking reward entries`);
         }
