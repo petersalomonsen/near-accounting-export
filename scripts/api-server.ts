@@ -815,18 +815,23 @@ app.get('/api/jobs/:jobId', (req: Request, res: Response) => {
     res.json({ job });
 });
 
-// GET /api/jobs - List all jobs
+// GET /api/jobs - List all jobs (now using in-memory tracking)
 app.get('/api/jobs', (req: Request, res: Response) => {
     const { accountId } = req.query;
-    
-    const jobsDb = loadJobs();
-    let jobs = Object.values(jobsDb.jobs);
-    
+
+    // Build jobs list from in-memory running jobs
+    const jobs: any[] = Array.from(runningJobs.keys()).map(accountId => ({
+        accountId,
+        status: 'running',
+        startedAt: new Date().toISOString() // We don't track start time, so use current time as placeholder
+    }));
+
     // Filter by accountId if provided
     if (accountId && typeof accountId === 'string') {
-        jobs = jobs.filter(job => job.accountId === accountId);
+        const filtered = jobs.filter(job => job.accountId === accountId);
+        return res.json({ jobs: filtered });
     }
-    
+
     res.json({ jobs });
 });
 
