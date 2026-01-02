@@ -394,6 +394,9 @@ export async function collectStakingRewards(
     let allChanges: StakingBalanceChange[] = [];
     let updatedExistingEntries = 0;
 
+    // Cache queried balances to avoid redundant RPC calls
+    const queriedBalances = new Map<string, Record<string, string>>(); // key: `${block}`, value: { pool -> balance }
+
     // Build a map of existing staking data by block and pool
     const existingStakingData = new Map<string, Set<string>>();
     for (const tx of history.transactions) {
@@ -472,6 +475,13 @@ export async function collectStakingRewards(
             console.log(`    Checking epoch ${i + 1}/${epochsToCheck.length} at block ${block}...`);
 
             const currentBalances = await getStakingPoolBalances(accountId, block, [range.pool]);
+
+            // Cache the queried balance for later reuse
+            const blockKey = block.toString();
+            if (!queriedBalances.has(blockKey)) {
+                queriedBalances.set(blockKey, {});
+            }
+            Object.assign(queriedBalances.get(blockKey)!, currentBalances);
 
             const prevBalance = BigInt(prevBalances[range.pool] || '0');
             const currentBalance = BigInt(currentBalances[range.pool] || '0');
@@ -559,9 +569,22 @@ export async function collectStakingRewards(
             break;
         }
         
-        // Get all staking pool balances at this block and the previous
-        const balancesBefore = await getStakingPoolBalances(accountId, change.block - 1, stakingPools);
-        const balancesAfter = await getStakingPoolBalances(accountId, change.block, stakingPools);
+        // Get staking pool balances at this block and the previous
+        // Prefer cached individual pool balance, but query for the specific pool if not cached
+        const blockKey = change.block.toString();
+        const prevBlockKey = (change.block - 1).toString();
+
+        const cachedAfter = queriedBalances.get(blockKey);
+        const cachedBefore = queriedBalances.get(prevBlockKey);
+
+        // For staking-only entries, we only need the balance of the pool that changed
+        const balancesAfter = cachedAfter && cachedAfter[change.pool]
+            ? cachedAfter
+            : await getStakingPoolBalances(accountId, change.block, [change.pool]);
+
+        const balancesBefore = cachedBefore && cachedBefore[change.pool]
+            ? cachedBefore
+            : await getStakingPoolBalances(accountId, change.block - 1, [change.pool]);
         
         // Fetch block timestamp
         const blockTimestamp = await getBlockTimestamp(change.block);
