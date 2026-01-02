@@ -336,7 +336,8 @@ export async function collectStakingRewards(
     accountId: string,
     history: AccountHistory,
     outputFile: string,
-    maxEpochsToCheck?: number
+    maxEpochsToCheck?: number,
+    endBlockLimit?: number
 ): Promise<number> {
     const poolRanges = discoverStakingPoolsWithRanges(history);
     
@@ -348,11 +349,14 @@ export async function collectStakingRewards(
     const stakingPools = poolRanges.map(r => r.pool);
     console.log(`\nDiscovered staking pools: ${stakingPools.join(', ')}`);
     history.stakingPools = stakingPools;
-    
+
+    // Get current block height or use provided limit to check active pools up to present
+    const currentBlockHeight = endBlockLimit || await getCurrentBlockHeight();
+
     // For each pool, determine the actual active staking range
     // Check balance at last withdrawal to see if it was a full withdrawal
     const activeRanges: { pool: string, startBlock: number, endBlock: number }[] = [];
-    
+
     for (const range of poolRanges) {
         let endBlock: number;
         
@@ -369,16 +373,14 @@ export async function collectStakingRewards(
                 endBlock = range.lastWithdrawalBlock;
                 console.log(`  ${range.pool}: active from block ${range.firstDepositBlock} to ${endBlock} (fully withdrawn)`);
             } else {
-                // Partial withdrawal - still active, check to current latest transaction
-                const sortedTxs = [...history.transactions].sort((a, b) => b.block - a.block);
-                endBlock = sortedTxs[0]?.block || range.lastWithdrawalBlock;
+                // Partial withdrawal - still active, check to current block height
+                endBlock = currentBlockHeight;
                 console.log(`  ${range.pool}: active from block ${range.firstDepositBlock} to ${endBlock} (still staking)`);
             }
         } else {
-            // No withdrawals yet - check to current latest transaction
-            const sortedTxs = [...history.transactions].sort((a, b) => b.block - a.block);
-            endBlock = sortedTxs[0]?.block || range.firstDepositBlock;
-            console.log(`  ${range.pool}: active from block ${range.firstDepositBlock} to ${endBlock} (no withdrawals)`);
+            // No withdrawals yet - check to current block height
+            endBlock = currentBlockHeight;
+            console.log(`  ${range.pool}: active from block ${range.firstDepositBlock} to ${endBlock} (still staking)`);
         }
         
         activeRanges.push({
@@ -1597,7 +1599,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         
         // Early return if stakingOnly mode (only wanted staking rewards)
         if (stakingOnly) {
-            const stakingRewards = await collectStakingRewards(accountId, history, outputFile, options.maxEpochsToCheck);
+            const stakingRewards = await collectStakingRewards(accountId, history, outputFile, options.maxEpochsToCheck, endBlock);
             if (stakingRewards > 0) {
                 console.log(`\nAdded ${stakingRewards} staking reward entries`);
             }
@@ -1848,7 +1850,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
     // PHASE 5: Staking rewards collection
     // ===================================================================================
     if (!getStopSignal() && history.transactions.length > 0) {
-        const stakingRewards = await collectStakingRewards(accountId, history, outputFile, options.maxEpochsToCheck);
+        const stakingRewards = await collectStakingRewards(accountId, history, outputFile, options.maxEpochsToCheck, endBlock);
         if (stakingRewards > 0) {
             console.log(`\nAdded ${stakingRewards} staking reward entries`);
         }
