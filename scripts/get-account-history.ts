@@ -97,6 +97,9 @@ interface AccountHistory {
     };
 }
 
+// Re-export the type for external use
+export type { AccountHistory };
+
 interface GetAccountHistoryOptions {
     accountId: string;
     outputFile: string;
@@ -278,11 +281,58 @@ function discoverStakingPools(history: AccountHistory): string[] {
 }
 
 /**
+ * Enrich transaction entry with staking pool balances if it involves staking pool transfers
+ */
+async function enrichWithStakingPoolBalances(
+    accountId: string,
+    entry: TransactionEntry
+): Promise<void> {
+    if (!entry.transfers || entry.transfers.length === 0) {
+        return;
+    }
+
+    // Find staking pool transfers (deposits/withdrawals)
+    const stakingPoolPattern = /\.pool.*\.near$/;
+    const stakingPools = entry.transfers
+        .filter(t => t.counterparty && stakingPoolPattern.test(t.counterparty))
+        .map(t => t.counterparty!)
+        .filter((pool, index, self) => self.indexOf(pool) === index); // unique
+
+    if (stakingPools.length === 0) {
+        return;
+    }
+
+    // Query staking balances for these pools
+    try {
+        const stakingBalances = await getStakingPoolBalances(accountId, entry.block, stakingPools);
+
+        // Add to balanceAfter if we got results
+        if (Object.keys(stakingBalances).length > 0) {
+            if (!entry.balanceAfter) {
+                entry.balanceAfter = {
+                    near: '0',
+                    fungibleTokens: {},
+                    intentsTokens: {},
+                    stakingPools: {}
+                };
+            }
+            if (!entry.balanceAfter.stakingPools) {
+                entry.balanceAfter.stakingPools = {};
+            }
+            Object.assign(entry.balanceAfter.stakingPools, stakingBalances);
+        }
+    } catch (error) {
+        // Don't fail the whole process if staking balance query fails
+        console.error(`  Warning: Could not fetch staking balance for pools at block ${entry.block}:`, error);
+    }
+}
+
+/**
  * Collect staking reward entries between transactions
  * Creates synthetic transaction entries for staking balance changes at epoch boundaries
  * Only checks epochs where staking was active (between first deposit and full withdrawal)
  */
-async function collectStakingRewards(
+export async function collectStakingRewards(
     accountId: string,
     history: AccountHistory,
     outputFile: string,
@@ -340,7 +390,8 @@ async function collectStakingRewards(
     
     // Find all staking balance changes at epoch boundaries for each pool's active range
     let allChanges: StakingBalanceChange[] = [];
-    
+    let updatedExistingEntries = 0;
+
     // Build a map of existing staking data by block and pool
     const existingStakingData = new Map<string, Set<string>>();
     for (const tx of history.transactions) {
@@ -417,12 +468,46 @@ async function collectStakingRewards(
             }
 
             console.log(`    Checking epoch ${i + 1}/${epochsToCheck.length} at block ${block}...`);
-            
+
             const currentBalances = await getStakingPoolBalances(accountId, block, [range.pool]);
-            
+
             const prevBalance = BigInt(prevBalances[range.pool] || '0');
             const currentBalance = BigInt(currentBalances[range.pool] || '0');
-            
+
+            // Update existing entry if this block already exists in history
+            const existingEntry = history.transactions.find(tx => tx.block === block);
+            const poolBalance = currentBalances[range.pool];
+            if (existingEntry && poolBalance !== undefined) {
+                // Add the newly queried pool balance to the existing entry
+                if (!existingEntry.balanceAfter) {
+                    existingEntry.balanceAfter = {
+                        near: '0',
+                        fungibleTokens: {},
+                        intentsTokens: {},
+                        stakingPools: {}
+                    };
+                }
+                if (!existingEntry.balanceAfter.stakingPools) {
+                    existingEntry.balanceAfter.stakingPools = {};
+                }
+                existingEntry.balanceAfter.stakingPools[range.pool] = poolBalance;
+
+                // Also update balanceBefore if it exists
+                if (existingEntry.balanceBefore) {
+                    if (!existingEntry.balanceBefore.stakingPools) {
+                        existingEntry.balanceBefore.stakingPools = {};
+                    }
+                    // Get balance from previous block to populate balanceBefore
+                    const prevBlockBalances = await getStakingPoolBalances(accountId, block - 1, [range.pool]);
+                    const prevPoolBalance = prevBlockBalances[range.pool];
+                    if (prevPoolBalance !== undefined) {
+                        existingEntry.balanceBefore.stakingPools[range.pool] = prevPoolBalance;
+                    }
+                }
+
+                updatedExistingEntries++;
+            }
+
             if (prevBalance !== currentBalance) {
                 allChanges.push({
                     block,
@@ -432,7 +517,7 @@ async function collectStakingRewards(
                     diff: (currentBalance - prevBalance).toString()
                 });
             }
-            
+
             prevBalances = currentBalances;
             prevBlock = block;
         }
@@ -452,6 +537,14 @@ async function collectStakingRewards(
     
     if (rewardChanges.length === 0) {
         console.log('All staking changes coincide with existing transactions (deposits/withdrawals)');
+
+        // Save the file if we updated existing entries
+        if (updatedExistingEntries > 0) {
+            console.log(`Updated ${updatedExistingEntries} existing entries with new pool data`);
+            history.updatedAt = new Date().toISOString();
+            saveHistory(outputFile, history);
+        }
+
         return 0;
     }
     
@@ -848,7 +941,10 @@ async function processDiscoveredBlocks(
                     intentsChanged: balanceChange.intentsChanged
                 }
             };
-            
+
+            // Enrich with staking pool balances if this is a staking deposit/withdrawal
+            await enrichWithStakingPoolBalances(accountId, entry);
+
             // Add to history
             history.transactions.push(entry);
             transactionsFound++;
@@ -1075,7 +1171,10 @@ async function fillGapWithBinarySearch(
                 intentsChanged: balanceChange.intentsChanged
             }
         };
-        
+
+        // Enrich with staking pool balances if this is a staking deposit/withdrawal
+        await enrichWithStakingPoolBalances(accountId, entry);
+
         history.transactions.push(entry);
         totalFound++;
         
@@ -1906,7 +2005,10 @@ async function searchForTransactions(
                 intentsChanged: balanceChange.intentsChanged
             }
         };
-        
+
+        // Enrich with staking pool balances if this is a staking deposit/withdrawal
+        await enrichWithStakingPoolBalances(accountId, entry);
+
         history.transactions.push(entry);
         transactionsFound++;
         
