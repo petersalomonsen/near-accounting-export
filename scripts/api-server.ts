@@ -267,12 +267,13 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
     // Check if history is complete (backward search done)
     const historyComplete = historyFile?.metadata?.historyComplete === true;
 
-    try {
-        // ALWAYS search forward FIRST to get latest data (priority: freshness over completeness)
-        console.log(`[${accountId}] Searching forward (checking for new transactions)`);
-        result.forward = true;
+    // Wrap entire sync operation in a single promise that stays in runningJobs
+    const syncPromise = (async () => {
+        try {
+            // ALWAYS search forward FIRST to get latest data (priority: freshness over completeness)
+            console.log(`[${accountId}] Searching forward (checking for new transactions)`);
+            result.forward = true;
 
-        const forwardPromise = (async () => {
             try {
                 await getAccountHistory({
                     accountId,
@@ -284,23 +285,17 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
             } catch (error) {
                 console.error(`[${accountId}] Forward search failed:`, error);
             }
-        })();
 
-        runningJobs.set(accountId, forwardPromise);
-        await forwardPromise;
-        runningJobs.delete(accountId);
+            // Skip backward search if shutting down
+            if (continuousSyncShuttingDown) {
+                return;
+            }
 
-        // Skip backward search if shutting down
-        if (continuousSyncShuttingDown) {
-            return result;
-        }
+            // Then do incremental backward search if history is not complete
+            if (!historyComplete) {
+                console.log(`[${accountId}] Searching backward (incremental - history incomplete)`);
+                result.backward = true;
 
-        // Then do incremental backward search if history is not complete
-        if (!historyComplete) {
-            console.log(`[${accountId}] Searching backward (incremental - history incomplete)`);
-            result.backward = true;
-
-            const backwardPromise = (async () => {
                 try {
                     await getAccountHistory({
                         accountId,
@@ -312,17 +307,18 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
                 } catch (error) {
                     console.error(`[${accountId}] Backward search failed:`, error);
                 }
-            })();
+            }
 
-            runningJobs.set(accountId, backwardPromise);
-            await backwardPromise;
+        } catch (error) {
+            console.error(`[${accountId}] Error processing account cycle:`, error);
+        } finally {
+            // Only remove from runningJobs after ALL phases complete (including staking sync)
             runningJobs.delete(accountId);
         }
+    })();
 
-    } catch (error) {
-        console.error(`[${accountId}] Error processing account cycle:`, error);
-        runningJobs.delete(accountId);
-    }
+    runningJobs.set(accountId, syncPromise);
+    await syncPromise;
 
     return result;
 }
