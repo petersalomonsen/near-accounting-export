@@ -805,32 +805,36 @@ async function enrichBalancesWithDiscoveredTokens(
     discoveredTokens: { ftTokens: Set<string>; intentsTokens: Set<string> }
 ): Promise<void> {
     const { ftTokens, intentsTokens } = discoveredTokens;
-    
+
     if (ftTokens.size === 0 && intentsTokens.size === 0) {
         return;
     }
-    
+
+    // IMPORTANT: FT and MT token balance changes appear at block N+1, not block N
+    // NEAR balance changes appear at block N (the transaction block)
+    // So we query FT/MT at blocks N and N+1 to capture the change
+
     // Enrich balance snapshots
     if (balanceChange.startBalance) {
         balanceChange.startBalance = await enrichBalanceSnapshot(
             accountId,
-            blockHeight - 1,
+            blockHeight,  // FT/MT balances BEFORE the change (at block N)
             balanceChange.startBalance,
             Array.from(ftTokens),
             Array.from(intentsTokens)
         );
     }
-    
+
     if (balanceChange.endBalance) {
         balanceChange.endBalance = await enrichBalanceSnapshot(
             accountId,
-            blockHeight,
+            blockHeight + 1,  // FT/MT balances AFTER the change (at block N+1)
             balanceChange.endBalance,
             Array.from(ftTokens),
             Array.from(intentsTokens)
         );
     }
-    
+
     // Recalculate changes with enriched balances
     if (balanceChange.startBalance && balanceChange.endBalance) {
         const updatedChanges = detectBalanceChanges(balanceChange.startBalance, balanceChange.endBalance);

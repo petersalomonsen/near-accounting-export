@@ -555,8 +555,16 @@ export async function enrichBalanceSnapshot(
 }
 
 /**
- * Get balance changes at a specific block by comparing block-1 to block
- * This is more efficient than binary search when we already know the block
+ * Get balance changes at a specific block by comparing block-1 to block.
+ *
+ * IMPORTANT: FT and MT token balances update at block N+1, not block N.
+ * NEAR balances update at block N.
+ *
+ * To handle this correctly:
+ * - NEAR: queries at block N-1 and N
+ * - FT/MT: queries at block N and N+1
+ *
+ * This is more efficient than binary search when we already know the block.
  */
 export async function getBalanceChangesAtBlock(
     accountId: string,
@@ -569,9 +577,33 @@ export async function getBalanceChangesAtBlock(
         throw new Error('Operation cancelled by user');
     }
 
-    // Get balances before and after the block
-    const balanceBefore = await getAllBalances(accountId, blockHeight - 1, tokenContracts, intentsTokens, true, stakingPools);
-    const balanceAfter = await getAllBalances(accountId, blockHeight, tokenContracts, intentsTokens, true, stakingPools);
+    // Get NEAR balance at block-1 and block (NEAR updates at block N)
+    const nearBalanceBefore = await getAllBalances(accountId, blockHeight - 1, null, null, true, null);
+    const nearBalanceAfter = await getAllBalances(accountId, blockHeight, null, null, true, null);
+
+    // Get FT/MT balances at block and block+1 (FT/MT update at block N+1)
+    const ftMtBalanceBefore = tokenContracts || intentsTokens
+        ? await getAllBalances(accountId, blockHeight, tokenContracts, intentsTokens, false, stakingPools)
+        : { near: '0', fungibleTokens: {}, intentsTokens: {}, stakingPools: {} };
+
+    const ftMtBalanceAfter = tokenContracts || intentsTokens
+        ? await getAllBalances(accountId, blockHeight + 1, tokenContracts, intentsTokens, false, stakingPools)
+        : { near: '0', fungibleTokens: {}, intentsTokens: {}, stakingPools: {} };
+
+    // Merge NEAR with FT/MT balances
+    const balanceBefore: BalanceSnapshot = {
+        near: nearBalanceBefore.near,
+        fungibleTokens: ftMtBalanceBefore.fungibleTokens,
+        intentsTokens: ftMtBalanceBefore.intentsTokens,
+        stakingPools: ftMtBalanceBefore.stakingPools || {}
+    };
+
+    const balanceAfter: BalanceSnapshot = {
+        near: nearBalanceAfter.near,
+        fungibleTokens: ftMtBalanceAfter.fungibleTokens,
+        intentsTokens: ftMtBalanceAfter.intentsTokens,
+        stakingPools: ftMtBalanceAfter.stakingPools || {}
+    };
 
     const changes = detectBalanceChanges(balanceBefore, balanceAfter);
     changes.block = blockHeight;
