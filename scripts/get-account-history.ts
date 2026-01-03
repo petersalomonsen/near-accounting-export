@@ -25,7 +25,9 @@ import {
     accountExistsAtBlock,
     getStakingPoolBalances,
     findStakingBalanceChanges,
-    getAllBalances
+    getAllBalances,
+    enrichBalanceSnapshot,
+    detectBalanceChanges
 } from './balance-tracker.js';
 import {
     getAllTransactionBlocks,
@@ -744,6 +746,100 @@ export function isStakingOnlyEntry(tx: TransactionEntry): boolean {
 // Note: detectGaps is now imported from './gap-detection.js' module
 
 /**
+ * Extract FT and intents tokens from transaction transfers.
+ * 
+ * Scans through transfer details and extracts unique token contract IDs
+ * for fungible tokens (FT) and multi-tokens (intents).
+ * 
+ * @param transfers - Array of transfer details from a transaction
+ * @returns Object containing Sets of unique FT and intents token IDs
+ * 
+ * @example
+ * const txInfo = await findBalanceChangingTransaction(accountId, block);
+ * const { ftTokens, intentsTokens } = extractTokensFromTransfers(txInfo.transfers);
+ * // ftTokens: Set(['arizcredits.near', 'wrap.near'])
+ * // intentsTokens: Set(['nep141:wrap.near'])
+ */
+function extractTokensFromTransfers(transfers: TransferDetail[]): {
+    ftTokens: Set<string>;
+    intentsTokens: Set<string>;
+} {
+    const ftTokens = new Set<string>(
+        (transfers || [])
+            .filter(t => t.type === 'ft' && t.tokenId)
+            .map(t => t.tokenId!)
+    );
+    
+    const intentsTokens = new Set<string>(
+        (transfers || [])
+            .filter(t => t.type === 'mt' && t.tokenId)
+            .map(t => t.tokenId!)
+    );
+    
+    return { ftTokens, intentsTokens };
+}
+
+/**
+ * Enrich balance snapshots with FT/intents tokens discovered from transfers.
+ * 
+ * This ensures balance snapshots include all tokens that had transfers in the transaction.
+ * Mutates the balanceChange object in place by:
+ * - Enriching startBalance and endBalance with discovered tokens
+ * - Recalculating tokensChanged and intentsChanged with the enriched balances
+ * 
+ * @param accountId - The account to query balances for
+ * @param blockHeight - The block height where the balance change occurred
+ * @param balanceChange - The balance change object to enrich (mutated in place)
+ * @param discoveredTokens - Sets of FT and intents token IDs discovered from transfers
+ * 
+ * @example
+ * const txInfo = await findBalanceChangingTransaction(accountId, block);
+ * const tokens = extractTokensFromTransfers(txInfo.transfers);
+ * await enrichBalancesWithDiscoveredTokens(accountId, block, balanceChange, tokens);
+ * // balanceChange.startBalance and endBalance now include discovered FT tokens
+ */
+async function enrichBalancesWithDiscoveredTokens(
+    accountId: string,
+    blockHeight: number,
+    balanceChange: BalanceChanges,
+    discoveredTokens: { ftTokens: Set<string>; intentsTokens: Set<string> }
+): Promise<void> {
+    const { ftTokens, intentsTokens } = discoveredTokens;
+    
+    if (ftTokens.size === 0 && intentsTokens.size === 0) {
+        return;
+    }
+    
+    // Enrich balance snapshots
+    if (balanceChange.startBalance) {
+        balanceChange.startBalance = await enrichBalanceSnapshot(
+            accountId,
+            blockHeight - 1,
+            balanceChange.startBalance,
+            Array.from(ftTokens),
+            Array.from(intentsTokens)
+        );
+    }
+    
+    if (balanceChange.endBalance) {
+        balanceChange.endBalance = await enrichBalanceSnapshot(
+            accountId,
+            blockHeight,
+            balanceChange.endBalance,
+            Array.from(ftTokens),
+            Array.from(intentsTokens)
+        );
+    }
+    
+    // Recalculate changes with enriched balances
+    if (balanceChange.startBalance && balanceChange.endBalance) {
+        const updatedChanges = detectBalanceChanges(balanceChange.startBalance, balanceChange.endBalance);
+        balanceChange.tokensChanged = updatedChanges.tokensChanged;
+        balanceChange.intentsChanged = updatedChanges.intentsChanged;
+    }
+}
+
+/**
  * Combined transaction block info from any API source
  */
 interface CombinedTransactionBlock {
@@ -1197,6 +1293,10 @@ async function fillGapWithBinarySearch(
         
         // Find transaction details
         const txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block);
+        
+        // Extract FT and intents tokens from discovered transfers and enrich balance snapshots
+        const discoveredTokens = extractTokensFromTransfers(txInfo.transfers);
+        await enrichBalancesWithDiscoveredTokens(accountId, balanceChange.block, balanceChange, discoveredTokens);
         
         // Create transaction entry
         const entry: TransactionEntry = {
@@ -2005,6 +2105,10 @@ async function searchForTransactions(
         
         // Find transaction details
         const txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block);
+        
+        // Extract FT and intents tokens from discovered transfers and enrich balance snapshots
+        const discoveredTokens = extractTokensFromTransfers(txInfo.transfers);
+        await enrichBalancesWithDiscoveredTokens(accountId, balanceChange.block, balanceChange, discoveredTokens);
         
         // Create and add entry
         const entry: TransactionEntry = {

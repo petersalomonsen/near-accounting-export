@@ -468,6 +468,93 @@ export async function getAllBalances(
 }
 
 /**
+ * Enrich a balance snapshot with additional FT and intents token balances.
+ * 
+ * This is used when FT/intents transfers are discovered after the initial balance query.
+ * Only queries tokens that aren't already in the snapshot (efficient - no redundant queries).
+ * 
+ * @param accountId - The account to query balances for
+ * @param blockId - Block height to query balances at (can be number or string)
+ * @param existingSnapshot - The existing balance snapshot to enrich
+ * @param additionalFtContracts - FT contract IDs to add (e.g., ['arizcredits.near'])
+ * @param additionalIntentsTokens - Intents token IDs to add (e.g., ['nep141:wrap.near'])
+ * @returns Promise<BalanceSnapshot> - Enriched snapshot with merged token balances
+ * 
+ * @example
+ * // After discovering FT transfer of arizcredits.near
+ * const enriched = await enrichBalanceSnapshot(
+ *   'account.near',
+ *   12345678,
+ *   existingSnapshot,
+ *   ['arizcredits.near'],
+ *   []
+ * );
+ * // enriched.fungibleTokens now includes arizcredits.near balance
+ */
+export async function enrichBalanceSnapshot(
+    accountId: string,
+    blockId: number | string,
+    existingSnapshot: BalanceSnapshot,
+    additionalFtContracts: string[],
+    additionalIntentsTokens: string[]
+): Promise<BalanceSnapshot> {
+    // Filter out tokens already in the snapshot
+    const missingFtContracts = additionalFtContracts.filter(
+        token => !(token in existingSnapshot.fungibleTokens)
+    );
+    const missingIntentsTokens = additionalIntentsTokens.filter(
+        token => !(token in existingSnapshot.intentsTokens)
+    );
+
+    if (missingFtContracts.length === 0 && missingIntentsTokens.length === 0) {
+        return existingSnapshot;
+    }
+
+    // Query the missing tokens
+    const newFtBalances = missingFtContracts.length > 0
+        ? await getFungibleTokenBalances(accountId, blockId, missingFtContracts)
+        : {};
+    
+    const newIntentsBalances: Record<string, string> = {};
+    if (missingIntentsTokens.length > 0) {
+        try {
+            if (getStopSignal()) {
+                throw new Error('Operation cancelled by user');
+            }
+
+            const batchBalances = await callViewFunction(
+                'intents.near',
+                'mt_batch_balance_of',
+                {
+                    token_ids: missingIntentsTokens,
+                    account_id: accountId
+                },
+                blockId
+            );
+
+            if (batchBalances && Array.isArray(batchBalances)) {
+                missingIntentsTokens.forEach((token, index) => {
+                    newIntentsBalances[token] = batchBalances[index] || '0';
+                });
+            }
+        } catch (e: any) {
+            console.warn(`Could not get batch balances for intents tokens:`, e.message);
+            for (const token of missingIntentsTokens) {
+                newIntentsBalances[token] = '0';
+            }
+        }
+    }
+
+    // Return enriched snapshot
+    return {
+        near: existingSnapshot.near,
+        fungibleTokens: { ...existingSnapshot.fungibleTokens, ...newFtBalances },
+        intentsTokens: { ...existingSnapshot.intentsTokens, ...newIntentsBalances },
+        stakingPools: existingSnapshot.stakingPools || {}
+    };
+}
+
+/**
  * Get balance changes at a specific block by comparing block-1 to block
  * This is more efficient than binary search when we already know the block
  */
@@ -497,7 +584,7 @@ export async function getBalanceChangesAtBlock(
 /**
  * Detect balance changes between two snapshots
  */
-function detectBalanceChanges(
+export function detectBalanceChanges(
     startBalance: BalanceSnapshot,
     endBalance: BalanceSnapshot
 ): BalanceChanges {
