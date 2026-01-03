@@ -144,43 +144,48 @@ describe('Gap Detection', () => {
             assert.strictEqual(result.errors.length, 3);
         });
 
-        it('should detect token appearing from zero', () => {
+        it('should NOT detect token appearing from zero with sparse balances (not in expected)', () => {
+            // With sparse representation: empty fungibleTokens in expected means "not queried"
+            // So this should NOT be detected as a gap
             const expected: BalanceSnapshot = {
                 near: '0',
-                fungibleTokens: {},
+                fungibleTokens: {},  // Empty = not queried (sparse)
                 intentsTokens: {},
                 stakingPools: {}
             };
             const actual: BalanceSnapshot = {
                 near: '0',
-                fungibleTokens: { 'wrap.near': '500' },
+                fungibleTokens: { 'wrap.near': '500' },  // Present in actual
                 intentsTokens: {},
                 stakingPools: {}
             };
             
             const result = compareBalances(expected, actual);
-            assert.strictEqual(result.valid, false);
-            assert.strictEqual(result.errors.length, 1);
-            assert.strictEqual(result.errors[0]?.type, 'token_balance_mismatch');
+            // With sparse balances, this should be VALID (not a gap)
+            assert.strictEqual(result.valid, true, 'Should be valid with sparse balances - token not in expected means not queried');
+            assert.strictEqual(result.errors.length, 0);
         });
 
-        it('should detect token disappearing to zero', () => {
+        it('should NOT detect token disappearing with sparse balances (not in actual)', () => {
+            // With sparse representation: empty fungibleTokens in actual means "not queried"
+            // So this should NOT be detected as a gap
             const expected: BalanceSnapshot = {
                 near: '0',
-                fungibleTokens: { 'wrap.near': '500' },
+                fungibleTokens: { 'wrap.near': '500' },  // Present in expected
                 intentsTokens: {},
                 stakingPools: {}
             };
             const actual: BalanceSnapshot = {
                 near: '0',
-                fungibleTokens: {},
+                fungibleTokens: {},  // Empty = not queried (sparse)
                 intentsTokens: {},
                 stakingPools: {}
             };
             
             const result = compareBalances(expected, actual);
-            assert.strictEqual(result.valid, false);
-            assert.strictEqual(result.errors.length, 1);
+            // With sparse balances, this should be VALID (not a gap)
+            assert.strictEqual(result.valid, true, 'Should be valid with sparse balances - token not in actual means not queried');
+            assert.strictEqual(result.errors.length, 0);
         });
 
         it('should handle undefined balances as zero', () => {
