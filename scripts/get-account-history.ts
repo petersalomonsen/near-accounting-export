@@ -747,29 +747,56 @@ export function isStakingOnlyEntry(tx: TransactionEntry): boolean {
 
 /**
  * Extract FT and intents tokens from transaction transfers.
- * Returns discovered token contract IDs.
+ * 
+ * Scans through transfer details and extracts unique token contract IDs
+ * for fungible tokens (FT) and multi-tokens (intents).
+ * 
+ * @param transfers - Array of transfer details from a transaction
+ * @returns Object containing Sets of unique FT and intents token IDs
+ * 
+ * @example
+ * const txInfo = await findBalanceChangingTransaction(accountId, block);
+ * const { ftTokens, intentsTokens } = extractTokensFromTransfers(txInfo.transfers);
+ * // ftTokens: Set(['arizcredits.near', 'wrap.near'])
+ * // intentsTokens: Set(['nep141:wrap.near'])
  */
 function extractTokensFromTransfers(transfers: TransferDetail[]): {
     ftTokens: Set<string>;
     intentsTokens: Set<string>;
 } {
-    const ftTokens = new Set<string>();
-    const intentsTokens = new Set<string>();
+    const ftTokens = new Set<string>(
+        (transfers || [])
+            .filter(t => t.type === 'ft' && t.tokenId)
+            .map(t => t.tokenId!)
+    );
     
-    for (const transfer of transfers || []) {
-        if (transfer.type === 'ft' && transfer.tokenId) {
-            ftTokens.add(transfer.tokenId);
-        } else if (transfer.type === 'mt' && transfer.tokenId) {
-            intentsTokens.add(transfer.tokenId);
-        }
-    }
+    const intentsTokens = new Set<string>(
+        (transfers || [])
+            .filter(t => t.type === 'mt' && t.tokenId)
+            .map(t => t.tokenId!)
+    );
     
     return { ftTokens, intentsTokens };
 }
 
 /**
  * Enrich balance snapshots with FT/intents tokens discovered from transfers.
- * This ensures balance snapshots include all tokens that had transfers.
+ * 
+ * This ensures balance snapshots include all tokens that had transfers in the transaction.
+ * Mutates the balanceChange object in place by:
+ * - Enriching startBalance and endBalance with discovered tokens
+ * - Recalculating tokensChanged and intentsChanged with the enriched balances
+ * 
+ * @param accountId - The account to query balances for
+ * @param blockHeight - The block height where the balance change occurred
+ * @param balanceChange - The balance change object to enrich (mutated in place)
+ * @param discoveredTokens - Sets of FT and intents token IDs discovered from transfers
+ * 
+ * @example
+ * const txInfo = await findBalanceChangingTransaction(accountId, block);
+ * const tokens = extractTokensFromTransfers(txInfo.transfers);
+ * await enrichBalancesWithDiscoveredTokens(accountId, block, balanceChange, tokens);
+ * // balanceChange.startBalance and endBalance now include discovered FT tokens
  */
 async function enrichBalancesWithDiscoveredTokens(
     accountId: string,

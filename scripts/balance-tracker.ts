@@ -469,8 +469,27 @@ export async function getAllBalances(
 
 /**
  * Enrich a balance snapshot with additional FT and intents token balances.
- * This is used when FT/intents transfers are discovered after initial balance query.
- * Only queries tokens that aren't already in the snapshot.
+ * 
+ * This is used when FT/intents transfers are discovered after the initial balance query.
+ * Only queries tokens that aren't already in the snapshot (efficient - no redundant queries).
+ * 
+ * @param accountId - The account to query balances for
+ * @param blockId - Block height to query balances at (can be number or string)
+ * @param existingSnapshot - The existing balance snapshot to enrich
+ * @param additionalFtContracts - FT contract IDs to add (e.g., ['arizcredits.near'])
+ * @param additionalIntentsTokens - Intents token IDs to add (e.g., ['nep141:wrap.near'])
+ * @returns Promise<BalanceSnapshot> - Enriched snapshot with merged token balances
+ * 
+ * @example
+ * // After discovering FT transfer of arizcredits.near
+ * const enriched = await enrichBalanceSnapshot(
+ *   'account.near',
+ *   12345678,
+ *   existingSnapshot,
+ *   ['arizcredits.near'],
+ *   []
+ * );
+ * // enriched.fungibleTokens now includes arizcredits.near balance
  */
 export async function enrichBalanceSnapshot(
     accountId: string,
