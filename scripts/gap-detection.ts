@@ -123,6 +123,11 @@ export function isStakingOnlyEntry(tx: TransactionEntry): boolean {
  * Compare two balance snapshots and return verification result.
  * The expected balance is what we have after the previous record.
  * The actual balance is what we have before the current record.
+ * 
+ * For sparse balance representation:
+ * - Only compare tokens that appear in BOTH snapshots
+ * - If a token appears in only one snapshot, it's not considered a mismatch
+ *   (sparse representation means the token wasn't queried, not that it's zero)
  */
 export function compareBalances(
     expected: BalanceSnapshot | undefined,
@@ -133,26 +138,32 @@ export function compareBalances(
         errors: []
     };
 
-    // Compare NEAR balance
-    const expectedNear = expected?.near || '0';
-    const actualNear = actual?.near || '0';
+    // Compare NEAR balance only if present in both snapshots
+    // Special handling for sparse mode: '0' could mean "not queried"
+    // Only compare if BOTH are non-zero (both were actually queried)
+    const expectedNear = expected?.near;
+    const actualNear = actual?.near;
 
-    if (expectedNear !== actualNear) {
-        result.valid = false;
-        result.errors.push({
-            type: 'near_balance_mismatch',
-            expected: expectedNear,
-            actual: actualNear,
-            message: `NEAR balance mismatch: expected ${expectedNear} but got ${actualNear}`
-        });
+    // Compare only if both are defined AND both are non-zero
+    if (expectedNear !== undefined && actualNear !== undefined &&
+        expectedNear !== '0' && actualNear !== '0') {
+        if (expectedNear !== actualNear) {
+            result.valid = false;
+            result.errors.push({
+                type: 'near_balance_mismatch',
+                expected: expectedNear,
+                actual: actualNear,
+                message: `NEAR balance mismatch: expected ${expectedNear} but got ${actualNear}`
+            });
+        }
     }
 
-    // Compare fungible token balances
+    // Compare fungible token balances - only for tokens present in BOTH snapshots
     const expectedTokens = expected?.fungibleTokens || {};
     const actualTokens = actual?.fungibleTokens || {};
-    const allTokens = new Set([...Object.keys(expectedTokens), ...Object.keys(actualTokens)]);
+    const commonTokens = Object.keys(expectedTokens).filter(t => t in actualTokens);
 
-    for (const token of allTokens) {
+    for (const token of commonTokens) {
         const expectedVal = expectedTokens[token] || '0';
         const actualVal = actualTokens[token] || '0';
         if (expectedVal !== actualVal) {
@@ -167,12 +178,12 @@ export function compareBalances(
         }
     }
 
-    // Compare intents token balances
+    // Compare intents token balances - only for tokens present in BOTH snapshots
     const expectedIntents = expected?.intentsTokens || {};
     const actualIntents = actual?.intentsTokens || {};
-    const allIntents = new Set([...Object.keys(expectedIntents), ...Object.keys(actualIntents)]);
+    const commonIntents = Object.keys(expectedIntents).filter(t => t in actualIntents);
 
-    for (const token of allIntents) {
+    for (const token of commonIntents) {
         const expectedVal = expectedIntents[token] || '0';
         const actualVal = actualIntents[token] || '0';
         if (expectedVal !== actualVal) {
@@ -187,12 +198,12 @@ export function compareBalances(
         }
     }
 
-    // Compare staking pool balances
+    // Compare staking pool balances - only for pools present in BOTH snapshots
     const expectedStaking = expected?.stakingPools || {};
     const actualStaking = actual?.stakingPools || {};
-    const allPools = new Set([...Object.keys(expectedStaking), ...Object.keys(actualStaking)]);
+    const commonPools = Object.keys(expectedStaking).filter(p => p in actualStaking);
 
-    for (const pool of allPools) {
+    for (const pool of commonPools) {
         const expectedVal = expectedStaking[pool] || '0';
         const actualVal = actualStaking[pool] || '0';
         if (expectedVal !== actualVal) {

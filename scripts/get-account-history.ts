@@ -79,8 +79,7 @@ export interface TransactionEntry {
         intentsChanged: Record<string, { start: string; end: string; diff: string }>;
         stakingChanged?: Record<string, { start: string; end: string; diff: string }>;
     };
-    verificationWithNext?: VerificationResult;
-    verificationWithPrevious?: VerificationResult;
+    // verificationWithNext removed - gap detection is computed on-demand using gap-detection module
 }
 
 interface AccountHistory {
@@ -931,12 +930,35 @@ async function processDiscoveredBlocks(
         }
         
         try {
-            // Get balance changes at this specific block
-            const intentsTokensToCheck = txBlock.tokenIds && txBlock.tokenIds.length > 0 ? txBlock.tokenIds : undefined;
+            // First, find the transaction details to discover which tokens changed
+            const txInfo = await findBalanceChangingTransaction(accountId, txBlock.blockHeight);
+            
+            // Determine which tokens changed from the transfers
+            const changedIntentsTokens = new Set<string>();
+            const changedFungibleTokens = new Set<string>();
+            
+            for (const transfer of txInfo.transfers || []) {
+                if (transfer.type === 'mt' && transfer.tokenId) {
+                    changedIntentsTokens.add(transfer.tokenId);
+                } else if (transfer.type === 'ft' && transfer.tokenId) {
+                    changedFungibleTokens.add(transfer.tokenId);
+                }
+            }
+            
+            // Merge with API-provided tokenIds if available
+            if (txBlock.tokenIds && txBlock.tokenIds.length > 0) {
+                txBlock.tokenIds.forEach(t => changedIntentsTokens.add(t));
+            }
+            
+            // Get balance changes at this specific block, querying only the tokens that changed
+            // If no token changes detected, pass empty array to avoid querying all tokens
+            const intentsTokensToCheck = changedIntentsTokens.size > 0 ? Array.from(changedIntentsTokens) : null;
+            const fungibleTokensToCheck = changedFungibleTokens.size > 0 ? Array.from(changedFungibleTokens) : null;
+            
             const balanceChange = await getBalanceChangesAtBlock(
                 accountId, 
                 txBlock.blockHeight,
-                undefined,
+                fungibleTokensToCheck,
                 intentsTokensToCheck,
                 undefined
             );
@@ -945,9 +967,6 @@ async function processDiscoveredBlocks(
                 // No balance changes for tracked tokens
                 continue;
             }
-            
-            // Find the transaction details
-            const txInfo = await findBalanceChangingTransaction(accountId, txBlock.blockHeight);
             
             // Create transaction entry
             const entry: TransactionEntry = {
@@ -1352,7 +1371,6 @@ async function fillGaps(
     // Save and return - gap to creation/present are handled by main search
     if (totalFilled > 0) {
         history.transactions.sort((a, b) => a.block - b.block);
-        updateVerificationFields(history);
         saveHistory(outputFile, history);
     }
     
@@ -1527,30 +1545,6 @@ async function enrichTransactionsWithTransactionBlock(
     }
     
     return enriched;
-}
-
-/**
- * Update verification fields on all transactions after sorting
- */
-function updateVerificationFields(history: AccountHistory): void {
-    // Sort transactions by block
-    history.transactions.sort((a, b) => a.block - b.block);
-    
-    // Update verificationWithNext for each transaction
-    for (let i = 0; i < history.transactions.length - 1; i++) {
-        const currentTx = history.transactions[i];
-        const nextTx = history.transactions[i + 1];
-        
-        if (currentTx && nextTx) {
-            currentTx.verificationWithNext = verifyTransactionConnectivity(nextTx, currentTx);
-        }
-    }
-    
-    // Clear verificationWithNext on the last transaction
-    const lastTx = history.transactions[history.transactions.length - 1];
-    if (lastTx) {
-        delete lastTx.verificationWithNext;
-    }
 }
 
 /**
@@ -1881,7 +1875,6 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
 
     // Final sort and save
     history.transactions.sort((a, b) => a.block - b.block);
-    updateVerificationFields(history);
     saveHistory(outputFile, history);
     
     console.log(`\n=== Export complete ===`);
