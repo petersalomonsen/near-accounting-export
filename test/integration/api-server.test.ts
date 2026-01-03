@@ -108,10 +108,16 @@ describe('API Server', function() {
         }
     });
 
-    after(function() {
-        // Stop the server
+    after(async function() {
+        // Stop the server and wait for it to exit
         if (serverProcess) {
             serverProcess.kill();
+            // Wait for process to actually exit
+            await new Promise<void>((resolve) => {
+                serverProcess.once('exit', () => resolve());
+                // Fallback timeout in case process doesn't exit cleanly
+                setTimeout(() => resolve(), 2000);
+            });
         }
 
         // Cleanup test data
@@ -380,9 +386,13 @@ describe('API Server - Payment Verification', function() {
         }
     });
 
-    after(function() {
+    after(async function() {
         if (serverProcess) {
             serverProcess.kill();
+            await new Promise<void>((resolve) => {
+                serverProcess.once('exit', () => resolve());
+                setTimeout(() => resolve(), 2000);
+            });
         }
 
         if (fs.existsSync(TEST_DATA_DIR)) {
@@ -535,9 +545,13 @@ describe('API Server - CORS Configuration', function() {
             }
         });
 
-        after(function() {
+        after(async function() {
             if (serverProcess) {
                 serverProcess.kill();
+                await new Promise<void>((resolve) => {
+                    serverProcess.once('exit', () => resolve());
+                    setTimeout(() => resolve(), 2000);
+                });
             }
 
             if (fs.existsSync(TEST_DATA_DIR)) {
@@ -697,9 +711,13 @@ describe('API Server - CORS Configuration', function() {
             }
         });
 
-        after(function() {
+        after(async function() {
             if (restrictedServerProcess) {
                 restrictedServerProcess.kill();
+                await new Promise<void>((resolve) => {
+                    restrictedServerProcess.once('exit', () => resolve());
+                    setTimeout(() => resolve(), 2000);
+                });
             }
 
             if (fs.existsSync(RESTRICTED_TEST_DATA_DIR)) {
