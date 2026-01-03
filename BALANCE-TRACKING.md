@@ -68,16 +68,16 @@ Each entry in the `transactions` array represents a **block** where a balance ch
       "receiptId": "DHnhxj..."           // The receipt that caused this balance change
     }
   ],
-  "balanceBefore": {                     // Full balance snapshot BEFORE this block
+  "balanceBefore": {                     // Balance snapshot BEFORE this block (sparse)
     "near": "26445338627379869499999976",
-    "fungibleTokens": { "wrap.near": "0", ... },
-    "intentsTokens": { "nep141:eth.omft.near": "35015088429776132", ... },
-    "stakingPools": {}
+    "fungibleTokens": {},                // May be empty if no FT changes in this transaction
+    "intentsTokens": {},                 // May be empty if no intents changes in this transaction
+    "stakingPools": {}                   // May be empty if no staking changes in this transaction
   },
-  "balanceAfter": {                      // Full balance snapshot AFTER this block
+  "balanceAfter": {                      // Balance snapshot AFTER this block (sparse)
     "near": "26569088627379869499999976",
-    "fungibleTokens": { ... },
-    "intentsTokens": { ... },
+    "fungibleTokens": {},
+    "intentsTokens": {},
     "stakingPools": {}
   },
   "changes": {                           // Summary of what changed
@@ -89,16 +89,34 @@ Each entry in the `transactions` array represents a **block** where a balance ch
 }
 ```
 
+### Sparse Balance Representation
+
+**Important**: `balanceBefore` and `balanceAfter` use **sparse representation** - they only include tokens that **changed** in that transaction.
+
+- **Empty token maps** (`{}`) mean "not queried" NOT "zero balance"
+- This prevents unnecessary RPC calls and avoids data loss when RPC queries fail
+- Gap detection only compares tokens that appear in BOTH snapshots
+
+**Example**: A NEAR-only transaction (no token transfers):
+```json
+{
+  "balanceBefore": { "near": "1000", "fungibleTokens": {}, "intentsTokens": {} },
+  "balanceAfter": { "near": "900", "fungibleTokens": {}, "intentsTokens": {} }
+}
+```
+The empty `fungibleTokens` and `intentsTokens` mean they weren't queried (sparse), NOT that they're zero.
+
 ## Gap detection
 
-A **gap** exists when `balanceAfter` of record N does not match `balanceBefore` of record N+1.
+A **gap** exists when `balanceAfter` of record N does not match `balanceBefore` of record N+1 **for tokens that appear in BOTH snapshots**.
 
 Gap detection is computed in-memory each time the script runs - it is NOT stored in the dataset. The algorithm:
 
 1. Load transactions sorted by block height
 2. For each consecutive pair (N, N+1):
    - Compare `transactions[N].balanceAfter` with `transactions[N+1].balanceBefore`
-   - If any balance differs → gap exists between `transactions[N].block` and `transactions[N+1].block`
+   - **Only compare tokens that appear in BOTH snapshots** (sparse balance handling)
+   - If any common token differs → gap exists between the blocks
 3. Check if `transactions[first].balanceBefore` has non-zero balances → gap to account creation
 4. Check if `transactions[last].balanceAfter` differs from current on-chain balance → gap to present
 
