@@ -687,22 +687,18 @@ describe('NEAR Accounting Export', function() {
                 const afterResults = verifyHistoryFile(gapTestFile);
                 assert.ok(afterResults.valid, 'History should be valid after gap filling');
                 
-                // Verify that verificationWithNext fields were updated
-                // Block 151391582 should now have valid verificationWithNext pointing to 151391583
-                const block151391582 = history.transactions.find(t => t.block === 151391582);
-                assert.ok(block151391582, 'Block 151391582 should exist');
-                assert.ok(block151391582.verificationWithNext, 'Block 151391582 should have verificationWithNext');
-                assert.ok(block151391582.verificationWithNext.valid, 
-                    'Block 151391582 verificationWithNext should be valid after gap fill');
+                // Verify that gaps are filled using gap detection
+                // Block 151391582 -> 151391583 -> 151391586 should have no gaps
+                const { detectGaps } = await import('../../scripts/gap-detection.js');
+                const gapAnalysis = detectGaps(history.transactions);
                 
-                // Block 151391583 should have valid verificationWithNext pointing to 151391586
-                assert.ok(block151391583.verificationWithNext, 'Block 151391583 should have verificationWithNext');
-                assert.ok(block151391583.verificationWithNext.valid,
-                    'Block 151391583 verificationWithNext should be valid');
+                // There should be no internal gaps
+                assert.strictEqual(gapAnalysis.internalGaps.length, 0, 
+                    'All gaps should be filled - no internal gaps should remain');
                 
                 console.log('Gap successfully filled with transaction at block 151391583');
                 console.log('Intents change:', block151391583.changes.intentsChanged);
-                console.log('Block 151391582 verificationWithNext:', block151391582.verificationWithNext);
+                console.log('Gap analysis:', gapAnalysis);
             } finally {
                 // Cleanup
                 if (fs.existsSync(gapTestFile)) {
