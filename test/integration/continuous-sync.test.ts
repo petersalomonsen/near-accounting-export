@@ -122,10 +122,16 @@ describe('Continuous Sync', function() {
         }
     });
 
-    after(function() {
-        // Stop the server
+    after(async function() {
+        // Stop the server and wait for it to exit
         if (serverProcess) {
             serverProcess.kill();
+            // Wait for process to actually exit
+            await new Promise<void>((resolve) => {
+                serverProcess.on('exit', () => resolve());
+                // Fallback timeout in case process doesn't exit cleanly
+                setTimeout(() => resolve(), 1000);
+            });
         }
 
         // Cleanup test data
@@ -142,16 +148,16 @@ describe('Continuous Sync', function() {
                     accountId: TEST_ACCOUNTS[i]
                 });
             }
-            
+
             // Wait for at least one sync cycle to complete
             // With CYCLE_DELAY_MS=100, we wait a bit for the loop to process
             await new Promise(resolve => setTimeout(resolve, 2000));
-            
+
             // Verify accounts are registered
             const accountsResponse = await makeRequest('GET', '/api/accounts');
             assert.equal(accountsResponse.statusCode, 200);
             assert.ok(accountsResponse.body.accounts.length >= TEST_ACCOUNTS.length);
-            
+
             // All test accounts should be in the list
             for (const testAccount of TEST_ACCOUNTS) {
                 const found = accountsResponse.body.accounts.find(
@@ -164,11 +170,11 @@ describe('Continuous Sync', function() {
         it('should have job records from continuous sync', async function() {
             // Wait a bit for the continuous sync loop to process
             await new Promise(resolve => setTimeout(resolve, 3000));
-            
+
             // Get all jobs
             const jobsResponse = await makeRequest('GET', '/api/jobs');
             assert.equal(jobsResponse.statusCode, 200);
-            
+
             // Should have jobs created by the continuous sync loop
             // Note: The loop may not have completed any jobs yet, but we verify it's running
             assert.ok(Array.isArray(jobsResponse.body.jobs));
@@ -233,11 +239,19 @@ describe('Subscription Renewal', function() {
         }
     });
 
-    after(function() {
+    after(async function() {
+        // Stop the server and wait for it to exit
         if (serverProcess) {
             serverProcess.kill();
+            // Wait for process to actually exit
+            await new Promise<void>((resolve) => {
+                serverProcess.on('exit', () => resolve());
+                // Fallback timeout in case process doesn't exit cleanly
+                setTimeout(() => resolve(), 1000);
+            });
         }
 
+        // Cleanup test data
         if (fs.existsSync(TEST_DATA_DIR)) {
             fs.rmSync(TEST_DATA_DIR, { recursive: true });
         }

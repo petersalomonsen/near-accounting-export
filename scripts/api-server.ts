@@ -17,6 +17,8 @@ import { getAccountHistory, verifyHistoryFile } from './get-account-history.js';
 import type { TransactionEntry } from './get-account-history.js';
 import { convertJsonToCsv } from './json-to-csv.js';
 import { getClient } from './rpc.js';
+import { detectGaps } from './gap-detection.js';
+import type { GapAnalysis, Gap } from './gap-detection.js';
 
 // Payment verification configuration
 const PAYMENT_CONFIG = {
@@ -32,7 +34,9 @@ const PAYMENT_CONFIG = {
 // Continuous sync configuration
 const SYNC_CONFIG = {
     batchSize: parseInt(process.env.BATCH_SIZE || '10', 10),
-    cycleDelayMs: parseInt(process.env.CYCLE_DELAY_MS || '30000', 10)
+    cycleDelayMs: parseInt(process.env.CYCLE_DELAY_MS || '30000', 10),
+    maxEpochsPerCycle: parseInt(process.env.MAX_EPOCHS_PER_CYCLE || '50', 10),
+    accountTimeoutMs: parseInt(process.env.ACCOUNT_TIMEOUT_MS || '300000', 10) // 5 minutes default
 };
 
 // CORS configuration
@@ -262,136 +266,60 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
     
     // Check if history is complete (backward search done)
     const historyComplete = historyFile?.metadata?.historyComplete === true;
-    
-    // Create job for tracking
-    const jobId = uuidv4();
-    const now = new Date().toISOString();
-    
-    try {
-        // If history is not complete, search backward first
-        if (!historyComplete) {
-            console.log(`[${accountId}] Searching backward (history incomplete)`);
-            result.backward = true;
-            
-            const backwardJob: Job = {
-                jobId,
-                accountId,
-                status: 'running',
-                createdAt: now,
-                startedAt: now,
-                options: {
-                    direction: 'backward',
-                    maxTransactions: SYNC_CONFIG.batchSize
-                }
-            };
-            
-            const jobsDb = loadJobs();
-            jobsDb.jobs[jobId] = backwardJob;
-            saveJobs(jobsDb);
-            
-            // Mark as running
-            const jobPromise = (async () => {
-                try {
-                    await getAccountHistory({
-                        accountId,
-                        outputFile,
-                        direction: 'backward',
-                        maxTransactions: SYNC_CONFIG.batchSize
-                    });
-                    
-                    // Mark as completed
-                    const updatedJobsDb = loadJobs();
-                    const completedJob = updatedJobsDb.jobs[jobId];
-                    if (completedJob) {
-                        completedJob.status = 'completed';
-                        completedJob.completedAt = new Date().toISOString();
-                        saveJobs(updatedJobsDb);
-                    }
-                } catch (error) {
-                    // Mark as failed
-                    const updatedJobsDb = loadJobs();
-                    const failedJob = updatedJobsDb.jobs[jobId];
-                    if (failedJob) {
-                        failedJob.status = 'failed';
-                        failedJob.error = error instanceof Error ? error.message : String(error);
-                        failedJob.completedAt = new Date().toISOString();
-                        saveJobs(updatedJobsDb);
-                    }
-                    console.error(`[${accountId}] Backward search failed:`, error);
-                }
-            })();
-            
-            runningJobs.set(accountId, jobPromise);
-            await jobPromise;
-            runningJobs.delete(accountId);
-        }
-        
-        // Skip forward search if shutting down
-        if (continuousSyncShuttingDown) {
-            return result;
-        }
-        
-        // Always search forward for new transactions
-        console.log(`[${accountId}] Searching forward (checking for new transactions)`);
-        result.forward = true;
-        
-        const forwardJobId = uuidv4();
-        const forwardJob: Job = {
-            jobId: forwardJobId,
-            accountId,
-            status: 'running',
-            createdAt: new Date().toISOString(),
-            startedAt: new Date().toISOString(),
-            options: {
-                direction: 'forward',
-                maxTransactions: SYNC_CONFIG.batchSize
-            }
-        };
-        
-        const jobsDb = loadJobs();
-        jobsDb.jobs[forwardJobId] = forwardJob;
-        saveJobs(jobsDb);
-        
-        const forwardPromise = (async () => {
+
+    // Wrap entire sync operation in a single promise that stays in runningJobs
+    const syncPromise = (async () => {
+        try {
+            // ALWAYS search forward FIRST to get latest data (priority: freshness over completeness)
+            console.log(`[${accountId}] Searching forward (checking for new transactions)`);
+            result.forward = true;
+
             try {
                 await getAccountHistory({
                     accountId,
                     outputFile,
                     direction: 'forward',
-                    maxTransactions: SYNC_CONFIG.batchSize
+                    maxTransactions: SYNC_CONFIG.batchSize,
+                    maxEpochsToCheck: SYNC_CONFIG.maxEpochsPerCycle
                 });
-                
-                // Mark as completed
-                const updatedJobsDb = loadJobs();
-                const completedJob = updatedJobsDb.jobs[forwardJobId];
-                if (completedJob) {
-                    completedJob.status = 'completed';
-                    completedJob.completedAt = new Date().toISOString();
-                    saveJobs(updatedJobsDb);
-                }
             } catch (error) {
-                // Mark as failed
-                const updatedJobsDb = loadJobs();
-                const failedJob = updatedJobsDb.jobs[forwardJobId];
-                if (failedJob) {
-                    failedJob.status = 'failed';
-                    failedJob.error = error instanceof Error ? error.message : String(error);
-                    failedJob.completedAt = new Date().toISOString();
-                    saveJobs(updatedJobsDb);
-                }
                 console.error(`[${accountId}] Forward search failed:`, error);
             }
-        })();
-        
-        runningJobs.set(accountId, forwardPromise);
-        await forwardPromise;
-        runningJobs.delete(accountId);
-        
-    } catch (error) {
-        console.error(`[${accountId}] Error processing account cycle:`, error);
-        runningJobs.delete(accountId);
-    }
-    
+
+            // Skip backward search if shutting down
+            if (continuousSyncShuttingDown) {
+                return;
+            }
+
+            // Then do incremental backward search if history is not complete
+            if (!historyComplete) {
+                console.log(`[${accountId}] Searching backward (incremental - history incomplete)`);
+                result.backward = true;
+
+                try {
+                    await getAccountHistory({
+                        accountId,
+                        outputFile,
+                        direction: 'backward',
+                        maxTransactions: SYNC_CONFIG.batchSize,
+                        maxEpochsToCheck: SYNC_CONFIG.maxEpochsPerCycle
+                    });
+                } catch (error) {
+                    console.error(`[${accountId}] Backward search failed:`, error);
+                }
+            }
+
+        } catch (error) {
+            console.error(`[${accountId}] Error processing account cycle:`, error);
+        } finally {
+            // Only remove from runningJobs after ALL phases complete (including staking sync)
+            runningJobs.delete(accountId);
+        }
+    })();
+
+    runningJobs.set(accountId, syncPromise);
+    await syncPromise;
+
     return result;
 }
 
@@ -406,7 +334,12 @@ export async function startContinuousLoop(): Promise<void> {
     
     continuousSyncRunning = true;
     continuousSyncShuttingDown = false;
-    console.log(`Starting continuous sync loop (batch size: ${SYNC_CONFIG.batchSize}, cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms)`);
+    console.log(`Starting continuous sync loop`);
+    console.log(`  Priority: Forward sync first (latest data), then backward sync (historical data)`);
+    console.log(`  Batch size: ${SYNC_CONFIG.batchSize} transactions`);
+    console.log(`  Cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms`);
+    console.log(`  Max epochs/cycle: ${SYNC_CONFIG.maxEpochsPerCycle}`);
+    console.log(`  Account timeout: ${SYNC_CONFIG.accountTimeoutMs}ms`);
     
     while (!continuousSyncShuttingDown) {
         try {
@@ -430,9 +363,27 @@ export async function startContinuousLoop(): Promise<void> {
                     skippedCount++;
                     continue;
                 }
-                
-                await processAccountCycle(account.accountId);
-                processedCount++;
+
+                // Process account with timeout to prevent one account from blocking others
+                try {
+                    const timeoutPromise = new Promise<never>((_, reject) =>
+                        setTimeout(() => reject(new Error('Account timeout')), SYNC_CONFIG.accountTimeoutMs)
+                    );
+
+                    await Promise.race([
+                        processAccountCycle(account.accountId),
+                        timeoutPromise
+                    ]);
+                    processedCount++;
+                } catch (error) {
+                    if (error instanceof Error && error.message === 'Account timeout') {
+                        console.log(`[${account.accountId}] ⏱️  Timeout reached (${SYNC_CONFIG.accountTimeoutMs}ms), moving to next account`);
+                        processedCount++;
+                    } else {
+                        console.error(`[${account.accountId}] Error in sync cycle:`, error);
+                        skippedCount++;
+                    }
+                }
             }
             
             console.log(`=== Sync cycle complete: ${processedCount} processed, ${skippedCount} skipped ===\n`);
@@ -860,18 +811,23 @@ app.get('/api/jobs/:jobId', (req: Request, res: Response) => {
     res.json({ job });
 });
 
-// GET /api/jobs - List all jobs
+// GET /api/jobs - List all jobs (now using in-memory tracking)
 app.get('/api/jobs', (req: Request, res: Response) => {
     const { accountId } = req.query;
-    
-    const jobsDb = loadJobs();
-    let jobs = Object.values(jobsDb.jobs);
-    
+
+    // Build jobs list from in-memory running jobs
+    const jobs: any[] = Array.from(runningJobs.keys()).map(accountId => ({
+        accountId,
+        status: 'running',
+        startedAt: new Date().toISOString() // We don't track start time, so use current time as placeholder
+    }));
+
     // Filter by accountId if provided
     if (accountId && typeof accountId === 'string') {
-        jobs = jobs.filter(job => job.accountId === accountId);
+        const filtered = jobs.filter(job => job.accountId === accountId);
+        return res.json({ jobs: filtered });
     }
-    
+
     res.json({ jobs });
 });
 
@@ -889,11 +845,9 @@ app.get('/api/accounts/:accountId/status', (req: Request, res: Response) => {
         return res.status(404).json({ error: 'Account not registered' });
     }
     
-    // Check for running job
-    const jobsDb = loadJobs();
-    const accountJobs = Object.values(jobsDb.jobs).filter(job => job.accountId === accountId);
-    const runningJob = accountJobs.find(job => job.status === 'running' || job.status === 'pending');
-    
+    // Check for running job (use in-memory Map, not jobs.json)
+    const isRunning = runningJobs.has(accountId);
+
     // Check if data file exists and get metadata
     const outputFile = getAccountOutputFile(accountId);
     let dataRange = null;
@@ -919,13 +873,7 @@ app.get('/api/accounts/:accountId/status', (req: Request, res: Response) => {
         accountId,
         hasData,
         dataRange,
-        ongoingJob: runningJob ? {
-            jobId: runningJob.jobId,
-            status: runningJob.status,
-            createdAt: runningJob.createdAt,
-            startedAt: runningJob.startedAt,
-            options: runningJob.options
-        } : null
+        isRunning
     });
 });
 
@@ -1003,7 +951,111 @@ app.get('/api/accounts/:accountId/download/csv', async (req: Request, res: Respo
         fileStream.pipe(res);
     } catch (error) {
         console.error('Unexpected error in CSV download:', error);
-        res.status(500).json({ 
+        res.status(500).json({
+            error: 'Internal server error',
+            message: error instanceof Error ? error.message : String(error)
+        });
+    }
+});
+
+// GET /api/accounts/:accountId/gap-analysis - Get gap analysis report
+app.get('/api/accounts/:accountId/gap-analysis', (req: Request, res: Response) => {
+    try {
+        const accountId = req.params.accountId;
+
+        if (!accountId) {
+            return res.status(400).json({ error: 'Account ID is required' });
+        }
+
+        // Check if account is registered
+        const accountsDb = loadAccounts();
+        if (!accountsDb.accounts[accountId]) {
+            return res.status(404).json({ error: 'Account not registered' });
+        }
+
+        const outputFile = getAccountOutputFile(accountId);
+
+        if (!fs.existsSync(outputFile)) {
+            return res.status(404).json({ error: 'No data file found for this account yet' });
+        }
+
+        // Read and parse the account history file
+        const fileContent = fs.readFileSync(outputFile, 'utf-8');
+        const history = JSON.parse(fileContent);
+
+        if (!history.accountId || !Array.isArray(history.transactions)) {
+            return res.status(500).json({ error: 'Invalid account history file format' });
+        }
+
+        // Run gap detection
+        const gapAnalysis: GapAnalysis = detectGaps(history.transactions);
+
+        // Format the response
+        const response = {
+            accountId: history.accountId,
+            analyzedAt: new Date().toISOString(),
+            summary: {
+                totalGaps: gapAnalysis.totalGaps,
+                internalGaps: gapAnalysis.internalGaps.length,
+                hasGapToCreation: gapAnalysis.gapToCreation !== null,
+                hasGapToPresent: gapAnalysis.gapToPresent !== null,
+                isComplete: gapAnalysis.isComplete
+            },
+            metadata: {
+                totalTransactions: history.transactions.length,
+                firstBlock: history.metadata?.firstBlock || null,
+                lastBlock: history.metadata?.lastBlock || null
+            },
+            gaps: [
+                // Include gap to creation if it exists
+                ...(gapAnalysis.gapToCreation ? [{
+                    type: 'gap_to_creation',
+                    startBlock: gapAnalysis.gapToCreation.startBlock,
+                    endBlock: gapAnalysis.gapToCreation.endBlock,
+                    mismatches: gapAnalysis.gapToCreation.verification.errors.map(err => ({
+                        type: err.type,
+                        token: err.token,
+                        pool: err.pool,
+                        expected: err.expected,
+                        actual: err.actual,
+                        message: err.message
+                    }))
+                }] : []),
+                // Include all internal gaps
+                ...gapAnalysis.internalGaps.map((gap: Gap) => ({
+                    type: 'internal_gap',
+                    startBlock: gap.startBlock,
+                    endBlock: gap.endBlock,
+                    mismatches: gap.verification.errors.map(err => ({
+                        type: err.type,
+                        token: err.token,
+                        pool: err.pool,
+                        expected: err.expected,
+                        actual: err.actual,
+                        message: err.message
+                    }))
+                })),
+                // Include gap to present if it exists
+                ...(gapAnalysis.gapToPresent ? [{
+                    type: 'gap_to_present',
+                    startBlock: gapAnalysis.gapToPresent.startBlock,
+                    endBlock: gapAnalysis.gapToPresent.endBlock,
+                    mismatches: gapAnalysis.gapToPresent.verification.errors.map(err => ({
+                        type: err.type,
+                        token: err.token,
+                        pool: err.pool,
+                        expected: err.expected,
+                        actual: err.actual,
+                        message: err.message
+                    }))
+                }] : [])
+            ]
+        };
+
+        res.json(response);
+    } catch (error) {
+        console.error('Unexpected error in gap analysis:', error);
+        res.status(500).json({
             error: 'Internal server error',
             message: error instanceof Error ? error.message : String(error)
         });
@@ -1028,6 +1080,8 @@ const server = app.listen(PORT, () => {
     console.log(`Data directory: ${DATA_DIR}`);
     console.log(`Batch size: ${SYNC_CONFIG.batchSize}`);
     console.log(`Cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms`);
+    console.log(`Max epochs per cycle: ${SYNC_CONFIG.maxEpochsPerCycle}`);
+    console.log(`Account timeout: ${SYNC_CONFIG.accountTimeoutMs}ms`);
     console.log(`CORS allowed origins: ${CORS_CONFIG.allowedOrigins.join(', ')}`);
     console.log('');
     console.log('Available endpoints:');
@@ -1036,6 +1090,7 @@ const server = app.listen(PORT, () => {
     console.log('  GET    /api/accounts/:accountId/status - Get account status and data range');
     console.log('  GET    /api/accounts/:accountId/download/json - Download account data as JSON');
     console.log('  GET    /api/accounts/:accountId/download/csv - Download account data as CSV');
+    console.log('  GET    /api/accounts/:accountId/gap-analysis - Get gap analysis report');
     console.log('  GET    /api/jobs - List all jobs');
     console.log('  GET    /api/jobs/:jobId - Get job status');
     console.log('  GET    /health - Health check');
