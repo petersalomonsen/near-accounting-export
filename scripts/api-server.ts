@@ -13,7 +13,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-import { getAccountHistory, verifyHistoryFile } from './get-account-history.js';
+import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances } from './get-account-history.js';
 import type { TransactionEntry } from './get-account-history.js';
 import { convertJsonToCsv } from './json-to-csv.js';
 import { getClient } from './rpc.js';
@@ -307,6 +307,19 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
                 } catch (error) {
                     console.error(`[${accountId}] Backward search failed:`, error);
                 }
+            }
+
+            // Skip FT re-enrichment if shutting down
+            if (continuousSyncShuttingDown) {
+                return;
+            }
+
+            // Re-enrich FT balances for entries that have FT transfers but missing FT balance snapshots
+            // This fixes entries created before FT balance enrichment was implemented
+            try {
+                await reEnrichFTBalances(accountId, outputFile, SYNC_CONFIG.batchSize);
+            } catch (error) {
+                console.error(`[${accountId}] FT re-enrichment failed:`, error);
             }
 
         } catch (error) {
@@ -1073,51 +1086,53 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
     res.status(500).json({ error: 'Internal server error', message: err.message });
 });
 
-// Start server
-const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
-    console.log(`API Server running on port ${PORT}`);
-    console.log(`Data directory: ${DATA_DIR}`);
-    console.log(`Batch size: ${SYNC_CONFIG.batchSize}`);
-    console.log(`Cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms`);
-    console.log(`Max epochs per cycle: ${SYNC_CONFIG.maxEpochsPerCycle}`);
-    console.log(`Account timeout: ${SYNC_CONFIG.accountTimeoutMs}ms`);
-    console.log(`CORS allowed origins: ${CORS_CONFIG.allowedOrigins.join(', ')}`);
-    console.log('');
-    console.log('Available endpoints:');
-    console.log('  POST   /api/accounts - Register an account (or renew subscription)');
-    console.log('  GET    /api/accounts - List registered accounts');
-    console.log('  GET    /api/accounts/:accountId/status - Get account status and data range');
-    console.log('  GET    /api/accounts/:accountId/download/json - Download account data as JSON');
-    console.log('  GET    /api/accounts/:accountId/download/csv - Download account data as CSV');
-    console.log('  GET    /api/accounts/:accountId/gap-analysis - Get gap analysis report');
-    console.log('  GET    /api/jobs - List all jobs');
-    console.log('  GET    /api/jobs/:jobId - Get job status');
-    console.log('  GET    /health - Health check');
-    console.log('');
-    console.log('Note: POST /api/jobs has been removed. Jobs run automatically.');
-    
-    // Start continuous sync loop
-    startContinuousLoop();
-});
+// Only start server when run directly (not when imported for testing)
+if (import.meta.url === `file://${process.argv[1]}`) {
+    const PORT = process.env.PORT || 3000;
+    const server = app.listen(PORT, () => {
+        console.log(`API Server running on port ${PORT}`);
+        console.log(`Data directory: ${DATA_DIR}`);
+        console.log(`Batch size: ${SYNC_CONFIG.batchSize}`);
+        console.log(`Cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms`);
+        console.log(`Max epochs per cycle: ${SYNC_CONFIG.maxEpochsPerCycle}`);
+        console.log(`Account timeout: ${SYNC_CONFIG.accountTimeoutMs}ms`);
+        console.log(`CORS allowed origins: ${CORS_CONFIG.allowedOrigins.join(', ')}`);
+        console.log('');
+        console.log('Available endpoints:');
+        console.log('  POST   /api/accounts - Register an account (or renew subscription)');
+        console.log('  GET    /api/accounts - List registered accounts');
+        console.log('  GET    /api/accounts/:accountId/status - Get account status and data range');
+        console.log('  GET    /api/accounts/:accountId/download/json - Download account data as JSON');
+        console.log('  GET    /api/accounts/:accountId/download/csv - Download account data as CSV');
+        console.log('  GET    /api/accounts/:accountId/gap-analysis - Get gap analysis report');
+        console.log('  GET    /api/jobs - List all jobs');
+        console.log('  GET    /api/jobs/:jobId - Get job status');
+        console.log('  GET    /health - Health check');
+        console.log('');
+        console.log('Note: POST /api/jobs has been removed. Jobs run automatically.');
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down gracefully...');
-    stopContinuousLoop();
-    server.close(() => {
-        console.log('Server closed');
-        process.exit(0);
+        // Start continuous sync loop
+        startContinuousLoop();
     });
-});
 
-process.on('SIGINT', () => {
-    console.log('SIGINT received, shutting down gracefully...');
-    stopContinuousLoop();
-    server.close(() => {
-        console.log('Server closed');
-        process.exit(0);
+    // Graceful shutdown
+    process.on('SIGTERM', () => {
+        console.log('SIGTERM received, shutting down gracefully...');
+        stopContinuousLoop();
+        server.close(() => {
+            console.log('Server closed');
+            process.exit(0);
+        });
     });
-});
+
+    process.on('SIGINT', () => {
+        console.log('SIGINT received, shutting down gracefully...');
+        stopContinuousLoop();
+        server.close(() => {
+            console.log('Server closed');
+            process.exit(0);
+        });
+    });
+}
 
 export { app };

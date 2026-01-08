@@ -25,7 +25,9 @@ import {
     accountExistsAtBlock,
     getStakingPoolBalances,
     findStakingBalanceChanges,
-    getAllBalances
+    getAllBalances,
+    enrichBalanceSnapshot,
+    detectBalanceChanges
 } from './balance-tracker.js';
 import {
     getAllTransactionBlocks,
@@ -744,6 +746,104 @@ export function isStakingOnlyEntry(tx: TransactionEntry): boolean {
 // Note: detectGaps is now imported from './gap-detection.js' module
 
 /**
+ * Extract FT and intents tokens from transaction transfers.
+ * 
+ * Scans through transfer details and extracts unique token contract IDs
+ * for fungible tokens (FT) and multi-tokens (intents).
+ * 
+ * @param transfers - Array of transfer details from a transaction
+ * @returns Object containing Sets of unique FT and intents token IDs
+ * 
+ * @example
+ * const txInfo = await findBalanceChangingTransaction(accountId, block);
+ * const { ftTokens, intentsTokens } = extractTokensFromTransfers(txInfo.transfers);
+ * // ftTokens: Set(['arizcredits.near', 'wrap.near'])
+ * // intentsTokens: Set(['nep141:wrap.near'])
+ */
+function extractTokensFromTransfers(transfers: TransferDetail[]): {
+    ftTokens: Set<string>;
+    intentsTokens: Set<string>;
+} {
+    const ftTokens = new Set<string>(
+        (transfers || [])
+            .filter(t => t.type === 'ft' && t.tokenId)
+            .map(t => t.tokenId!)
+    );
+    
+    const intentsTokens = new Set<string>(
+        (transfers || [])
+            .filter(t => t.type === 'mt' && t.tokenId)
+            .map(t => t.tokenId!)
+    );
+    
+    return { ftTokens, intentsTokens };
+}
+
+/**
+ * Enrich balance snapshots with FT/intents tokens discovered from transfers.
+ * 
+ * This ensures balance snapshots include all tokens that had transfers in the transaction.
+ * Mutates the balanceChange object in place by:
+ * - Enriching startBalance and endBalance with discovered tokens
+ * - Recalculating tokensChanged and intentsChanged with the enriched balances
+ * 
+ * @param accountId - The account to query balances for
+ * @param blockHeight - The block height where the balance change occurred
+ * @param balanceChange - The balance change object to enrich (mutated in place)
+ * @param discoveredTokens - Sets of FT and intents token IDs discovered from transfers
+ * 
+ * @example
+ * const txInfo = await findBalanceChangingTransaction(accountId, block);
+ * const tokens = extractTokensFromTransfers(txInfo.transfers);
+ * await enrichBalancesWithDiscoveredTokens(accountId, block, balanceChange, tokens);
+ * // balanceChange.startBalance and endBalance now include discovered FT tokens
+ */
+async function enrichBalancesWithDiscoveredTokens(
+    accountId: string,
+    blockHeight: number,
+    balanceChange: BalanceChanges,
+    discoveredTokens: { ftTokens: Set<string>; intentsTokens: Set<string> }
+): Promise<void> {
+    const { ftTokens, intentsTokens } = discoveredTokens;
+
+    if (ftTokens.size === 0 && intentsTokens.size === 0) {
+        return;
+    }
+
+    // IMPORTANT: FT and MT token balance changes appear at block N+1, not block N
+    // NEAR balance changes appear at block N (the transaction block)
+    // So we query FT/MT at blocks N and N+1 to capture the change
+
+    // Enrich balance snapshots
+    if (balanceChange.startBalance) {
+        balanceChange.startBalance = await enrichBalanceSnapshot(
+            accountId,
+            blockHeight,  // FT/MT balances BEFORE the change (at block N)
+            balanceChange.startBalance,
+            Array.from(ftTokens),
+            Array.from(intentsTokens)
+        );
+    }
+
+    if (balanceChange.endBalance) {
+        balanceChange.endBalance = await enrichBalanceSnapshot(
+            accountId,
+            blockHeight + 1,  // FT/MT balances AFTER the change (at block N+1)
+            balanceChange.endBalance,
+            Array.from(ftTokens),
+            Array.from(intentsTokens)
+        );
+    }
+
+    // Recalculate changes with enriched balances
+    if (balanceChange.startBalance && balanceChange.endBalance) {
+        const updatedChanges = detectBalanceChanges(balanceChange.startBalance, balanceChange.endBalance);
+        balanceChange.tokensChanged = updatedChanges.tokensChanged;
+        balanceChange.intentsChanged = updatedChanges.intentsChanged;
+    }
+}
+
+/**
  * Combined transaction block info from any API source
  */
 interface CombinedTransactionBlock {
@@ -1197,6 +1297,10 @@ async function fillGapWithBinarySearch(
         
         // Find transaction details
         const txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block);
+        
+        // Extract FT and intents tokens from discovered transfers and enrich balance snapshots
+        const discoveredTokens = extractTokensFromTransfers(txInfo.transfers);
+        await enrichBalancesWithDiscoveredTokens(accountId, balanceChange.block, balanceChange, discoveredTokens);
         
         // Create transaction entry
         const entry: TransactionEntry = {
@@ -2006,6 +2110,10 @@ async function searchForTransactions(
         // Find transaction details
         const txInfo = await findBalanceChangingTransaction(accountId, balanceChange.block);
         
+        // Extract FT and intents tokens from discovered transfers and enrich balance snapshots
+        const discoveredTokens = extractTokensFromTransfers(txInfo.transfers);
+        await enrichBalancesWithDiscoveredTokens(accountId, balanceChange.block, balanceChange, discoveredTokens);
+        
         // Create and add entry
         const entry: TransactionEntry = {
             block: balanceChange.block,
@@ -2053,6 +2161,135 @@ async function searchForTransactions(
     }
     
     return transactionsFound;
+}
+
+/**
+ * Re-enrich FT balances for entries that have FT transfers but are missing those tokens in balance snapshots.
+ * This fixes entries that were created before FT balance enrichment was implemented.
+ *
+ * @param accountId - The NEAR account ID
+ * @param outputFile - Path to the history JSON file
+ * @param maxToEnrich - Maximum number of entries to re-enrich (default: 50)
+ * @returns Number of entries re-enriched
+ */
+export async function reEnrichFTBalances(
+    accountId: string,
+    outputFile: string,
+    maxToEnrich: number = 50
+): Promise<number> {
+    const history = loadExistingHistory(outputFile);
+
+    if (!history) {
+        console.log(`No history file found for ${accountId}`);
+        return 0;
+    }
+
+    // Find entries that have FT transfers but are missing those tokens in fungibleTokens
+    const entriesToEnrich = history.transactions.filter(tx => {
+        if (!tx.transfers || tx.transfers.length === 0) {
+            return false;
+        }
+
+        // Get FT tokens from transfers
+        const ftTokensInTransfers = new Set(
+            tx.transfers
+                .filter(t => t.type === 'ft' && t.tokenId)
+                .map(t => t.tokenId!)
+        );
+
+        if (ftTokensInTransfers.size === 0) {
+            return false;
+        }
+
+        // Check if any FT token is missing from balanceAfter.fungibleTokens
+        const existingFtTokens = new Set(Object.keys(tx.balanceAfter?.fungibleTokens || {}));
+
+        for (const token of ftTokensInTransfers) {
+            if (!existingFtTokens.has(token)) {
+                return true; // Found a missing token
+            }
+        }
+
+        return false;
+    });
+
+    if (entriesToEnrich.length === 0) {
+        console.log(`[${accountId}] No entries need FT balance re-enrichment`);
+        return 0;
+    }
+
+    console.log(`[${accountId}] Found ${entriesToEnrich.length} entries needing FT balance re-enrichment`);
+
+    let enriched = 0;
+    for (const tx of entriesToEnrich) {
+        if (enriched >= maxToEnrich) {
+            console.log(`[${accountId}] Reached max re-enrichment limit (${maxToEnrich})`);
+            break;
+        }
+
+        if (getStopSignal()) {
+            break;
+        }
+
+        try {
+            // Extract FT tokens from transfers
+            const discoveredTokens = extractTokensFromTransfers(tx.transfers || []);
+
+            if (discoveredTokens.ftTokens.size === 0 && discoveredTokens.intentsTokens.size === 0) {
+                continue;
+            }
+
+            console.log(`[${accountId}] Re-enriching FT balances at block ${tx.block}...`);
+
+            // Create a BalanceChanges object from the TransactionEntry
+            const balanceChange: BalanceChanges = {
+                hasChanges: true,
+                nearChanged: tx.changes?.nearChanged || false,
+                tokensChanged: tx.changes?.tokensChanged || {},
+                intentsChanged: tx.changes?.intentsChanged || {},
+                nearDiff: tx.changes?.nearDiff,
+                startBalance: tx.balanceBefore,
+                endBalance: tx.balanceAfter,
+                block: tx.block
+            };
+
+            // Call the enrichment function
+            await enrichBalancesWithDiscoveredTokens(accountId, tx.block, balanceChange, discoveredTokens);
+
+            // Update the transaction entry with enriched balances
+            tx.balanceBefore = balanceChange.startBalance;
+            tx.balanceAfter = balanceChange.endBalance;
+            tx.changes = {
+                nearChanged: balanceChange.nearChanged,
+                nearDiff: balanceChange.nearDiff,
+                tokensChanged: balanceChange.tokensChanged,
+                intentsChanged: balanceChange.intentsChanged,
+                stakingChanged: tx.changes?.stakingChanged
+            };
+
+            enriched++;
+
+            // Save progress periodically
+            if (enriched % 5 === 0) {
+                history.updatedAt = new Date().toISOString();
+                saveHistory(outputFile, history);
+            }
+        } catch (error: any) {
+            if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                console.log(`[${accountId}] Error during FT re-enrichment: ${error.message}`);
+                break;
+            }
+            console.log(`[${accountId}] Warning: Could not re-enrich FT balances at block ${tx.block}: ${error.message}`);
+        }
+    }
+
+    if (enriched > 0) {
+        history.updatedAt = new Date().toISOString();
+        saveHistory(outputFile, history);
+        console.log(`[${accountId}] Re-enriched FT balances for ${enriched} entries`);
+    }
+
+    return enriched;
 }
 
 /**
