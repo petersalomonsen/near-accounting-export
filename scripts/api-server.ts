@@ -13,7 +13,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-import { getAccountHistory, verifyHistoryFile } from './get-account-history.js';
+import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances } from './get-account-history.js';
 import type { TransactionEntry } from './get-account-history.js';
 import { convertJsonToCsv } from './json-to-csv.js';
 import { getClient } from './rpc.js';
@@ -307,6 +307,19 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
                 } catch (error) {
                     console.error(`[${accountId}] Backward search failed:`, error);
                 }
+            }
+
+            // Skip FT re-enrichment if shutting down
+            if (continuousSyncShuttingDown) {
+                return;
+            }
+
+            // Re-enrich FT balances for entries that have FT transfers but missing FT balance snapshots
+            // This fixes entries created before FT balance enrichment was implemented
+            try {
+                await reEnrichFTBalances(accountId, outputFile, SYNC_CONFIG.batchSize);
+            } catch (error) {
+                console.error(`[${accountId}] FT re-enrichment failed:`, error);
             }
 
         } catch (error) {

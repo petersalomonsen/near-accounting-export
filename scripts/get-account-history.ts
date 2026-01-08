@@ -2164,6 +2164,135 @@ async function searchForTransactions(
 }
 
 /**
+ * Re-enrich FT balances for entries that have FT transfers but are missing those tokens in balance snapshots.
+ * This fixes entries that were created before FT balance enrichment was implemented.
+ *
+ * @param accountId - The NEAR account ID
+ * @param outputFile - Path to the history JSON file
+ * @param maxToEnrich - Maximum number of entries to re-enrich (default: 50)
+ * @returns Number of entries re-enriched
+ */
+export async function reEnrichFTBalances(
+    accountId: string,
+    outputFile: string,
+    maxToEnrich: number = 50
+): Promise<number> {
+    const history = loadExistingHistory(outputFile);
+
+    if (!history) {
+        console.log(`No history file found for ${accountId}`);
+        return 0;
+    }
+
+    // Find entries that have FT transfers but are missing those tokens in fungibleTokens
+    const entriesToEnrich = history.transactions.filter(tx => {
+        if (!tx.transfers || tx.transfers.length === 0) {
+            return false;
+        }
+
+        // Get FT tokens from transfers
+        const ftTokensInTransfers = new Set(
+            tx.transfers
+                .filter(t => t.type === 'ft' && t.tokenId)
+                .map(t => t.tokenId!)
+        );
+
+        if (ftTokensInTransfers.size === 0) {
+            return false;
+        }
+
+        // Check if any FT token is missing from balanceAfter.fungibleTokens
+        const existingFtTokens = new Set(Object.keys(tx.balanceAfter?.fungibleTokens || {}));
+
+        for (const token of ftTokensInTransfers) {
+            if (!existingFtTokens.has(token)) {
+                return true; // Found a missing token
+            }
+        }
+
+        return false;
+    });
+
+    if (entriesToEnrich.length === 0) {
+        console.log(`[${accountId}] No entries need FT balance re-enrichment`);
+        return 0;
+    }
+
+    console.log(`[${accountId}] Found ${entriesToEnrich.length} entries needing FT balance re-enrichment`);
+
+    let enriched = 0;
+    for (const tx of entriesToEnrich) {
+        if (enriched >= maxToEnrich) {
+            console.log(`[${accountId}] Reached max re-enrichment limit (${maxToEnrich})`);
+            break;
+        }
+
+        if (getStopSignal()) {
+            break;
+        }
+
+        try {
+            // Extract FT tokens from transfers
+            const discoveredTokens = extractTokensFromTransfers(tx.transfers || []);
+
+            if (discoveredTokens.ftTokens.size === 0 && discoveredTokens.intentsTokens.size === 0) {
+                continue;
+            }
+
+            console.log(`[${accountId}] Re-enriching FT balances at block ${tx.block}...`);
+
+            // Create a BalanceChanges object from the TransactionEntry
+            const balanceChange: BalanceChanges = {
+                hasChanges: true,
+                nearChanged: tx.changes?.nearChanged || false,
+                tokensChanged: tx.changes?.tokensChanged || {},
+                intentsChanged: tx.changes?.intentsChanged || {},
+                nearDiff: tx.changes?.nearDiff,
+                startBalance: tx.balanceBefore,
+                endBalance: tx.balanceAfter,
+                block: tx.block
+            };
+
+            // Call the enrichment function
+            await enrichBalancesWithDiscoveredTokens(accountId, tx.block, balanceChange, discoveredTokens);
+
+            // Update the transaction entry with enriched balances
+            tx.balanceBefore = balanceChange.startBalance;
+            tx.balanceAfter = balanceChange.endBalance;
+            tx.changes = {
+                nearChanged: balanceChange.nearChanged,
+                nearDiff: balanceChange.nearDiff,
+                tokensChanged: balanceChange.tokensChanged,
+                intentsChanged: balanceChange.intentsChanged,
+                stakingChanged: tx.changes?.stakingChanged
+            };
+
+            enriched++;
+
+            // Save progress periodically
+            if (enriched % 5 === 0) {
+                history.updatedAt = new Date().toISOString();
+                saveHistory(outputFile, history);
+            }
+        } catch (error: any) {
+            if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                console.log(`[${accountId}] Error during FT re-enrichment: ${error.message}`);
+                break;
+            }
+            console.log(`[${accountId}] Warning: Could not re-enrich FT balances at block ${tx.block}: ${error.message}`);
+        }
+    }
+
+    if (enriched > 0) {
+        history.updatedAt = new Date().toISOString();
+        saveHistory(outputFile, history);
+        console.log(`[${accountId}] Re-enriched FT balances for ${enriched} entries`);
+    }
+
+    return enriched;
+}
+
+/**
  * Verify an existing history file
  */
 export function verifyHistoryFile(filePath: string): VerificationResults {
