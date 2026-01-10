@@ -303,12 +303,32 @@ async function enrichWithStakingPoolBalances(
         return;
     }
 
-    // Query staking balances for these pools
+    // Query staking balances for these pools at block-1 (before) and block (after)
     try {
-        const stakingBalances = await getStakingPoolBalances(accountId, entry.block, stakingPools);
+        // Query balance BEFORE the transaction (at block - 1)
+        const stakingBalancesBefore = await getStakingPoolBalances(accountId, entry.block - 1, stakingPools);
+
+        // Query balance AFTER the transaction (at block)
+        const stakingBalancesAfter = await getStakingPoolBalances(accountId, entry.block, stakingPools);
+
+        // Add to balanceBefore if we got results
+        if (Object.keys(stakingBalancesBefore).length > 0) {
+            if (!entry.balanceBefore) {
+                entry.balanceBefore = {
+                    near: '0',
+                    fungibleTokens: {},
+                    intentsTokens: {},
+                    stakingPools: {}
+                };
+            }
+            if (!entry.balanceBefore.stakingPools) {
+                entry.balanceBefore.stakingPools = {};
+            }
+            Object.assign(entry.balanceBefore.stakingPools, stakingBalancesBefore);
+        }
 
         // Add to balanceAfter if we got results
-        if (Object.keys(stakingBalances).length > 0) {
+        if (Object.keys(stakingBalancesAfter).length > 0) {
             if (!entry.balanceAfter) {
                 entry.balanceAfter = {
                     near: '0',
@@ -320,7 +340,7 @@ async function enrichWithStakingPoolBalances(
             if (!entry.balanceAfter.stakingPools) {
                 entry.balanceAfter.stakingPools = {};
             }
-            Object.assign(entry.balanceAfter.stakingPools, stakingBalances);
+            Object.assign(entry.balanceAfter.stakingPools, stakingBalancesAfter);
         }
     } catch (error) {
         // Don't fail the whole process if staking balance query fails
