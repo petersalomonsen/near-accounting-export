@@ -1987,6 +1987,17 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         if (enriched > 0) {
             console.log(`\nEnriched ${enriched} transaction(s) with transfer details`);
         }
+
+        // Re-enrich staking pool balances for entries that have staking pool transfers
+        // but are missing those pools in balance snapshots
+        const stakingEnriched = await reEnrichStakingPoolBalances(accountId, outputFile, 50);
+        if (stakingEnriched > 0) {
+            // Reload history after re-enrichment
+            const updatedHistory = loadExistingHistory(outputFile);
+            if (updatedHistory) {
+                history.transactions = updatedHistory.transactions;
+            }
+        }
     }
 
     // ===================================================================================
@@ -2309,6 +2320,109 @@ export async function reEnrichFTBalances(
         history.updatedAt = new Date().toISOString();
         saveHistory(outputFile, history);
         console.log(`[${accountId}] Re-enriched FT balances for ${enriched} entries`);
+    }
+
+    return enriched;
+}
+
+/**
+ * Re-enrich staking pool balances for entries that have staking pool transfers but are missing
+ * those pools in balance snapshots. This fixes entries that were created before the staking
+ * pool balance enrichment was implemented or fixed.
+ *
+ * @param accountId - The NEAR account ID
+ * @param outputFile - Path to the history JSON file
+ * @param maxToEnrich - Maximum number of entries to re-enrich (default: 50)
+ * @returns Number of entries re-enriched
+ */
+export async function reEnrichStakingPoolBalances(
+    accountId: string,
+    outputFile: string,
+    maxToEnrich: number = 50
+): Promise<number> {
+    const history = loadExistingHistory(outputFile);
+
+    if (!history) {
+        console.log(`No history file found for ${accountId}`);
+        return 0;
+    }
+
+    // Pattern to match staking pool contract addresses
+    const stakingPoolPattern = /\.pool.*\.near$/;
+
+    // Find entries that have staking pool transfers but are missing those pools in stakingPools
+    const entriesToEnrich = history.transactions.filter(tx => {
+        if (!tx.transfers || tx.transfers.length === 0) {
+            return false;
+        }
+
+        // Get staking pools from transfers
+        const stakingPoolsInTransfers = new Set(
+            tx.transfers
+                .filter(t => t.counterparty && stakingPoolPattern.test(t.counterparty))
+                .map(t => t.counterparty!)
+        );
+
+        if (stakingPoolsInTransfers.size === 0) {
+            return false;
+        }
+
+        // Check if any staking pool is missing from balanceAfter.stakingPools
+        const existingStakingPools = new Set(Object.keys(tx.balanceAfter?.stakingPools || {}));
+
+        for (const pool of stakingPoolsInTransfers) {
+            if (!existingStakingPools.has(pool)) {
+                return true; // Found a missing pool
+            }
+        }
+
+        return false;
+    });
+
+    if (entriesToEnrich.length === 0) {
+        console.log(`[${accountId}] No entries need staking pool balance re-enrichment`);
+        return 0;
+    }
+
+    console.log(`[${accountId}] Found ${entriesToEnrich.length} entries needing staking pool balance re-enrichment`);
+
+    let enriched = 0;
+    for (const tx of entriesToEnrich) {
+        if (enriched >= maxToEnrich) {
+            console.log(`[${accountId}] Reached max staking re-enrichment limit (${maxToEnrich})`);
+            break;
+        }
+
+        if (getStopSignal()) {
+            break;
+        }
+
+        try {
+            console.log(`[${accountId}] Re-enriching staking pool balances at block ${tx.block}...`);
+
+            // Call the enrichment function
+            await enrichWithStakingPoolBalances(accountId, tx);
+
+            enriched++;
+
+            // Save progress periodically
+            if (enriched % 5 === 0) {
+                history.updatedAt = new Date().toISOString();
+                saveHistory(outputFile, history);
+            }
+        } catch (error: any) {
+            if (error.message.includes('rate limit') || error.message.includes('Operation cancelled')) {
+                console.log(`[${accountId}] Error during staking re-enrichment: ${error.message}`);
+                break;
+            }
+            console.log(`[${accountId}] Warning: Could not re-enrich staking pool balances at block ${tx.block}: ${error.message}`);
+        }
+    }
+
+    if (enriched > 0) {
+        history.updatedAt = new Date().toISOString();
+        saveHistory(outputFile, history);
+        console.log(`[${accountId}] Re-enriched staking pool balances for ${enriched} entries`);
     }
 
     return enriched;
