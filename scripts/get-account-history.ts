@@ -284,7 +284,7 @@ function discoverStakingPools(history: AccountHistory): string[] {
 /**
  * Enrich transaction entry with staking pool balances if it involves staking pool transfers
  */
-async function enrichWithStakingPoolBalances(
+export async function enrichWithStakingPoolBalances(
     accountId: string,
     entry: TransactionEntry
 ): Promise<void> {
@@ -303,13 +303,15 @@ async function enrichWithStakingPoolBalances(
         return;
     }
 
-    // Query staking balances for these pools at block-1 (before) and block (after)
+    // Query staking balances for these pools at block (before) and block+1 (after)
+    // Note: Due to NEAR's cross-contract call mechanism, the staking pool contract state
+    // updates when the receipt executes, which is typically block+1 after the originating transaction
     try {
-        // Query balance BEFORE the transaction (at block - 1)
-        const stakingBalancesBefore = await getStakingPoolBalances(accountId, entry.block - 1, stakingPools);
+        // Query balance BEFORE the staking pool receipt executes (at block)
+        const stakingBalancesBefore = await getStakingPoolBalances(accountId, entry.block, stakingPools);
 
-        // Query balance AFTER the transaction (at block)
-        const stakingBalancesAfter = await getStakingPoolBalances(accountId, entry.block, stakingPools);
+        // Query balance AFTER the staking pool receipt executes (at block + 1)
+        const stakingBalancesAfter = await getStakingPoolBalances(accountId, entry.block + 1, stakingPools);
 
         // Add to balanceBefore if we got results
         if (Object.keys(stakingBalancesBefore).length > 0) {

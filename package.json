@@ -15,7 +15,6 @@
     "json-to-csv": "npm run build && node dist/scripts/json-to-csv.js",
     "analyze-gaps": "npm run build && node dist/scripts/analyze-gaps.js",
     "sanitize-json": "npm run build && node dist/scripts/sanitize-json.js",
-    "verify-staking-fix": "tsx scripts/verify-staking-fix.ts",
     "test": "npm run build && mocha --timeout 60000 --exit 'dist/test/**/*.test.js'",
     "test:unit": "npm run build && mocha --timeout 60000 'dist/test/unit/**/*.test.js'",
     "test:integration": "npm run build && mocha --timeout 60000 'dist/test/integration/**/*.test.js'",

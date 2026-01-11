@@ -4,114 +4,108 @@
 
 import { strict as assert } from 'assert';
 import { describe, it } from 'mocha';
-import { findBalanceChangingTransaction, getStakingPoolBalances } from '../../scripts/balance-tracker.js';
+import { findBalanceChangingTransaction } from '../../scripts/balance-tracker.js';
+import { enrichWithStakingPoolBalances } from '../../scripts/get-account-history.js';
+import type { TransactionEntry } from '../../scripts/get-account-history.js';
 
 describe('Staking Pool Balance in Transactions', () => {
     /**
      * Test case for petermusic.near deposit_and_stake transaction
-     * 
+     *
      * Transaction: ADRV4zdG7fPXQE6dSYwTkzGsueEnitznKecp89CjaAsm
      * Account: petermusic.near
      * Staking pool: astro-stakers.poolv1.near
      * Amount: 1000 NEAR
      * Block: 161869264
-     * 
+     *
      * Previous epoch (block 161827200):
      * - stakingPools: { "astro-stakers.poolv1.near": "442813251789670864000720706" }
-     * 
+     *
      * Transaction block (161869264):
      * - deposit_and_stake: 1000 NEAR to astro-stakers.poolv1.near
      * - NEAR balance drops from ~1008.5 to ~8.5 NEAR
-     * - Expected balanceBefore.stakingPools: { "astro-stakers.poolv1.near": "~442.8 NEAR" }
-     * - Expected balanceAfter.stakingPools: { "astro-stakers.poolv1.near": "~1442.8 NEAR" }
-     * 
+     * - Staking pool receipt executes at block 161869265
+     * - Expected balanceBefore.stakingPools (at block): { "astro-stakers.poolv1.near": "442848977056627936899944429" }
+     * - Expected balanceAfter.stakingPools (at block+1): { "astro-stakers.poolv1.near": "1442848977056627936899944430" }
+     *
      * Next epoch (block 161870400):
      * - stakingPools: { "astro-stakers.poolv1.near": "1442967093064936394199457858" }
      */
-    describe('deposit_and_stake transaction for petermusic.near', () => {
+    describe('enrichWithStakingPoolBalances for deposit_and_stake transaction', () => {
         const accountId = 'petermusic.near';
         const stakingPool = 'astro-stakers.poolv1.near';
         const depositBlock = 161869264;
-        
-        it('should find deposit_and_stake transaction with correct transfers', async () => {
+
+        it('should populate both balanceBefore.stakingPools and balanceAfter.stakingPools with real blockchain data', async () => {
+            // First, get the real transaction data from the blockchain
             const txInfo = await findBalanceChangingTransaction(accountId, depositBlock);
-            
-            // Should find the transaction
-            assert.ok(txInfo.transactionHashes.length > 0, 'Should find transaction hashes');
-            assert.ok(txInfo.transactions.length > 0, 'Should find transactions');
-            
-            // Should have transfers
-            assert.ok(txInfo.transfers.length > 0, 'Should find transfers');
-            
-            // Should find NEAR transfer to staking pool with deposit_and_stake memo
-            const stakingTransfer = txInfo.transfers.find(t => 
+
+            // Verify we found the expected transaction
+            assert.ok(txInfo.transactionHashes.includes('ADRV4zdG7fPXQE6dSYwTkzGsueEnitznKecp89CjaAsm'),
+                'Should find the deposit_and_stake transaction');
+
+            // Find the staking transfer
+            const stakingTransfer = txInfo.transfers.find(t =>
                 t.counterparty === stakingPool &&
                 t.memo === 'deposit_and_stake'
             );
-            
-            assert.ok(stakingTransfer, 'Should find staking transfer to astro-stakers.poolv1.near');
-            assert.equal(stakingTransfer!.type, 'near');
-            assert.equal(stakingTransfer!.direction, 'out');
-            assert.equal(stakingTransfer!.amount, '1000000000000000000000000000'); // 1000 NEAR
-            
-            console.log('Transaction info:', {
-                hashes: txInfo.transactionHashes,
-                block: txInfo.transactionBlock,
-                transfers: txInfo.transfers.length
-            });
-        });
-        
-        it('should have staking pool balance at block-1 (balanceBefore)', async () => {
-            // Query staking pool balance at block-1 (this should be what balanceBefore contains)
-            const balanceAtBlockBefore = await getStakingPoolBalances(
-                accountId,
-                depositBlock - 1,
-                [stakingPool]
-            );
-            
-            console.log('Staking balance at block-1:', balanceAtBlockBefore);
-            
-            // Should have ~442.8 NEAR staked before the deposit
-            const stakedBalance = BigInt(balanceAtBlockBefore[stakingPool] || '0');
-            assert.ok(stakedBalance > 0n, 'Should have existing stake before deposit');
-            assert.ok(stakedBalance >= BigInt('442000000000000000000000000'), 'Should have >= 442 NEAR staked');
-            assert.ok(stakedBalance <= BigInt('443000000000000000000000000'), 'Should have <= 443 NEAR staked');
-        });
-        
-        it('should have staking pool balance at block (balanceAfter)', async () => {
-            // Query staking pool balance at block (this should be what balanceAfter contains)
-            const balanceAtBlock = await getStakingPoolBalances(
-                accountId,
-                depositBlock,
-                [stakingPool]
-            );
-            
-            console.log('Staking balance at block:', balanceAtBlock);
-            
-            // Should have ~1442.8 NEAR staked after the deposit
-            const stakedBalance = BigInt(balanceAtBlock[stakingPool] || '0');
-            assert.ok(stakedBalance > BigInt('1442000000000000000000000000'), 'Should have >= 1442 NEAR staked');
-            assert.ok(stakedBalance <= BigInt('1443000000000000000000000000'), 'Should have <= 1443 NEAR staked');
-        });
-        
-        it('should verify the 1000 NEAR deposit by comparing balances', async () => {
-            // Get balance before and after
-            const balanceBefore = await getStakingPoolBalances(accountId, depositBlock - 1, [stakingPool]);
-            const balanceAfter = await getStakingPoolBalances(accountId, depositBlock, [stakingPool]);
-            
-            const before = BigInt(balanceBefore[stakingPool] || '0');
-            const after = BigInt(balanceAfter[stakingPool] || '0');
-            const diff = after - before;
-            
-            console.log('Balance change:', {
-                before: before.toString(),
-                after: after.toString(),
-                diff: diff.toString()
-            });
-            
-            // The difference should be ~1000 NEAR (allowing for small rounding/rewards)
-            assert.ok(diff >= BigInt('999000000000000000000000000'), 'Diff should be >= 999 NEAR');
-            assert.ok(diff <= BigInt('1001000000000000000000000000'), 'Diff should be <= 1001 NEAR');
+            assert.ok(stakingTransfer, 'Should find deposit_and_stake transfer');
+            assert.equal(stakingTransfer!.amount, '1000000000000000000000000000', 'Should be 1000 NEAR deposit');
+
+            // Create a transaction entry from the real data
+            const entry: TransactionEntry = {
+                block: depositBlock,
+                timestamp: null,
+                transactionHashes: txInfo.transactionHashes,
+                transactions: txInfo.transactions,
+                transfers: txInfo.transfers,
+                balanceBefore: {
+                    near: '1008506877444837788000000001',
+                    fungibleTokens: {},
+                    intentsTokens: {},
+                    stakingPools: {}
+                },
+                balanceAfter: {
+                    near: '8501757738090454900000001',
+                    fungibleTokens: {},
+                    intentsTokens: {},
+                    stakingPools: {}
+                },
+                changes: {
+                    nearChanged: true,
+                    nearDiff: '-1000005119706747333100000000',
+                    tokensChanged: {},
+                    intentsChanged: {}
+                }
+            };
+
+            // Call the enrichment function - this is what we're testing
+            await enrichWithStakingPoolBalances(accountId, entry);
+
+            // Verify balanceBefore.stakingPools is populated
+            assert.ok(entry.balanceBefore?.stakingPools, 'balanceBefore.stakingPools should exist');
+            assert.ok(entry.balanceBefore!.stakingPools![stakingPool],
+                `balanceBefore.stakingPools should have ${stakingPool}`);
+
+            // Verify exact balanceBefore value (blockchain data is immutable)
+            assert.equal(entry.balanceBefore!.stakingPools![stakingPool], '442848977056627936899944429',
+                'balanceBefore should have exact staking balance at block');
+
+            // Verify balanceAfter.stakingPools is populated
+            assert.ok(entry.balanceAfter?.stakingPools, 'balanceAfter.stakingPools should exist');
+            assert.ok(entry.balanceAfter!.stakingPools![stakingPool],
+                `balanceAfter.stakingPools should have ${stakingPool}`);
+
+            // Verify exact balanceAfter value (blockchain data is immutable)
+            assert.equal(entry.balanceAfter!.stakingPools![stakingPool], '1442848977056627936899944430',
+                'balanceAfter should have exact staking balance at block+1');
+
+            // Verify the difference is exactly 1000 NEAR plus 1 yoctoNEAR (deposit + tiny reward)
+            const balanceBefore = BigInt(entry.balanceBefore!.stakingPools![stakingPool]);
+            const balanceAfter = BigInt(entry.balanceAfter!.stakingPools![stakingPool]);
+            const diff = balanceAfter - balanceBefore;
+            assert.equal(diff.toString(), '1000000000000000000000000001',
+                'Difference should be 1000 NEAR + 1 yoctoNEAR');
         });
     });
 });
