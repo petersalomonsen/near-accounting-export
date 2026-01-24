@@ -451,13 +451,11 @@ export async function collectStakingRewards(
             }
         }
         
-        // Also check the final block if it's not an epoch boundary
-        if (range.endBlock > firstEpochBoundary && range.endBlock % EPOCH_LENGTH !== 0) {
-            const key = `${range.endBlock}:${range.pool}`;
-            if (!existingStakingData.has(key)) {
-                epochBoundaries.push(range.endBlock);
-            }
-        }
+        // Note: We intentionally do NOT check the "final block" if it's not at an epoch boundary.
+        // Staking rewards only accrue at epoch boundaries (every 43200 blocks / ~12 hours).
+        // Checking non-epoch blocks during frequent sync cycles would create redundant entries
+        // since the balance won't have changed from rewards within an incomplete epoch.
+        // Withdrawal transactions are captured separately as regular transfers.
         
         const totalEpochs = Math.ceil((range.endBlock - firstEpochBoundary) / EPOCH_LENGTH);
         const alreadyChecked = totalEpochs - epochBoundaries.length;
