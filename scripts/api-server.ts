@@ -17,6 +17,7 @@ import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances } from './get-
 import { convertJsonToCsv } from './json-to-csv.js';
 import { getClient } from './rpc.js';
 import { detectGapsV2 } from './gap-detection.js';
+import { migrateToV2 } from './migrate-to-flat-format.js';
 import type { GapAnalysisV2 } from './gap-detection.js';
 import type { BalanceChangeRecord } from './balance-tracker.js';
 
@@ -235,6 +236,72 @@ interface AccountHistoryFile {
 
 function isV2Format(data: any): data is AccountHistoryFile {
     return data.version === 2 && Array.isArray(data.records);
+}
+
+/**
+ * Migrate all V1 format files in the data directory to V2 format
+ * This runs on startup before the sync loop begins
+ */
+function migrateAllV1Files(): { migrated: number; skipped: number; errors: string[] } {
+    const result = { migrated: 0, skipped: 0, errors: [] as string[] };
+
+    if (!fs.existsSync(DATA_DIR)) {
+        return result;
+    }
+
+    // Find all .json files that look like account history files (*.near.json)
+    const files = fs.readdirSync(DATA_DIR).filter(f => f.endsWith('.near.json'));
+
+    if (files.length === 0) {
+        return result;
+    }
+
+    console.log(`\n=== Checking ${files.length} account file(s) for V1 -> V2 migration ===`);
+
+    for (const filename of files) {
+        const filePath = path.join(DATA_DIR, filename);
+
+        try {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+
+            // Skip if already V2 format
+            if (isV2Format(data)) {
+                result.skipped++;
+                continue;
+            }
+
+            // Check if it's a V1 format file (has transactions array)
+            if (!data.accountId || !Array.isArray(data.transactions)) {
+                result.skipped++;
+                continue;
+            }
+
+            console.log(`  Migrating ${filename}...`);
+
+            // Create backup
+            const backupPath = filePath.replace('.json', '.v1-backup.json');
+            fs.copyFileSync(filePath, backupPath);
+
+            // Migrate to V2
+            const v2History = migrateToV2(data);
+
+            // Write migrated file
+            fs.writeFileSync(filePath, JSON.stringify(v2History, null, 2));
+
+            console.log(`    ✓ Migrated: ${data.transactions.length} transactions -> ${v2History.records.length} records`);
+            result.migrated++;
+        } catch (error) {
+            const errorMsg = `Failed to migrate ${filename}: ${error instanceof Error ? error.message : String(error)}`;
+            console.error(`    ✗ ${errorMsg}`);
+            result.errors.push(errorMsg);
+        }
+    }
+
+    if (result.migrated > 0 || result.errors.length > 0) {
+        console.log(`\nMigration complete: ${result.migrated} migrated, ${result.skipped} already V2, ${result.errors.length} errors\n`);
+    }
+
+    return result;
 }
 
 function loadAccountHistoryFile(accountId: string): AccountHistoryFile | null {
@@ -1094,6 +1161,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         console.log('  GET    /health - Health check');
         console.log('');
         console.log('Note: POST /api/jobs has been removed. Jobs run automatically.');
+
+        // Migrate any V1 format files before starting sync
+        migrateAllV1Files();
 
         // Start continuous sync loop
         startContinuousLoop();
