@@ -46,7 +46,11 @@ export interface TransferDetail {
     tokenId?: string;  // For FT: contract address, for MT: token identifier, for staking_reward: pool address
     memo?: string;
     txHash?: string;
+    txBlock?: number;         // Block where the transaction was submitted
     receiptId?: string;
+    signerId?: string;        // Who signed the transaction
+    receiverId?: string;      // The receiver account in the receipt
+    predecessorId?: string;   // The predecessor account that initiated this receipt
 }
 
 export interface TransactionInfo {
@@ -66,6 +70,38 @@ export interface StakingBalanceChange {
     startBalance: string;
     endBalance: string;
     diff: string;
+}
+
+/**
+ * Per-token balance change record - the core data structure for accounting.
+ * Each record represents a single token balance change at a specific block.
+ *
+ * This is the flat output format described in BALANCE-DISCOVERY-FLOW.md.
+ * Benefits:
+ * - One row per token change (easy CSV export, SQL, spreadsheets)
+ * - No nested objects to parse
+ * - Complete context for accounting in one record
+ * - Token-agnostic (same format for NEAR, FT, MT, staking)
+ */
+export interface BalanceChangeRecord {
+    // Block context
+    block_height: number;
+    block_timestamp: string | null;  // ISO 8601 date string, null if unknown
+
+    // Transaction context (where the transaction originated)
+    tx_hash: string | null;           // null for synthetic entries (e.g., staking rewards)
+    tx_block: number | null;          // Block where tx was submitted (may differ from receipt block)
+    signer_id: string | null;         // Who signed the transaction
+    receiver_id: string | null;       // The receiver account in the receipt
+    predecessor_id: string | null;    // The predecessor account that initiated this receipt
+
+    // Token and transfer data
+    token_id: string;                 // "near" | FT contract | "nep141:xxx" for intents | staking pool
+    receipt_id: string | null;
+    counterparty: string | null;      // Who sent or received the token
+    amount: string;                   // Change amount (positive = in, negative = out)
+    balance_before: string;           // Token balance before this block
+    balance_after: string;            // Token balance after this block
 }
 
 // Mainnet epoch length in blocks (roughly 12 hours)
@@ -591,19 +627,25 @@ export async function getBalanceChangesAtBlock(
         : { near: '0', fungibleTokens: {}, intentsTokens: {}, stakingPools: {} };
 
     // Merge NEAR with FT/MT balances
-    const balanceBefore: BalanceSnapshot = {
+    const balanceBeforeRaw: BalanceSnapshot = {
         near: nearBalanceBefore.near,
         fungibleTokens: ftMtBalanceBefore.fungibleTokens,
         intentsTokens: ftMtBalanceBefore.intentsTokens,
         stakingPools: ftMtBalanceBefore.stakingPools || {}
     };
 
-    const balanceAfter: BalanceSnapshot = {
+    const balanceAfterRaw: BalanceSnapshot = {
         near: nearBalanceAfter.near,
         fungibleTokens: ftMtBalanceAfter.fungibleTokens,
         intentsTokens: ftMtBalanceAfter.intentsTokens,
         stakingPools: ftMtBalanceAfter.stakingPools || {}
     };
+
+    // Normalize snapshots to ensure both have the same token keys
+    const { before: balanceBefore, after: balanceAfter } = normalizeBalanceSnapshots(
+        balanceBeforeRaw,
+        balanceAfterRaw
+    );
 
     const changes = detectBalanceChanges(balanceBefore, balanceAfter);
     changes.block = blockHeight;
@@ -698,6 +740,308 @@ export function detectBalanceChanges(
     }
 
     return changes;
+}
+
+/**
+ * Normalize two balance snapshots to ensure they contain the same token keys.
+ *
+ * When tokens are auto-discovered at different blocks, balanceBefore and balanceAfter
+ * may contain different token sets. This function unifies them by:
+ * - Collecting all token keys from both snapshots
+ * - Filling in '0' for any tokens missing from either snapshot
+ *
+ * This makes it easier to compare before/after states and ensures consistent output.
+ *
+ * @param before - The balance snapshot before the transaction
+ * @param after - The balance snapshot after the transaction
+ * @returns Object containing normalized before and after snapshots
+ *
+ * @example
+ * const { before, after } = normalizeBalanceSnapshots(
+ *   { near: '100', fungibleTokens: { 'a': '10' }, intentsTokens: {}, stakingPools: {} },
+ *   { near: '90', fungibleTokens: { 'b': '20' }, intentsTokens: {}, stakingPools: {} }
+ * );
+ * // before.fungibleTokens = { 'a': '10', 'b': '0' }
+ * // after.fungibleTokens = { 'a': '0', 'b': '20' }
+ */
+export function normalizeBalanceSnapshots(
+    before: BalanceSnapshot,
+    after: BalanceSnapshot
+): { before: BalanceSnapshot; after: BalanceSnapshot } {
+    // Collect all token keys from both snapshots
+    const allFungibleTokens = new Set([
+        ...Object.keys(before.fungibleTokens || {}),
+        ...Object.keys(after.fungibleTokens || {})
+    ]);
+
+    const allIntentsTokens = new Set([
+        ...Object.keys(before.intentsTokens || {}),
+        ...Object.keys(after.intentsTokens || {})
+    ]);
+
+    const allStakingPools = new Set([
+        ...Object.keys(before.stakingPools || {}),
+        ...Object.keys(after.stakingPools || {})
+    ]);
+
+    // Create normalized fungibleTokens
+    const normalizedBeforeFt: Record<string, string> = {};
+    const normalizedAfterFt: Record<string, string> = {};
+    for (const token of allFungibleTokens) {
+        normalizedBeforeFt[token] = before.fungibleTokens?.[token] || '0';
+        normalizedAfterFt[token] = after.fungibleTokens?.[token] || '0';
+    }
+
+    // Create normalized intentsTokens
+    const normalizedBeforeIntents: Record<string, string> = {};
+    const normalizedAfterIntents: Record<string, string> = {};
+    for (const token of allIntentsTokens) {
+        normalizedBeforeIntents[token] = before.intentsTokens?.[token] || '0';
+        normalizedAfterIntents[token] = after.intentsTokens?.[token] || '0';
+    }
+
+    // Create normalized stakingPools
+    const normalizedBeforeStaking: Record<string, string> = {};
+    const normalizedAfterStaking: Record<string, string> = {};
+    for (const pool of allStakingPools) {
+        normalizedBeforeStaking[pool] = before.stakingPools?.[pool] || '0';
+        normalizedAfterStaking[pool] = after.stakingPools?.[pool] || '0';
+    }
+
+    return {
+        before: {
+            near: before.near,
+            fungibleTokens: normalizedBeforeFt,
+            intentsTokens: normalizedBeforeIntents,
+            stakingPools: normalizedBeforeStaking
+        },
+        after: {
+            near: after.near,
+            fungibleTokens: normalizedAfterFt,
+            intentsTokens: normalizedAfterIntents,
+            stakingPools: normalizedAfterStaking
+        }
+    };
+}
+
+/**
+ * Create flat BalanceChangeRecords from balance changes at a block.
+ * This converts the nested TransactionEntry format to per-token flat records.
+ *
+ * @param blockHeight - The block where changes occurred
+ * @param blockTimestamp - Block timestamp in nanoseconds (NEAR format) or null
+ * @param changes - The BalanceChanges object with detected changes
+ * @param transfers - Optional transfer details for counterparty/tx info
+ * @param txHashes - Transaction hashes for this block
+ * @returns Array of flat BalanceChangeRecord objects (one per changed token)
+ */
+export function createBalanceChangeRecords(
+    blockHeight: number,
+    blockTimestamp: number | null,
+    changes: BalanceChanges,
+    transfers?: TransferDetail[],
+    txHashes?: string[]
+): BalanceChangeRecord[] {
+    const records: BalanceChangeRecord[] = [];
+
+    // Format timestamp to ISO 8601
+    const timestampStr = blockTimestamp
+        ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString()
+        : null;
+
+    // Helper to find matching transfer
+    const findTransfer = (tokenId: string, type: 'near' | 'ft' | 'mt' | 'staking_reward'): TransferDetail | undefined => {
+        if (!transfers) return undefined;
+        return transfers.find(t => {
+            if (type === 'near') return t.type === 'near' || t.type === 'action_receipt_gas_reward';
+            if (type === 'ft') return t.type === 'ft' && t.tokenId === tokenId;
+            if (type === 'mt') return t.type === 'mt' && t.tokenId === tokenId;
+            if (type === 'staking_reward') return t.type === 'staking_reward' && t.tokenId === tokenId;
+            return false;
+        });
+    };
+
+    // Process NEAR changes
+    if (changes.nearChanged && changes.nearDiff) {
+        const transfer = findTransfer('near', 'near');
+        const balanceBefore = changes.startBalance?.near || '0';
+        const balanceAfter = changes.endBalance?.near || '0';
+
+        records.push({
+            block_height: blockHeight,
+            block_timestamp: timestampStr,
+            tx_hash: transfer?.txHash || txHashes?.[0] || null,
+            tx_block: transfer?.txBlock || null,
+            signer_id: transfer?.signerId || null,
+            receiver_id: transfer?.receiverId || null,
+            predecessor_id: transfer?.predecessorId || null,
+            token_id: 'near',
+            receipt_id: transfer?.receiptId || null,
+            counterparty: transfer?.counterparty || null,
+            amount: changes.nearDiff,
+            balance_before: balanceBefore,
+            balance_after: balanceAfter
+        });
+    }
+
+    // Process fungible token changes
+    for (const [tokenId, change] of Object.entries(changes.tokensChanged)) {
+        const transfer = findTransfer(tokenId, 'ft');
+
+        records.push({
+            block_height: blockHeight,
+            block_timestamp: timestampStr,
+            tx_hash: transfer?.txHash || txHashes?.[0] || null,
+            tx_block: transfer?.txBlock || null,
+            signer_id: transfer?.signerId || null,
+            receiver_id: transfer?.receiverId || null,
+            predecessor_id: transfer?.predecessorId || null,
+            token_id: tokenId,
+            receipt_id: transfer?.receiptId || null,
+            counterparty: transfer?.counterparty || null,
+            amount: change.diff,
+            balance_before: change.start,
+            balance_after: change.end
+        });
+    }
+
+    // Process intents token changes
+    for (const [tokenId, change] of Object.entries(changes.intentsChanged)) {
+        const transfer = findTransfer(tokenId, 'mt');
+
+        records.push({
+            block_height: blockHeight,
+            block_timestamp: timestampStr,
+            tx_hash: transfer?.txHash || txHashes?.[0] || null,
+            tx_block: transfer?.txBlock || null,
+            signer_id: transfer?.signerId || null,
+            receiver_id: transfer?.receiverId || null,
+            predecessor_id: transfer?.predecessorId || null,
+            token_id: tokenId,
+            receipt_id: transfer?.receiptId || null,
+            counterparty: transfer?.counterparty || null,
+            amount: change.diff,
+            balance_before: change.start,
+            balance_after: change.end
+        });
+    }
+
+    // Process staking pool changes
+    if (changes.stakingChanged) {
+        for (const [poolId, change] of Object.entries(changes.stakingChanged)) {
+            const transfer = findTransfer(poolId, 'staking_reward');
+
+            records.push({
+                block_height: blockHeight,
+                block_timestamp: timestampStr,
+                tx_hash: transfer?.txHash || null,
+                tx_block: transfer?.txBlock || null,
+                signer_id: transfer?.signerId || null,
+                receiver_id: transfer?.receiverId || null,
+                predecessor_id: transfer?.predecessorId || null,
+                token_id: poolId,
+                receipt_id: transfer?.receiptId || null,
+                counterparty: transfer?.counterparty || poolId,  // Pool is the counterparty for staking
+                amount: change.diff,
+                balance_before: change.start,
+                balance_after: change.end
+            });
+        }
+    }
+
+    return records;
+}
+
+/**
+ * Gap information for a specific token between two consecutive records.
+ */
+export interface TokenGap {
+    token_id: string;
+    from_block: number;
+    to_block: number;
+    expected_balance: string;  // balance_after from previous record
+    actual_balance: string;    // balance_before from next record
+    diff: string;              // actual - expected
+}
+
+/**
+ * Detect gaps in per-token balance change records.
+ * For each token, checks if consecutive records have matching balances:
+ * record[N].balance_after should equal record[N+1].balance_before
+ *
+ * @param records - Array of BalanceChangeRecord objects (can be for multiple tokens)
+ * @returns Array of TokenGap objects representing detected gaps
+ */
+export function detectTokenGaps(records: BalanceChangeRecord[]): TokenGap[] {
+    const gaps: TokenGap[] = [];
+
+    // Group records by token_id
+    const recordsByToken = new Map<string, BalanceChangeRecord[]>();
+    for (const record of records) {
+        const tokenRecords = recordsByToken.get(record.token_id) || [];
+        tokenRecords.push(record);
+        recordsByToken.set(record.token_id, tokenRecords);
+    }
+
+    // For each token, check consecutive records
+    for (const [tokenId, tokenRecords] of recordsByToken) {
+        // Sort by block height
+        const sorted = [...tokenRecords].sort((a, b) => a.block_height - b.block_height);
+
+        // Check consecutive pairs
+        for (let i = 0; i < sorted.length - 1; i++) {
+            const current = sorted[i]!;
+            const next = sorted[i + 1]!;
+
+            // Check if balance_after matches next balance_before
+            if (current.balance_after !== next.balance_before) {
+                const expected = BigInt(current.balance_after);
+                const actual = BigInt(next.balance_before);
+                const diff = actual - expected;
+
+                gaps.push({
+                    token_id: tokenId,
+                    from_block: current.block_height,
+                    to_block: next.block_height,
+                    expected_balance: current.balance_after,
+                    actual_balance: next.balance_before,
+                    diff: diff.toString()
+                });
+            }
+        }
+    }
+
+    return gaps;
+}
+
+/**
+ * Get all unique token IDs from balance change records.
+ */
+export function getUniqueTokenIds(records: BalanceChangeRecord[]): string[] {
+    return [...new Set(records.map(r => r.token_id))];
+}
+
+/**
+ * Filter balance change records by token ID.
+ */
+export function filterRecordsByToken(records: BalanceChangeRecord[], tokenId: string): BalanceChangeRecord[] {
+    return records.filter(r => r.token_id === tokenId);
+}
+
+/**
+ * Get the latest record for each token.
+ */
+export function getLatestRecordPerToken(records: BalanceChangeRecord[]): Map<string, BalanceChangeRecord> {
+    const latest = new Map<string, BalanceChangeRecord>();
+
+    for (const record of records) {
+        const existing = latest.get(record.token_id);
+        if (!existing || record.block_height > existing.block_height) {
+            latest.set(record.token_id, record);
+        }
+    }
+
+    return latest;
 }
 
 /**
@@ -814,6 +1158,16 @@ export async function findLatestBalanceChangingBlock(
 }
 
 /**
+ * Receipt context for transfer detail enrichment
+ */
+interface ReceiptContext {
+    txHash: string;
+    receiptId: string;
+    receiverId: string;
+    predecessorId: string;
+}
+
+/**
  * Parse NEP-141 FT transfer events from logs
  * Supports both EVENT_JSON (NEP-141 standard) and plain text logs (wrap.near style)
  */
@@ -821,17 +1175,16 @@ function parseFtTransferEvents(
     logs: string[],
     targetAccountId: string,
     contractId: string,
-    txHash: string,
-    receiptId: string
+    ctx: ReceiptContext
 ): TransferDetail[] {
     const transfers: TransferDetail[] = [];
-    
+
     for (const log of logs) {
         // Try EVENT_JSON format (NEP-141 standard)
         if (log.startsWith('EVENT_JSON:')) {
             try {
                 const eventData = JSON.parse(log.substring('EVENT_JSON:'.length));
-                
+
                 // NEP-141 ft_transfer event
                 if (eventData.standard === 'nep141' && eventData.event === 'ft_transfer') {
                     for (const transfer of eventData.data || []) {
@@ -839,7 +1192,7 @@ function parseFtTransferEvents(
                         const newOwner = transfer.new_owner_id;
                         const amount = transfer.amount;
                         const memo = transfer.memo;
-                        
+
                         if (oldOwner === targetAccountId) {
                             transfers.push({
                                 type: 'ft',
@@ -848,8 +1201,10 @@ function parseFtTransferEvents(
                                 counterparty: newOwner,
                                 tokenId: contractId,
                                 memo,
-                                txHash,
-                                receiptId
+                                txHash: ctx.txHash,
+                                receiptId: ctx.receiptId,
+                                receiverId: ctx.receiverId,
+                                predecessorId: ctx.predecessorId
                             });
                         } else if (newOwner === targetAccountId) {
                             transfers.push({
@@ -859,8 +1214,10 @@ function parseFtTransferEvents(
                                 counterparty: oldOwner,
                                 tokenId: contractId,
                                 memo,
-                                txHash,
-                                receiptId
+                                txHash: ctx.txHash,
+                                receiptId: ctx.receiptId,
+                                receiverId: ctx.receiverId,
+                                predecessorId: ctx.predecessorId
                             });
                         }
                     }
@@ -876,7 +1233,7 @@ function parseFtTransferEvents(
                 const amount = plainTransferMatch[1]!;
                 const fromAccount = plainTransferMatch[2]!;
                 const toAccount = plainTransferMatch[3]!;
-                
+
                 if (toAccount === targetAccountId) {
                     transfers.push({
                         type: 'ft',
@@ -884,8 +1241,10 @@ function parseFtTransferEvents(
                         amount,
                         counterparty: fromAccount,
                         tokenId: contractId,
-                        txHash,
-                        receiptId
+                        txHash: ctx.txHash,
+                        receiptId: ctx.receiptId,
+                        receiverId: ctx.receiverId,
+                        predecessorId: ctx.predecessorId
                     });
                 } else if (fromAccount === targetAccountId) {
                     transfers.push({
@@ -894,14 +1253,16 @@ function parseFtTransferEvents(
                         amount,
                         counterparty: toAccount,
                         tokenId: contractId,
-                        txHash,
-                        receiptId
+                        txHash: ctx.txHash,
+                        receiptId: ctx.receiptId,
+                        receiverId: ctx.receiverId,
+                        predecessorId: ctx.predecessorId
                     });
                 }
             }
         }
     }
-    
+
     return transfers;
 }
 
@@ -912,17 +1273,16 @@ function parseMtTransferEvents(
     logs: string[],
     targetAccountId: string,
     contractId: string,
-    txHash: string,
-    receiptId: string
+    ctx: ReceiptContext
 ): TransferDetail[] {
     const transfers: TransferDetail[] = [];
-    
+
     for (const log of logs) {
         if (!log.startsWith('EVENT_JSON:')) continue;
-        
+
         try {
             const eventData = JSON.parse(log.substring('EVENT_JSON:'.length));
-            
+
             // NEP-245 mt_transfer event
             if (eventData.standard === 'nep245' && eventData.event === 'mt_transfer') {
                 for (const transfer of eventData.data || []) {
@@ -931,11 +1291,11 @@ function parseMtTransferEvents(
                     const tokenIds = transfer.token_ids || [];
                     const amounts = transfer.amounts || [];
                     const memo = transfer.memo;
-                    
+
                     for (let i = 0; i < tokenIds.length; i++) {
                         const tokenId = tokenIds[i];
                         const amount = amounts[i] || '0';
-                        
+
                         if (oldOwner === targetAccountId) {
                             transfers.push({
                                 type: 'mt',
@@ -944,8 +1304,10 @@ function parseMtTransferEvents(
                                 counterparty: newOwner,
                                 tokenId,
                                 memo,
-                                txHash,
-                                receiptId
+                                txHash: ctx.txHash,
+                                receiptId: ctx.receiptId,
+                                receiverId: ctx.receiverId,
+                                predecessorId: ctx.predecessorId
                             });
                         } else if (newOwner === targetAccountId) {
                             transfers.push({
@@ -955,14 +1317,16 @@ function parseMtTransferEvents(
                                 counterparty: oldOwner,
                                 tokenId,
                                 memo,
-                                txHash,
-                                receiptId
+                                txHash: ctx.txHash,
+                                receiptId: ctx.receiptId,
+                                receiverId: ctx.receiverId,
+                                predecessorId: ctx.predecessorId
                             });
                         }
                     }
                 }
             }
-            
+
             // Also check for mt_mint and mt_burn events
             if (eventData.standard === 'nep245' && eventData.event === 'mt_mint') {
                 for (const mint of eventData.data || []) {
@@ -970,7 +1334,7 @@ function parseMtTransferEvents(
                     const tokenIds = mint.token_ids || [];
                     const amounts = mint.amounts || [];
                     const memo = mint.memo;
-                    
+
                     if (owner === targetAccountId) {
                         for (let i = 0; i < tokenIds.length; i++) {
                             transfers.push({
@@ -980,21 +1344,23 @@ function parseMtTransferEvents(
                                 counterparty: contractId, // Minted from contract
                                 tokenId: tokenIds[i],
                                 memo,
-                                txHash,
-                                receiptId
+                                txHash: ctx.txHash,
+                                receiptId: ctx.receiptId,
+                                receiverId: ctx.receiverId,
+                                predecessorId: ctx.predecessorId
                             });
                         }
                     }
                 }
             }
-            
+
             if (eventData.standard === 'nep245' && eventData.event === 'mt_burn') {
                 for (const burn of eventData.data || []) {
                     const owner = burn.owner_id;
                     const tokenIds = burn.token_ids || [];
                     const amounts = burn.amounts || [];
                     const memo = burn.memo;
-                    
+
                     if (owner === targetAccountId) {
                         for (let i = 0; i < tokenIds.length; i++) {
                             transfers.push({
@@ -1004,8 +1370,10 @@ function parseMtTransferEvents(
                                 counterparty: contractId, // Burned to contract
                                 tokenId: tokenIds[i],
                                 memo,
-                                txHash,
-                                receiptId
+                                txHash: ctx.txHash,
+                                receiptId: ctx.receiptId,
+                                receiverId: ctx.receiverId,
+                                predecessorId: ctx.predecessorId
                             });
                         }
                     }
@@ -1015,7 +1383,7 @@ function parseMtTransferEvents(
             // Skip invalid JSON
         }
     }
-    
+
     return transfers;
 }
 
@@ -1042,12 +1410,20 @@ function processBlockReceipts(
             const predecessorId = receipt?.predecessor_id;
             const logs = executionOutcome?.outcome?.logs || [];
 
+            // Create receipt context for passing to parse functions
+            const ctx: ReceiptContext = {
+                txHash,
+                receiptId,
+                receiverId: receiverId || '',
+                predecessorId: predecessorId || ''
+            };
+
             let affectsTargetAccount = false;
 
             // Check if this is a direct transfer to/from the account
             if (receiverId === targetAccountId || predecessorId === targetAccountId) {
                 affectsTargetAccount = true;
-                
+
                 // Check for NEAR transfer actions and other actions with deposits
                 const actions = receipt?.receipt?.Action?.actions || [];
                 for (const action of actions) {
@@ -1063,7 +1439,9 @@ function processBlockReceipts(
                                     counterparty: receiverId,
                                     memo,
                                     txHash,
-                                    receiptId
+                                    receiptId,
+                                    receiverId: ctx.receiverId,
+                                    predecessorId: ctx.predecessorId
                                 });
                             } else if (receiverId === targetAccountId) {
                                 transfers.push({
@@ -1073,7 +1451,9 @@ function processBlockReceipts(
                                     counterparty: predecessorId,
                                     memo,
                                     txHash,
-                                    receiptId
+                                    receiptId,
+                                    receiverId: ctx.receiverId,
+                                    predecessorId: ctx.predecessorId
                                 });
                             }
                         }
@@ -1100,19 +1480,19 @@ function processBlockReceipts(
 
             // Parse FT transfer events from logs
             if (!processedReceipts.has(receiptId)) {
-                const ftTransfers = parseFtTransferEvents(logs, targetAccountId, receiverId, txHash, receiptId);
+                const ftTransfers = parseFtTransferEvents(logs, targetAccountId, receiverId, ctx);
                 if (ftTransfers.length > 0) {
                     transfers.push(...ftTransfers);
                     affectsTargetAccount = true;
                 }
-                
+
                 // Parse MT (intents) transfer events from logs
-                const mtTransfers = parseMtTransferEvents(logs, targetAccountId, receiverId, txHash, receiptId);
+                const mtTransfers = parseMtTransferEvents(logs, targetAccountId, receiverId, ctx);
                 if (mtTransfers.length > 0) {
                     transfers.push(...mtTransfers);
                     affectsTargetAccount = true;
                 }
-                
+
                 processedReceipts.add(receiptId);
             }
 
@@ -1127,7 +1507,7 @@ function processBlockReceipts(
                             if (eventStr.includes(targetAccountId)) {
                                 affectsTargetAccount = true;
                                 // Parse FT transfers from this receipt
-                                const ftTransfers = parseFtTransferEvents(logs, targetAccountId, receiverId, txHash, receiptId);
+                                const ftTransfers = parseFtTransferEvents(logs, targetAccountId, receiverId, ctx);
                                 if (ftTransfers.length > 0) {
                                     transfers.push(...ftTransfers);
                                 }
@@ -1138,14 +1518,14 @@ function processBlockReceipts(
                         }
                     }
                     // Check for plain text transfer logs (wrap.near style)
-                    // Format: "Transfer X from Y to Z" 
+                    // Format: "Transfer X from Y to Z"
                     else if (log.includes(targetAccountId)) {
                         const plainTransferMatch = log.match(/^Transfer (\d+) from ([^\s]+) to ([^\s]+)$/);
                         if (plainTransferMatch) {
                             const amount = plainTransferMatch[1];
                             const fromAccount = plainTransferMatch[2];
                             const toAccount = plainTransferMatch[3];
-                            
+
                             if (toAccount === targetAccountId) {
                                 transfers.push({
                                     type: 'ft',
@@ -1154,7 +1534,9 @@ function processBlockReceipts(
                                     counterparty: fromAccount!,
                                     tokenId: receiverId, // The FT contract
                                     txHash,
-                                    receiptId
+                                    receiptId,
+                                    receiverId: ctx.receiverId,
+                                    predecessorId: ctx.predecessorId
                                 });
                                 affectsTargetAccount = true;
                             } else if (fromAccount === targetAccountId) {
@@ -1165,7 +1547,9 @@ function processBlockReceipts(
                                     counterparty: toAccount!,
                                     tokenId: receiverId, // The FT contract
                                     txHash,
-                                    receiptId
+                                    receiptId,
+                                    receiverId: ctx.receiverId,
+                                    predecessorId: ctx.predecessorId
                                 });
                                 affectsTargetAccount = true;
                             }
@@ -1249,7 +1633,7 @@ function processBlockReceipts(
                 if (previousAmount !== null) {
                     const newAmount = BigInt(stateChange.change.amount);
                     const gasRewardAmount = newAmount - previousAmount;
-                    
+
                     if (gasRewardAmount > 0n) {
                         transfers.push({
                             type: 'action_receipt_gas_reward',
@@ -1258,9 +1642,11 @@ function processBlockReceipts(
                             counterparty: caller,
                             memo: 'contract gas reward (30% of gas burnt)',
                             txHash,
-                            receiptId: receiptHash
+                            receiptId: receiptHash,
+                            receiverId: targetAccountId,  // Gas reward goes to the target account
+                            predecessorId: caller  // The caller triggered the gas reward
                         });
-                        
+
                         if (txHash && !matchingTxHashes.has(txHash)) {
                             matchingTxHashes.add(txHash);
                         }
@@ -1415,12 +1801,18 @@ export async function findBalanceChangingTransaction(
                                     const outcome = receiptOutcome.outcome;
                                     const receiptId = receiptOutcome.id;
                                     const logs = outcome?.logs || [];
-                                    
+
                                     // Parse logs for FT transfers using existing function
                                     // We need to determine the contract ID from the receipt
                                     // For now, we'll extract it from receipt executor_id if available
                                     const contractId = (receiptOutcome as any).executor_id || '';
-                                    const ftTransfers = parseFtTransferEvents(logs, targetAccountId, contractId, txHash, receiptId);
+                                    const receiptCtx: ReceiptContext = {
+                                        txHash,
+                                        receiptId,
+                                        receiverId: contractId,
+                                        predecessorId: ''
+                                    };
+                                    const ftTransfers = parseFtTransferEvents(logs, targetAccountId, contractId, receiptCtx);
                                     transfers.push(...ftTransfers);
                                 }
                             }
@@ -1438,7 +1830,7 @@ export async function findBalanceChangingTransaction(
                     // Try to get the predecessor (origin tx hash is not directly available in receipt)
                     const predecessorId = receipt.predecessor_id;
                     const receiverId = receipt.receiver_id;
-                    
+
                     // Check for Transfer action
                     const actions = receipt.receipt?.Action?.actions || [];
                     for (const action of actions) {
@@ -1447,30 +1839,34 @@ export async function findBalanceChangingTransaction(
                             if (deposit && BigInt(deposit) > 0n) {
                                 const direction = receiverId === targetAccountId ? 'in' : 'out';
                                 const counterparty = direction === 'in' ? predecessorId : receiverId;
-                                
+
                                 transfers.push({
                                     type: 'near',
                                     direction,
                                     amount: deposit,
                                     counterparty: counterparty || 'unknown',
-                                    receiptId: receipt.receipt_id
+                                    receiptId: receipt.receipt_id,
+                                    receiverId: receiverId || '',
+                                    predecessorId: predecessorId || ''
                                 });
                             }
                         }
-                        
+
                         // Check for FunctionCall with deposit
                         if (action.FunctionCall) {
                             const deposit = action.FunctionCall.deposit;
                             if (deposit && BigInt(deposit) > 0n) {
                                 const direction = receiverId === targetAccountId ? 'in' : 'out';
                                 const counterparty = direction === 'in' ? predecessorId : receiverId;
-                                
+
                                 transfers.push({
                                     type: 'near',
                                     direction,
                                     amount: deposit,
                                     counterparty: counterparty || 'unknown',
-                                    receiptId: receipt.receipt_id
+                                    receiptId: receipt.receipt_id,
+                                    receiverId: receiverId || '',
+                                    predecessorId: predecessorId || ''
                                 });
                             }
                         }

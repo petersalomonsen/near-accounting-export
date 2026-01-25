@@ -14,11 +14,11 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances } from './get-account-history.js';
-import type { TransactionEntry } from './get-account-history.js';
 import { convertJsonToCsv } from './json-to-csv.js';
 import { getClient } from './rpc.js';
-import { detectGaps } from './gap-detection.js';
-import type { GapAnalysis, Gap } from './gap-detection.js';
+import { detectGapsV2 } from './gap-detection.js';
+import type { GapAnalysisV2 } from './gap-detection.js';
+import type { BalanceChangeRecord } from './balance-tracker.js';
 
 // Payment verification configuration
 const PAYMENT_CONFIG = {
@@ -217,18 +217,24 @@ function isPaymentValid(account: RegisteredAccount): boolean {
 
 /**
  * Load account history file and check if history is complete
+ * V2 format only
  */
 interface AccountHistoryMetadata {
     historyComplete?: boolean;
     firstBlock: number | null;
     lastBlock: number | null;
-    totalTransactions: number;
+    totalRecords: number;
 }
 
 interface AccountHistoryFile {
+    version: 2;
     accountId: string;
     metadata: AccountHistoryMetadata;
-    transactions: any[];
+    records: BalanceChangeRecord[];
+}
+
+function isV2Format(data: any): data is AccountHistoryFile {
+    return data.version === 2 && Array.isArray(data.records);
 }
 
 function loadAccountHistoryFile(accountId: string): AccountHistoryFile | null {
@@ -237,7 +243,12 @@ function loadAccountHistoryFile(accountId: string): AccountHistoryFile | null {
         return null;
     }
     try {
-        return JSON.parse(fs.readFileSync(outputFile, 'utf8'));
+        const data = JSON.parse(fs.readFileSync(outputFile, 'utf8'));
+        if (!isV2Format(data)) {
+            console.warn(`Account ${accountId} has legacy V1 format, needs migration`);
+            return null;
+        }
+        return data;
     } catch (error) {
         console.error(`Error loading account history file for ${accountId}:`, error);
         return null;
@@ -865,26 +876,29 @@ app.get('/api/accounts/:accountId/status', (req: Request, res: Response) => {
     const outputFile = getAccountOutputFile(accountId);
     let dataRange = null;
     let hasData = false;
-    
+    let format: 'v1' | 'v2' | null = null;
+
     if (fs.existsSync(outputFile)) {
         try {
             const fileContent = fs.readFileSync(outputFile, 'utf8');
             const accountHistory = JSON.parse(fileContent);
             hasData = true;
+            format = isV2Format(accountHistory) ? 'v2' : 'v1';
             dataRange = {
                 firstBlock: accountHistory.metadata?.firstBlock || null,
                 lastBlock: accountHistory.metadata?.lastBlock || null,
-                totalTransactions: accountHistory.metadata?.totalTransactions || 0,
+                totalTransactions: accountHistory.metadata?.totalTransactions || accountHistory.metadata?.totalRecords || 0,
                 updatedAt: accountHistory.updatedAt || null
             };
         } catch (error) {
             console.error('Error reading account data file:', error);
         }
     }
-    
+
     res.json({
         accountId,
         hasData,
+        format,
         dataRange,
         isRunning
     });
@@ -996,73 +1010,43 @@ app.get('/api/accounts/:accountId/gap-analysis', (req: Request, res: Response) =
         const fileContent = fs.readFileSync(outputFile, 'utf-8');
         const history = JSON.parse(fileContent);
 
-        if (!history.accountId || !Array.isArray(history.transactions)) {
-            return res.status(500).json({ error: 'Invalid account history file format' });
+        if (!history.accountId) {
+            return res.status(500).json({ error: 'Invalid account history file format - missing accountId' });
         }
 
-        // Run gap detection
-        const gapAnalysis: GapAnalysis = detectGaps(history.transactions);
+        // V2 format only
+        if (!isV2Format(history)) {
+            return res.status(400).json({
+                error: 'Only V2 format is supported. Run migration script to convert.',
+                hint: 'npx tsx scripts/migrate-to-flat-format.ts ' + outputFile
+            });
+        }
 
-        // Format the response
+        // Run per-token gap detection
+        const gapAnalysis: GapAnalysisV2 = detectGapsV2(history.records);
+
         const response = {
             accountId: history.accountId,
             analyzedAt: new Date().toISOString(),
             summary: {
                 totalGaps: gapAnalysis.totalGaps,
-                internalGaps: gapAnalysis.internalGaps.length,
-                hasGapToCreation: gapAnalysis.gapToCreation !== null,
-                hasGapToPresent: gapAnalysis.gapToPresent !== null,
+                tokensWithGaps: gapAnalysis.tokensWithGaps,
                 isComplete: gapAnalysis.isComplete
             },
             metadata: {
-                totalTransactions: history.transactions.length,
+                totalRecords: history.records.length,
                 firstBlock: history.metadata?.firstBlock || null,
                 lastBlock: history.metadata?.lastBlock || null
             },
-            gaps: [
-                // Include gap to creation if it exists
-                ...(gapAnalysis.gapToCreation ? [{
-                    type: 'gap_to_creation',
-                    startBlock: gapAnalysis.gapToCreation.startBlock,
-                    endBlock: gapAnalysis.gapToCreation.endBlock,
-                    mismatches: gapAnalysis.gapToCreation.verification.errors.map(err => ({
-                        type: err.type,
-                        token: err.token,
-                        pool: err.pool,
-                        expected: err.expected,
-                        actual: err.actual,
-                        message: err.message
-                    }))
-                }] : []),
-                // Include all internal gaps
-                ...gapAnalysis.internalGaps.map((gap: Gap) => ({
-                    type: 'internal_gap',
-                    startBlock: gap.startBlock,
-                    endBlock: gap.endBlock,
-                    mismatches: gap.verification.errors.map(err => ({
-                        type: err.type,
-                        token: err.token,
-                        pool: err.pool,
-                        expected: err.expected,
-                        actual: err.actual,
-                        message: err.message
-                    }))
-                })),
-                // Include gap to present if it exists
-                ...(gapAnalysis.gapToPresent ? [{
-                    type: 'gap_to_present',
-                    startBlock: gapAnalysis.gapToPresent.startBlock,
-                    endBlock: gapAnalysis.gapToPresent.endBlock,
-                    mismatches: gapAnalysis.gapToPresent.verification.errors.map(err => ({
-                        type: err.type,
-                        token: err.token,
-                        pool: err.pool,
-                        expected: err.expected,
-                        actual: err.actual,
-                        message: err.message
-                    }))
-                }] : [])
-            ]
+            gaps: gapAnalysis.tokenGaps.map(gap => ({
+                type: 'token_gap',
+                tokenId: gap.token_id,
+                fromBlock: gap.from_block,
+                toBlock: gap.to_block,
+                expectedBalance: gap.expected_balance,
+                actualBalance: gap.actual_balance,
+                diff: gap.diff
+            }))
         };
 
         res.json(response);
