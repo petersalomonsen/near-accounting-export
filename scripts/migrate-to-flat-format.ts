@@ -13,6 +13,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import {
     createBalanceChangeRecords,
     type BalanceChangeRecord,
@@ -328,4 +329,7 @@ Examples:
     }
 }
 
-main().catch(console.error);
+// Only run main() when executed directly, not when imported
+if (import.meta.url.startsWith('file:') && process.argv[1] === fileURLToPath(import.meta.url)) {
+    main().catch(console.error);
+}
