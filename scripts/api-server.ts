@@ -1306,6 +1306,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         // Migrate any V1 format files before starting sync
         migrateAllV1Files();
 
+        // Repair any buggy staking records (balance_before: "0" issue)
+        repairStakingRecords().catch(err => {
+            console.error('Error during staking record repair:', err);
+        });
+
         // Start continuous sync loop
         startContinuousLoop();
     });
