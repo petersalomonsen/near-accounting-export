@@ -27,7 +27,8 @@ import {
     findStakingBalanceChanges,
     getAllBalances,
     enrichBalanceSnapshot,
-    detectBalanceChanges
+    detectBalanceChanges,
+    normalizeBalanceSnapshots
 } from './balance-tracker.js';
 import {
     getAllTransactionBlocks,
@@ -43,10 +44,14 @@ import {
 } from './pikespeak-api.js';
 import {
     detectGaps,
+    detectGapsV2,
     type Gap,
-    type GapAnalysis
+    type GapAnalysis,
+    type GapAnalysisV2,
+    type TokenGap
 } from './gap-detection.js';
-import type { BalanceSnapshot, BalanceChanges, TransactionInfo, TransferDetail, StakingBalanceChange } from './balance-tracker.js';
+import type { BalanceSnapshot, BalanceChanges, TransactionInfo, TransferDetail, StakingBalanceChange, BalanceChangeRecord } from './balance-tracker.js';
+import { createBalanceChangeRecords, detectTokenGaps } from './balance-tracker.js';
 import type { TransactionBlock } from './nearblocks-api.js';
 import type { IntentsTransactionBlock } from './intents-explorer-api.js';
 import type { PikespeakTransactionBlock } from './pikespeak-api.js';
@@ -84,22 +89,99 @@ export interface TransactionEntry {
     // verificationWithNext removed - gap detection is computed on-demand using gap-detection module
 }
 
-interface AccountHistory {
+// V1 format (legacy) - kept for backward compatibility during migration
+interface AccountHistoryV1 {
     accountId: string;
     createdAt: string;
     updatedAt: string;
     transactions: TransactionEntry[];
-    stakingPools?: string[];  // Discovered staking pool contracts
+    stakingPools?: string[];
     metadata: {
         firstBlock: number | null;
         lastBlock: number | null;
         totalTransactions: number;
-        historyComplete?: boolean;  // True when backward search found the beginning of account history
+        historyComplete?: boolean;
     };
 }
 
-// Re-export the type for external use
-export type { AccountHistory };
+// V2 format (new flat format)
+interface AccountHistoryV2 {
+    version: 2;
+    accountId: string;
+    createdAt: string;
+    updatedAt: string;
+    records: BalanceChangeRecord[];
+    stakingPools?: string[];
+    metadata: {
+        firstBlock: number | null;
+        lastBlock: number | null;
+        totalRecords: number;
+        historyComplete?: boolean;
+    };
+}
+
+// Internal working format during sync (combines V1 structure with V2 records)
+interface AccountHistory {
+    accountId: string;
+    createdAt: string;
+    updatedAt: string;
+    transactions: TransactionEntry[];  // Used during sync for block-level operations
+    records?: BalanceChangeRecord[];    // V2 records (populated on save/load)
+    stakingPools?: string[];
+    metadata: {
+        firstBlock: number | null;
+        lastBlock: number | null;
+        totalTransactions: number;
+        totalRecords?: number;
+        historyComplete?: boolean;
+    };
+}
+
+/**
+ * Check if data is V2 format
+ */
+function isV2Format(data: any): data is AccountHistoryV2 {
+    return data.version === 2 && Array.isArray(data.records);
+}
+
+/**
+ * Convert V1 TransactionEntry[] to V2 BalanceChangeRecord[]
+ */
+function convertToRecords(transactions: TransactionEntry[]): BalanceChangeRecord[] {
+    const allRecords: BalanceChangeRecord[] = [];
+
+    for (const entry of transactions) {
+        const changes: BalanceChanges = {
+            hasChanges: entry.changes.nearChanged ||
+                Object.keys(entry.changes.tokensChanged || {}).length > 0 ||
+                Object.keys(entry.changes.intentsChanged || {}).length > 0 ||
+                Object.keys(entry.changes.stakingChanged || {}).length > 0,
+            nearChanged: entry.changes.nearChanged,
+            nearDiff: entry.changes.nearDiff,
+            tokensChanged: entry.changes.tokensChanged || {},
+            intentsChanged: entry.changes.intentsChanged || {},
+            stakingChanged: entry.changes.stakingChanged,
+            startBalance: entry.balanceBefore,
+            endBalance: entry.balanceAfter
+        };
+
+        const records = createBalanceChangeRecords(
+            entry.block,
+            entry.timestamp,
+            changes,
+            entry.transfers,
+            entry.transactionHashes
+        );
+        allRecords.push(...records);
+    }
+
+    // Sort by block height descending
+    allRecords.sort((a, b) => b.block_height - a.block_height);
+    return allRecords;
+}
+
+// Re-export the types for external use
+export type { AccountHistory, AccountHistoryV2 };
 
 interface GetAccountHistoryOptions {
     accountId: string;
@@ -141,12 +223,39 @@ interface VerificationResults {
 
 /**
  * Load existing accounting history from file
+ * Supports both V1 (legacy) and V2 formats
+ * V2 is converted to internal working format
  */
 function loadExistingHistory(filePath: string): AccountHistory | null {
     try {
         if (fs.existsSync(filePath)) {
             const data = fs.readFileSync(filePath, 'utf-8');
-            return JSON.parse(data);
+            const parsed = JSON.parse(data);
+
+            // If V2 format, we only work with records (no transactions needed internally)
+            if (isV2Format(parsed)) {
+                // V2 format - convert to working format
+                // Note: During sync, we need transactions for block-level gap filling
+                // For V2 files, we start fresh with transactions and merge records on save
+                return {
+                    accountId: parsed.accountId,
+                    createdAt: parsed.createdAt,
+                    updatedAt: parsed.updatedAt,
+                    transactions: [], // V2 doesn't have transactions, start fresh
+                    records: parsed.records,
+                    stakingPools: parsed.stakingPools,
+                    metadata: {
+                        firstBlock: parsed.metadata.firstBlock,
+                        lastBlock: parsed.metadata.lastBlock,
+                        totalTransactions: 0,
+                        totalRecords: parsed.metadata.totalRecords,
+                        historyComplete: parsed.metadata.historyComplete
+                    }
+                };
+            }
+
+            // V1 format - use as-is (internal format matches V1)
+            return parsed;
         }
     } catch (error: any) {
         console.error(`Error loading existing history from ${filePath}:`, error.message);
@@ -155,14 +264,74 @@ function loadExistingHistory(filePath: string): AccountHistory | null {
 }
 
 /**
- * Save accounting history to file
+ * Save accounting history to file in V2 format
+ * Converts transactions to records and saves as V2
  */
 function saveHistory(filePath: string, history: AccountHistory): void {
     const dir = path.dirname(filePath);
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(filePath, JSON.stringify(history, null, 2));
+
+    // Convert transactions to records
+    const newRecords = convertToRecords(history.transactions);
+
+    // Merge with existing records (if any) and deduplicate
+    const existingRecords = history.records || [];
+    const allRecords = mergeAndDeduplicateRecords(existingRecords, newRecords);
+
+    // Calculate block range from records
+    let firstBlock: number | null = null;
+    let lastBlock: number | null = null;
+    if (allRecords.length > 0) {
+        const blocks = allRecords.map(r => r.block_height);
+        firstBlock = Math.min(...blocks);
+        lastBlock = Math.max(...blocks);
+    }
+
+    // Create V2 output
+    const v2History: AccountHistoryV2 = {
+        version: 2,
+        accountId: history.accountId,
+        createdAt: history.createdAt,
+        updatedAt: history.updatedAt,
+        records: allRecords,
+        stakingPools: history.stakingPools,
+        metadata: {
+            firstBlock,
+            lastBlock,
+            totalRecords: allRecords.length,
+            historyComplete: history.metadata.historyComplete
+        }
+    };
+
+    fs.writeFileSync(filePath, JSON.stringify(v2History, null, 2));
+}
+
+/**
+ * Merge records and remove duplicates
+ * Records are deduplicated by (block_height, token_id, tx_hash)
+ */
+function mergeAndDeduplicateRecords(
+    existing: BalanceChangeRecord[],
+    newRecords: BalanceChangeRecord[]
+): BalanceChangeRecord[] {
+    const seen = new Map<string, BalanceChangeRecord>();
+
+    // Add existing records first
+    for (const record of existing) {
+        const key = `${record.block_height}:${record.token_id}:${record.tx_hash || ''}`;
+        seen.set(key, record);
+    }
+
+    // Add/update with new records
+    for (const record of newRecords) {
+        const key = `${record.block_height}:${record.token_id}:${record.tx_hash || ''}`;
+        seen.set(key, record);
+    }
+
+    // Sort by block height descending
+    return Array.from(seen.values()).sort((a, b) => b.block_height - a.block_height);
 }
 
 /**
@@ -343,6 +512,16 @@ export async function enrichWithStakingPoolBalances(
                 entry.balanceAfter.stakingPools = {};
             }
             Object.assign(entry.balanceAfter.stakingPools, stakingBalancesAfter);
+        }
+
+        // Normalize snapshots to ensure both have the same staking pool keys
+        if (entry.balanceBefore && entry.balanceAfter) {
+            const { before: normalizedBefore, after: normalizedAfter } = normalizeBalanceSnapshots(
+                entry.balanceBefore,
+                entry.balanceAfter
+            );
+            entry.balanceBefore = normalizedBefore;
+            entry.balanceAfter = normalizedAfter;
         }
     } catch (error) {
         // Don't fail the whole process if staking balance query fails
@@ -855,9 +1034,17 @@ async function enrichBalancesWithDiscoveredTokens(
         );
     }
 
-    // Recalculate changes with enriched balances
+    // Normalize and recalculate changes with enriched balances
     if (balanceChange.startBalance && balanceChange.endBalance) {
-        const updatedChanges = detectBalanceChanges(balanceChange.startBalance, balanceChange.endBalance);
+        // Normalize snapshots to ensure both have the same token keys
+        const { before: normalizedStart, after: normalizedEnd } = normalizeBalanceSnapshots(
+            balanceChange.startBalance,
+            balanceChange.endBalance
+        );
+        balanceChange.startBalance = normalizedStart;
+        balanceChange.endBalance = normalizedEnd;
+
+        const updatedChanges = detectBalanceChanges(normalizedStart, normalizedEnd);
         balanceChange.tokensChanged = updatedChanges.tokensChanged;
         balanceChange.intentsChanged = updatedChanges.intentsChanged;
     }
@@ -1734,8 +1921,15 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
     // ===================================================================================
     // CASE 1: Existing history - detect and fill gaps
     // ===================================================================================
-    if (history.transactions.length > 0) {
-        console.log(`\nLoaded ${history.transactions.length} existing transaction(s)`);
+    const hasExistingData = history.transactions.length > 0 || (history.records && history.records.length > 0);
+    const isV2Only = history.transactions.length === 0 && history.records && history.records.length > 0;
+
+    if (hasExistingData) {
+        if (isV2Only) {
+            console.log(`\nLoaded V2 history with ${history.records!.length} existing record(s)`);
+        } else {
+            console.log(`\nLoaded ${history.transactions.length} existing transaction(s)`);
+        }
         console.log(`Block range: ${history.metadata.firstBlock} - ${history.metadata.lastBlock}`);
         
         // Early return if stakingOnly mode (only wanted staking rewards)
@@ -1747,36 +1941,44 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             return history;
         }
 
-        // Sort transactions before analysis
-        history.transactions.sort((a, b) => a.block - b.block);
-        
-        // Detect gaps using the gap-detection module
-        const gapAnalysis = detectGaps(history.transactions);
-        
-        console.log(`\n=== Gap Analysis ===`);
-        console.log(`  Internal gaps: ${gapAnalysis.internalGaps.length}`);
-        console.log(`  Gap to creation: ${gapAnalysis.gapToCreation ? 'yes' : 'no'}`);
-        console.log(`  Gap to present: ${gapAnalysis.gapToPresent ? 'yes' : 'no'}`);
-        console.log(`  History complete: ${gapAnalysis.isComplete}`);
+        // For V2-only files, skip transaction-based gap analysis (go directly to Phase 2)
+        let gapAnalysis: ReturnType<typeof detectGaps> | null = null;
 
-        // -----------------------------------------------------------------------------
-        // PHASE 1: Fill internal gaps (highest priority)
-        // -----------------------------------------------------------------------------
-        if (gapAnalysis.internalGaps.length > 0 && !getStopSignal() && transactionsFound < maxTransactions) {
-            console.log(`\n=== Phase 1: Filling ${gapAnalysis.internalGaps.length} internal gap(s) ===`);
-            
-            for (const gap of gapAnalysis.internalGaps) {
-                if (getStopSignal() || transactionsFound >= maxTransactions) break;
-                
-                const filled = await fillGap(
-                    accountId,
-                    history,
-                    outputFile,
-                    gap,
-                    Math.min(50, maxTransactions - transactionsFound)
-                );
-                transactionsFound += filled;
+        if (!isV2Only) {
+            // Sort transactions before analysis
+            history.transactions.sort((a, b) => a.block - b.block);
+
+            // Detect gaps using the gap-detection module
+            gapAnalysis = detectGaps(history.transactions);
+
+            console.log(`\n=== Gap Analysis ===`);
+            console.log(`  Internal gaps: ${gapAnalysis.internalGaps.length}`);
+            console.log(`  Gap to creation: ${gapAnalysis.gapToCreation ? 'yes' : 'no'}`);
+            console.log(`  Gap to present: ${gapAnalysis.gapToPresent ? 'yes' : 'no'}`);
+            console.log(`  History complete: ${gapAnalysis.isComplete}`);
+
+            // -----------------------------------------------------------------------------
+            // PHASE 1: Fill internal gaps (highest priority)
+            // -----------------------------------------------------------------------------
+            if (gapAnalysis.internalGaps.length > 0 && !getStopSignal() && transactionsFound < maxTransactions) {
+                console.log(`\n=== Phase 1: Filling ${gapAnalysis.internalGaps.length} internal gap(s) ===`);
+
+                for (const gap of gapAnalysis.internalGaps) {
+                    if (getStopSignal() || transactionsFound >= maxTransactions) break;
+
+                    const filled = await fillGap(
+                        accountId,
+                        history,
+                        outputFile,
+                        gap,
+                        Math.min(50, maxTransactions - transactionsFound)
+                    );
+                    transactionsFound += filled;
+                }
             }
+        } else {
+            console.log(`\n=== V2 Format - Skipping transaction-based gap analysis ===`);
+            console.log(`  (V2 files can only check for new data after lastBlock)`);
         }
 
         // -----------------------------------------------------------------------------
@@ -1831,17 +2033,18 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
 
         // -----------------------------------------------------------------------------
         // PHASE 3: Look for old data (before firstBlock) - "gap to creation"
+        // Skip for V2-only files (no transaction-based gap analysis available)
         // -----------------------------------------------------------------------------
-        if (!getStopSignal() && transactionsFound < maxTransactions && direction === 'backward') {
+        if (!isV2Only && !getStopSignal() && transactionsFound < maxTransactions && direction === 'backward') {
             const firstBlock = history.metadata.firstBlock || currentBlock;
-            
+
             // Check if the earliest transaction has non-zero balance before
             // (indicating there's history before it)
             const sortedTxs = [...history.transactions].sort((a, b) => a.block - b.block);
             const earliestTx = sortedTxs.find(tx => !isStakingOnlyEntry(tx));
-            
+
             // Use gapToCreation or user-specified range
-            const hasGapToCreation = gapAnalysis.gapToCreation !== null;
+            const hasGapToCreation = gapAnalysis?.gapToCreation !== null;
             const searchEndBlock = startBlock || firstBlock - 1;
             const searchStartBlock = endBlock || Math.max(0, searchEndBlock - 1000000);
             
