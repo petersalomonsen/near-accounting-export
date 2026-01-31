@@ -15,7 +15,7 @@ dotenv.config();
 
 import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances } from './get-account-history.js';
 import { convertJsonToCsv } from './json-to-csv.js';
-import { getClient } from './rpc.js';
+import { callViewFunction } from './rpc.js';
 import { detectGapsV2 } from './gap-detection.js';
 import { migrateToV2 } from './migrate-to-flat-format.js';
 import type { GapAnalysisV2 } from './gap-detection.js';
@@ -299,6 +299,147 @@ function migrateAllV1Files(): { migrated: number; skipped: number; errors: strin
 
     if (result.migrated > 0 || result.errors.length > 0) {
         console.log(`\nMigration complete: ${result.migrated} migrated, ${result.skipped} already V2, ${result.errors.length} errors\n`);
+    }
+
+    return result;
+}
+
+/**
+ * Check if a token_id represents a staking pool
+ */
+function isStakingPoolToken(tokenId: string): boolean {
+    // Staking pools typically have patterns like:
+    // - *.poolv1.near
+    // - *.pool.near
+    // - aurora.pool.near
+    return tokenId.includes('.pool');
+}
+
+/**
+ * Query staking pool balance at a specific block
+ */
+async function queryStakingBalanceAtBlock(
+    accountId: string,
+    poolId: string,
+    blockHeight: number
+): Promise<string | null> {
+    try {
+        const result = await callViewFunction(
+            poolId,
+            'get_account_total_balance',
+            { account_id: accountId },
+            blockHeight
+        );
+        // Result is returned as a quoted string like "1000000000000000000000000000"
+        return typeof result === 'string' ? result.replace(/"/g, '') : String(result || '0');
+    } catch (error) {
+        console.warn(`    Could not query ${poolId} at block ${blockHeight}: ${error instanceof Error ? error.message : String(error)}`);
+        return null;
+    }
+}
+
+/**
+ * Repair staking records by fixing incorrect balance_before values.
+ *
+ * Old buggy staking records have balance_before: "0" incorrectly.
+ * This function queries the actual balance at the block and fixes the records.
+ *
+ * For records where balance_before was wrong:
+ * 1. Query actual balance_before from RPC
+ * 2. Recalculate amount = balance_after - balance_before
+ * 3. If amount is 0, the record becomes a snapshot (can be kept or removed)
+ */
+async function repairStakingRecords(): Promise<{ repaired: number; recordsFixed: number; errors: string[] }> {
+    const result = { repaired: 0, recordsFixed: 0, errors: [] as string[] };
+
+    if (!fs.existsSync(DATA_DIR)) {
+        return result;
+    }
+
+    const files = fs.readdirSync(DATA_DIR).filter(f => f.endsWith('.near.json'));
+
+    if (files.length === 0) {
+        return result;
+    }
+
+    console.log(`\n=== Checking ${files.length} account file(s) for staking record repair ===`);
+
+    for (const filename of files) {
+        const filePath = path.join(DATA_DIR, filename);
+
+        try {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+
+            // Only process V2 format files
+            if (!isV2Format(data)) {
+                continue;
+            }
+
+            const accountId = data.accountId;
+
+            // Find staking records with balance_before: "0" but balance_after != "0"
+            // These are the buggy records that need fixing
+            const buggyRecords = data.records.filter((r: BalanceChangeRecord) =>
+                isStakingPoolToken(r.token_id) &&
+                r.balance_before === '0' &&
+                r.balance_after !== '0'
+            );
+
+            if (buggyRecords.length === 0) {
+                continue;
+            }
+
+            console.log(`  Repairing ${filename}...`);
+            console.log(`    Found ${buggyRecords.length} staking records with balance_before=0 to fix`);
+
+            let fixedCount = 0;
+
+            for (const record of buggyRecords) {
+                // Query actual balance at the block BEFORE this record
+                // balance_before should be the balance at block_height - 1
+                const actualBalanceBefore = await queryStakingBalanceAtBlock(
+                    accountId,
+                    record.token_id,
+                    record.block_height - 1
+                );
+
+                if (actualBalanceBefore === null) {
+                    continue;
+                }
+
+                // Update the record
+                const oldBalanceBefore = record.balance_before;
+                record.balance_before = actualBalanceBefore;
+
+                // Recalculate amount
+                const balanceAfterBigInt = BigInt(record.balance_after);
+                const balanceBeforeBigInt = BigInt(actualBalanceBefore);
+                record.amount = (balanceAfterBigInt - balanceBeforeBigInt).toString();
+
+                console.log(`    Fixed ${record.token_id} at block ${record.block_height}: balance_before ${oldBalanceBefore} -> ${actualBalanceBefore}, amount=${record.amount}`);
+                fixedCount++;
+            }
+
+            if (fixedCount > 0) {
+                // Update metadata
+                (data as any).updatedAt = new Date().toISOString();
+
+                // Write repaired file
+                fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+
+                console.log(`    ✓ Fixed ${fixedCount} staking records`);
+                result.repaired++;
+                result.recordsFixed += fixedCount;
+            }
+        } catch (error) {
+            const errorMsg = `Failed to repair ${filename}: ${error instanceof Error ? error.message : String(error)}`;
+            console.error(`    ✗ ${errorMsg}`);
+            result.errors.push(errorMsg);
+        }
+    }
+
+    if (result.repaired > 0 || result.errors.length > 0) {
+        console.log(`\nStaking repair complete: ${result.repaired} file(s) repaired, ${result.recordsFixed} records fixed, ${result.errors.length} errors\n`);
     }
 
     return result;
