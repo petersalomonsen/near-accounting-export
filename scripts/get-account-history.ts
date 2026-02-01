@@ -998,6 +998,175 @@ export async function fillStakingGaps(
 }
 
 /**
+ * Fill gaps in V2 format staking balance history using binary search.
+ *
+ * V2 format stores each balance change as a separate BalanceChangeRecord.
+ * This function detects gaps between consecutive records for the same token
+ * and uses binary search to find the exact block where rewards were applied.
+ *
+ * @param accountId - The account to fill gaps for
+ * @param history - The account history (will be modified in place)
+ * @param outputFile - Path to save the history file
+ * @returns Number of reward entries added
+ */
+export async function fillStakingGapsV2(
+    accountId: string,
+    history: AccountHistory,
+    outputFile: string
+): Promise<number> {
+    if (!history.records || history.records.length === 0) {
+        console.log('No V2 records found in history');
+        return 0;
+    }
+
+    // Find staking pool tokens (token_id contains .pool pattern)
+    const stakingPoolPatterns = [
+        /\.poolv1\.near$/,
+        /\.pool\.near$/,
+        /\.poolv2\.near$/
+    ];
+
+    const isStakingToken = (tokenId: string) =>
+        stakingPoolPatterns.some(pattern => pattern.test(tokenId));
+
+    // Group records by staking pool token
+    const poolRecords = new Map<string, BalanceChangeRecord[]>();
+    for (const record of history.records) {
+        if (isStakingToken(record.token_id)) {
+            if (!poolRecords.has(record.token_id)) {
+                poolRecords.set(record.token_id, []);
+            }
+            poolRecords.get(record.token_id)!.push(record);
+        }
+    }
+
+    if (poolRecords.size === 0) {
+        // Try using stakingPools array from history
+        if (history.stakingPools && history.stakingPools.length > 0) {
+            for (const pool of history.stakingPools) {
+                const records = history.records.filter(r => r.token_id === pool);
+                if (records.length > 0) {
+                    poolRecords.set(pool, records);
+                }
+            }
+        }
+    }
+
+    if (poolRecords.size === 0) {
+        console.log('No staking pool records found in V2 history');
+        return 0;
+    }
+
+    console.log(`\nChecking for staking gaps in ${poolRecords.size} pool(s) (V2 format)...`);
+
+    let totalGapsFound = 0;
+    let totalRewardsAdded = 0;
+
+    for (const [pool, records] of poolRecords) {
+        // Sort by block height ascending
+        const sorted = [...records].sort((a, b) => a.block_height - b.block_height);
+
+        if (sorted.length < 2) {
+            continue;
+        }
+
+        // Find gaps between consecutive records
+        const gaps: Array<{
+            fromBlock: number;
+            toBlock: number;
+            expectedBalance: string;  // balance_after of earlier record
+            actualBalance: string;    // balance_before of later record
+        }> = [];
+
+        for (let i = 0; i < sorted.length - 1; i++) {
+            const current = sorted[i]!;
+            const next = sorted[i + 1]!;
+
+            if (current.balance_after !== next.balance_before) {
+                gaps.push({
+                    fromBlock: current.block_height,
+                    toBlock: next.block_height,
+                    expectedBalance: current.balance_after,
+                    actualBalance: next.balance_before
+                });
+            }
+        }
+
+        if (gaps.length === 0) {
+            continue;
+        }
+
+        console.log(`  ${pool}: Found ${gaps.length} gap(s) to fill`);
+        totalGapsFound += gaps.length;
+
+        // Fill each gap using binary search
+        for (const gap of gaps) {
+            if (getStopSignal()) {
+                break;
+            }
+
+            const rewardBlock = await findStakingRewardBlock(
+                accountId,
+                pool,
+                gap.fromBlock,
+                gap.toBlock,
+                gap.expectedBalance
+            );
+
+            if (rewardBlock) {
+                // Query exact balances at the reward block
+                const balanceBefore = await getStakingPoolBalances(accountId, rewardBlock - 1, [pool]);
+                const balanceAfter = await getStakingPoolBalances(accountId, rewardBlock, [pool]);
+                const blockTimestamp = await getBlockTimestamp(rewardBlock);
+
+                const beforeAmount = BigInt(balanceBefore[pool] || '0');
+                const afterAmount = BigInt(balanceAfter[pool] || '0');
+                const diff = afterAmount - beforeAmount;
+
+                if (diff !== 0n) {
+                    // Create a V2 BalanceChangeRecord for the reward
+                    // Note: blockTimestamp is in nanoseconds, need to convert to milliseconds for Date
+                    const record: BalanceChangeRecord = {
+                        block_height: rewardBlock,
+                        block_timestamp: blockTimestamp ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString() : null,
+                        tx_hash: null,  // Synthetic entry, no transaction
+                        tx_block: null,
+                        signer_id: null,
+                        receiver_id: null,
+                        predecessor_id: null,
+                        token_id: pool,
+                        receipt_id: null,
+                        counterparty: pool,
+                        amount: diff.toString(),
+                        balance_before: beforeAmount.toString(),
+                        balance_after: afterAmount.toString()
+                    };
+
+                    history.records!.push(record);
+                    totalRewardsAdded++;
+                    console.log(`    Found reward at block ${rewardBlock}: ${diff.toString()} (${gap.fromBlock} -> ${gap.toBlock})`);
+                }
+            }
+        }
+    }
+
+    if (totalRewardsAdded > 0) {
+        // Sort records by block height descending (most recent first)
+        history.records!.sort((a, b) => b.block_height - a.block_height);
+        history.updatedAt = new Date().toISOString();
+        if (history.metadata) {
+            history.metadata.totalRecords = history.records!.length;
+        }
+        saveHistory(outputFile, history);
+        console.log(`\nAdded ${totalRewardsAdded} staking reward entries from ${totalGapsFound} gap(s)`);
+    } else if (totalGapsFound > 0) {
+        console.log(`\nFound ${totalGapsFound} gap(s) but no rewards to add`);
+    }
+
+    return totalRewardsAdded;
+}
+
+/**
  * Binary search to find the exact block where a staking balance changed.
  *
  * @param accountId - The account to query
@@ -2128,6 +2297,11 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
             if (stakingRewards > 0) {
                 console.log(`\nAdded ${stakingRewards} staking reward entries`);
             }
+            // Fill gaps in staking balance history using binary search
+            const gapsFilled = await fillStakingGapsV2(accountId, history, outputFile);
+            if (gapsFilled > 0) {
+                console.log(`\nFilled ${gapsFilled} staking gap(s) with binary search`);
+            }
             return history;
         }
 
@@ -2394,15 +2568,23 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
     // ===================================================================================
     // PHASE 5: Staking rewards collection
     // ===================================================================================
-    if (!getStopSignal() && history.transactions.length > 0) {
+    const hasData = history.transactions.length > 0 || (history.records && history.records.length > 0);
+    if (!getStopSignal() && hasData) {
         const stakingRewards = await collectStakingRewards(accountId, history, outputFile, options.maxEpochsToCheck, endBlock);
         if (stakingRewards > 0) {
             console.log(`\nAdded ${stakingRewards} staking reward entries`);
         }
+        // Fill gaps in staking balance history using binary search (V2 format)
+        const gapsFilled = await fillStakingGapsV2(accountId, history, outputFile);
+        if (gapsFilled > 0) {
+            console.log(`\nFilled ${gapsFilled} staking gap(s) with binary search`);
+        }
     }
 
     // Final sort and save
-    history.transactions.sort((a, b) => a.block - b.block);
+    if (history.transactions.length > 0) {
+        history.transactions.sort((a, b) => a.block - b.block);
+    }
     saveHistory(outputFile, history);
     
     console.log(`\n=== Export complete ===`);
