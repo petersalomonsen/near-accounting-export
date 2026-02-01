@@ -13,7 +13,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances } from './get-account-history.js';
+import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances, repairMissingStakingRecordsV2 } from './get-account-history.js';
 import { convertJsonToCsv } from './json-to-csv.js';
 import { callViewFunction } from './rpc.js';
 import { detectGapsV2 } from './gap-detection.js';
@@ -440,6 +440,60 @@ async function repairStakingRecords(): Promise<{ repaired: number; recordsFixed:
 
     if (result.repaired > 0 || result.errors.length > 0) {
         console.log(`\nStaking repair complete: ${result.repaired} file(s) repaired, ${result.recordsFixed} records fixed, ${result.errors.length} errors\n`);
+    }
+
+    return result;
+}
+
+/**
+ * Repair missing staking balance records for NEAR transfers to/from staking pools.
+ * This finds NEAR transfers where the counterparty is a staking pool but there's
+ * no corresponding staking balance change record.
+ */
+async function repairMissingStakingTransfers(): Promise<{ repaired: number; recordsAdded: number; errors: string[] }> {
+    const result = { repaired: 0, recordsAdded: 0, errors: [] as string[] };
+
+    if (!fs.existsSync(DATA_DIR)) {
+        return result;
+    }
+
+    const files = fs.readdirSync(DATA_DIR).filter(f => f.endsWith('.near.json'));
+
+    if (files.length === 0) {
+        return result;
+    }
+
+    console.log(`\n=== Checking ${files.length} account file(s) for missing staking transfer records ===`);
+
+    for (const filename of files) {
+        const filePath = path.join(DATA_DIR, filename);
+
+        try {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+
+            // Only process V2 format files
+            if (!isV2Format(data)) {
+                continue;
+            }
+
+            const accountId = data.accountId;
+
+            // Run the repair function (cast to AccountHistory - it only needs records and metadata)
+            const recordsAdded = await repairMissingStakingRecordsV2(accountId, data as any, filePath);
+
+            if (recordsAdded > 0) {
+                result.repaired++;
+                result.recordsAdded += recordsAdded;
+            }
+        } catch (error) {
+            const errorMsg = `Failed to repair ${filename}: ${error instanceof Error ? error.message : String(error)}`;
+            console.error(`    ✗ ${errorMsg}`);
+            result.errors.push(errorMsg);
+        }
+    }
+
+    if (result.repaired > 0 || result.errors.length > 0) {
+        console.log(`\nMissing staking transfer repair complete: ${result.repaired} file(s), ${result.recordsAdded} records added, ${result.errors.length} errors\n`);
     }
 
     return result;
@@ -1309,6 +1363,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         // Repair any buggy staking records (balance_before: "0" issue)
         repairStakingRecords().catch(err => {
             console.error('Error during staking record repair:', err);
+        });
+
+        // Repair missing staking balance records from NEAR transfers to/from pools
+        repairMissingStakingTransfers().catch(err => {
+            console.error('Error during missing staking transfer repair:', err);
         });
 
         // Start continuous sync loop
