@@ -1120,35 +1120,50 @@ export async function fillStakingGapsV2(
         console.log(`  ${pool}: Found ${gaps.length} gap(s) to fill`);
         totalGapsFound += gaps.length;
 
-        // Fill each gap using binary search
+        // Fill each gap by iterating through epoch boundaries
+        // Staking rewards only accrue at epoch boundaries (~43,200 blocks / ~12 hours)
+        const EPOCH_LENGTH = 43200;
+
         for (const gap of gaps) {
             if (getStopSignal()) {
                 break;
             }
 
-            const rewardBlock = await findStakingRewardBlock(
-                accountId,
-                pool,
-                gap.fromBlock,
-                gap.toBlock,
-                gap.expectedBalance
-            );
+            // Calculate epoch boundaries within the gap
+            const firstEpoch = Math.ceil(gap.fromBlock / EPOCH_LENGTH);
+            const lastEpoch = Math.floor(gap.toBlock / EPOCH_LENGTH);
 
-            if (rewardBlock) {
-                // Query exact balances at the reward block
-                const balanceBefore = await getStakingPoolBalances(accountId, rewardBlock - 1, [pool]);
-                const balanceAfter = await getStakingPoolBalances(accountId, rewardBlock, [pool]);
-                const blockTimestamp = await getBlockTimestamp(rewardBlock);
+            // Build list of checkpoints: gap start, epoch boundaries, gap end
+            const checkpoints: number[] = [gap.fromBlock];
+            for (let epoch = firstEpoch; epoch <= lastEpoch; epoch++) {
+                const boundaryBlock = epoch * EPOCH_LENGTH;
+                if (boundaryBlock > gap.fromBlock && boundaryBlock < gap.toBlock) {
+                    checkpoints.push(boundaryBlock);
+                }
+            }
+            checkpoints.push(gap.toBlock);
 
-                const beforeAmount = BigInt(balanceBefore[pool] || '0');
-                const afterAmount = BigInt(balanceAfter[pool] || '0');
-                const diff = afterAmount - beforeAmount;
+            // Query balance at each checkpoint and create records when balance changes
+            let prevBalance = BigInt(gap.expectedBalance);
+            let prevBlock = gap.fromBlock;
 
-                if (diff !== 0n) {
-                    // Create a V2 BalanceChangeRecord for the reward
-                    // Note: blockTimestamp is in nanoseconds, need to convert to milliseconds for Date
+            for (let i = 1; i < checkpoints.length; i++) {
+                if (getStopSignal()) {
+                    break;
+                }
+
+                const currentBlock = checkpoints[i]!;
+                const balances = await getStakingPoolBalances(accountId, currentBlock, [pool]);
+                const currentBalance = BigInt(balances[pool] || '0');
+
+                // Check if balance changed (reward accrued)
+                const diff = currentBalance - prevBalance;
+                if (diff > 0n) {
+                    // Found a reward - create record at this epoch boundary
+                    const blockTimestamp = await getBlockTimestamp(currentBlock);
+
                     const record: BalanceChangeRecord = {
-                        block_height: rewardBlock,
+                        block_height: currentBlock,
                         block_timestamp: blockTimestamp ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString() : null,
                         tx_hash: null,  // Synthetic entry, no transaction
                         tx_block: null,
@@ -1159,14 +1174,17 @@ export async function fillStakingGapsV2(
                         receipt_id: null,
                         counterparty: pool,
                         amount: diff.toString(),
-                        balance_before: beforeAmount.toString(),
-                        balance_after: afterAmount.toString()
+                        balance_before: prevBalance.toString(),
+                        balance_after: currentBalance.toString()
                     };
 
                     history.records!.push(record);
                     totalRewardsAdded++;
-                    console.log(`    Found reward at block ${rewardBlock}: ${diff.toString()} (${gap.fromBlock} -> ${gap.toBlock})`);
+                    console.log(`    Found reward at epoch block ${currentBlock}: ${diff.toString()} (${prevBlock} -> ${currentBlock})`);
                 }
+
+                prevBalance = currentBalance;
+                prevBlock = currentBlock;
             }
         }
     }
