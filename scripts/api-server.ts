@@ -13,7 +13,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances, repairMissingStakingRecordsV2 } from './get-account-history.js';
+import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances, repairMissingStakingRecordsV2, repairInvalidStakingRewards } from './get-account-history.js';
 import { convertJsonToCsv } from './json-to-csv.js';
 import { callViewFunction } from './rpc.js';
 import { detectGapsV2 } from './gap-detection.js';
@@ -494,6 +494,59 @@ async function repairMissingStakingTransfers(): Promise<{ repaired: number; reco
 
     if (result.repaired > 0 || result.errors.length > 0) {
         console.log(`\nMissing staking transfer repair complete: ${result.repaired} file(s), ${result.recordsAdded} records added, ${result.errors.length} errors\n`);
+    }
+
+    return result;
+}
+
+/**
+ * Repair invalid staking rewards in all account history files on startup.
+ * This removes synthetic staking reward records (tx_hash: null) with unreasonably
+ * large amounts (> 10 NEAR), which were incorrectly created by a bug in the
+ * epoch-based gap filler that included deposit transactions as rewards.
+ */
+function repairInvalidStakingRewardsAll(): { repaired: number; recordsRemoved: number; errors: string[] } {
+    const result = { repaired: 0, recordsRemoved: 0, errors: [] as string[] };
+
+    if (!fs.existsSync(DATA_DIR)) {
+        return result;
+    }
+
+    const files = fs.readdirSync(DATA_DIR).filter(f => f.endsWith('.near.json'));
+
+    if (files.length === 0) {
+        return result;
+    }
+
+    console.log(`\n=== Checking ${files.length} account file(s) for invalid staking rewards ===`);
+
+    for (const filename of files) {
+        const filePath = path.join(DATA_DIR, filename);
+
+        try {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+
+            // Only process V2 format files
+            if (!isV2Format(data)) {
+                continue;
+            }
+
+            // Run the repair function
+            const recordsRemoved = repairInvalidStakingRewards(data as any, filePath);
+
+            if (recordsRemoved > 0) {
+                result.repaired++;
+                result.recordsRemoved += recordsRemoved;
+            }
+        } catch (error) {
+            const errorMsg = `Failed to repair ${filename}: ${error instanceof Error ? error.message : String(error)}`;
+            console.error(`    ✗ ${errorMsg}`);
+            result.errors.push(errorMsg);
+        }
+    }
+
+    if (result.repaired > 0 || result.errors.length > 0) {
+        console.log(`\nInvalid staking rewards repair complete: ${result.repaired} file(s), ${result.recordsRemoved} records removed, ${result.errors.length} errors\n`);
     }
 
     return result;
@@ -1369,6 +1422,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         repairMissingStakingTransfers().catch(err => {
             console.error('Error during missing staking transfer repair:', err);
         });
+
+        // Repair invalid staking rewards (large synthetic entries from epoch gap filler bug)
+        repairInvalidStakingRewardsAll();
 
         // Start continuous sync loop
         startContinuousLoop();

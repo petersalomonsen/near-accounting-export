@@ -1364,6 +1364,69 @@ export async function repairMissingStakingRecordsV2(
 }
 
 /**
+ * Remove invalid synthetic staking "reward" records.
+ *
+ * This repairs data corrupted by a bug where gap filling incorrectly created
+ * reward records at transaction blocks, attributing deposits/withdrawals as rewards.
+ *
+ * Criteria for removal:
+ * - token_id is a staking pool (.pool pattern)
+ * - tx_hash is null (synthetic entry)
+ * - amount > 10 NEAR (real rewards are typically < 1 NEAR per epoch)
+ */
+export function repairInvalidStakingRewards(
+    history: AccountHistory,
+    outputFile: string
+): number {
+    if (!history.records || history.records.length === 0) {
+        return 0;
+    }
+
+    const stakingPoolPattern = /\.pool.*\.near$/;
+    const TEN_NEAR = BigInt('10000000000000000000000000'); // 10 NEAR in yoctoNEAR
+
+    const originalCount = history.records.length;
+
+    // Filter out invalid reward records
+    history.records = history.records.filter(record => {
+        // Keep all non-staking records
+        if (!stakingPoolPattern.test(record.token_id)) {
+            return true;
+        }
+
+        // Keep records with tx_hash (real transactions)
+        if (record.tx_hash !== null) {
+            return true;
+        }
+
+        // For synthetic entries (tx_hash is null), check if amount is reasonable
+        const amount = BigInt(record.amount);
+        const absAmount = amount < 0n ? -amount : amount;
+
+        // Remove if amount > 10 NEAR (unreasonable for a single epoch reward)
+        if (absAmount > TEN_NEAR) {
+            console.log(`  Removing invalid reward: ${record.token_id} at block ${record.block_height}, amount: ${record.amount}`);
+            return false;
+        }
+
+        return true;
+    });
+
+    const removedCount = originalCount - history.records.length;
+
+    if (removedCount > 0) {
+        history.updatedAt = new Date().toISOString();
+        if (history.metadata) {
+            history.metadata.totalRecords = history.records.length;
+        }
+        saveHistory(outputFile, history);
+        console.log(`Removed ${removedCount} invalid staking reward record(s)`);
+    }
+
+    return removedCount;
+}
+
+/**
  * Binary search to find the exact block where a staking balance changed.
  *
  * @param accountId - The account to query
