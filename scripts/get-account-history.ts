@@ -1129,41 +1129,45 @@ export async function fillStakingGapsV2(
                 break;
             }
 
-            // Calculate epoch boundaries within the gap
+            // Calculate epoch boundaries within the gap (ONLY epoch boundaries, not gap endpoints)
+            // Gap endpoints already have records - we're filling the space between them
             const firstEpoch = Math.ceil(gap.fromBlock / EPOCH_LENGTH);
             const lastEpoch = Math.floor(gap.toBlock / EPOCH_LENGTH);
 
-            // Build list of checkpoints: gap start, epoch boundaries, gap end
-            const checkpoints: number[] = [gap.fromBlock];
+            // Build list of epoch boundary checkpoints only
+            const epochBoundaries: number[] = [];
             for (let epoch = firstEpoch; epoch <= lastEpoch; epoch++) {
                 const boundaryBlock = epoch * EPOCH_LENGTH;
                 if (boundaryBlock > gap.fromBlock && boundaryBlock < gap.toBlock) {
-                    checkpoints.push(boundaryBlock);
+                    epochBoundaries.push(boundaryBlock);
                 }
             }
-            checkpoints.push(gap.toBlock);
 
-            // Query balance at each checkpoint and create records when balance changes
+            if (epochBoundaries.length === 0) {
+                // No epoch boundaries in gap - nothing to fill
+                continue;
+            }
+
+            // Query balance at each epoch boundary and create records when balance changes
             let prevBalance = BigInt(gap.expectedBalance);
             let prevBlock = gap.fromBlock;
 
-            for (let i = 1; i < checkpoints.length; i++) {
+            for (const epochBlock of epochBoundaries) {
                 if (getStopSignal()) {
                     break;
                 }
 
-                const currentBlock = checkpoints[i]!;
-                const balances = await getStakingPoolBalances(accountId, currentBlock, [pool]);
+                const balances = await getStakingPoolBalances(accountId, epochBlock, [pool]);
                 const currentBalance = BigInt(balances[pool] || '0');
 
                 // Check if balance changed (reward accrued)
                 const diff = currentBalance - prevBalance;
                 if (diff > 0n) {
                     // Found a reward - create record at this epoch boundary
-                    const blockTimestamp = await getBlockTimestamp(currentBlock);
+                    const blockTimestamp = await getBlockTimestamp(epochBlock);
 
                     const record: BalanceChangeRecord = {
-                        block_height: currentBlock,
+                        block_height: epochBlock,
                         block_timestamp: blockTimestamp ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString() : null,
                         tx_hash: null,  // Synthetic entry, no transaction
                         tx_block: null,
@@ -1180,11 +1184,11 @@ export async function fillStakingGapsV2(
 
                     history.records!.push(record);
                     totalRewardsAdded++;
-                    console.log(`    Found reward at epoch block ${currentBlock}: ${diff.toString()} (${prevBlock} -> ${currentBlock})`);
+                    console.log(`    Found reward at epoch block ${epochBlock}: ${diff.toString()} (${prevBlock} -> ${epochBlock})`);
                 }
 
                 prevBalance = currentBalance;
-                prevBlock = currentBlock;
+                prevBlock = epochBlock;
             }
         }
     }
