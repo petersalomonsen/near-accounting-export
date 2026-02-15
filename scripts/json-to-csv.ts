@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getTokenMetadata, formatTokenAmount } from './token-metadata.js';
+import { isStakingPool } from './balance-tracker.js';
 import type { BalanceChangeRecord } from './balance-tracker.js';
 
 // V2 format (flat BalanceChangeRecord format)
@@ -74,7 +75,7 @@ async function convertToCSVRows(records: BalanceChangeRecord[]): Promise<CSVRow[
         // Determine token type from token_id
         const tokenType = record.token_id === 'near' ? 'near' :
             record.token_id.startsWith('nep141:') ? 'mt' :
-            record.token_id.includes('.pool') ? 'staking_reward' : 'ft';
+            isStakingPool(record.token_id) ? 'staking_reward' : 'ft';
 
         const metadata = await getTokenMetadata(record.token_id, tokenType);
 

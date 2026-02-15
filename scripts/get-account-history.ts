@@ -28,7 +28,9 @@ import {
     getAllBalances,
     enrichBalanceSnapshot,
     detectBalanceChanges,
-    normalizeBalanceSnapshots
+    normalizeBalanceSnapshots,
+    isStakingPool,
+    EPOCH_LENGTH
 } from './balance-tracker.js';
 import {
     getAllTransactionBlocks,
@@ -311,6 +313,21 @@ function saveHistory(filePath: string, history: AccountHistory): void {
 }
 
 /**
+ * Update and persist V2 records after a repair/fill operation.
+ * Sorts records descending by block_height, updates metadata counts and timestamp, then saves.
+ */
+function saveHistoryAfterRepair(history: AccountHistory, outputFile: string): void {
+    if (history.records) {
+        history.records.sort((a, b) => b.block_height - a.block_height);
+    }
+    history.updatedAt = new Date().toISOString();
+    if (history.metadata) {
+        history.metadata.totalRecords = history.records?.length;
+    }
+    saveHistory(outputFile, history);
+}
+
+/**
  * Merge records and remove duplicates
  * Records are deduplicated by (block_height, token_id, tx_hash)
  */
@@ -349,31 +366,22 @@ interface StakingPoolRange {
 
 function discoverStakingPoolsWithRanges(history: AccountHistory): StakingPoolRange[] {
     const poolData = new Map<string, { deposits: number[], withdrawals: number[] }>();
-    
-    // Common staking pool contract patterns
-    const stakingPoolPatterns = [
-        /\.poolv1\.near$/,
-        /\.pool\.near$/,
-        /\.poolv2\.near$/
-    ];
-    
+
     // Method names for deposits vs withdrawals
     const depositMethods = ['deposit_and_stake', 'stake'];
     const withdrawMethods = ['unstake', 'unstake_all', 'withdraw_all', 'withdraw'];
-    
+
     // Sort transactions by block
     const sortedTxs = [...history.transactions].sort((a, b) => a.block - b.block);
-    
+
     for (const tx of sortedTxs) {
         if (!tx.transfers) continue;
-        
+
         for (const transfer of tx.transfers) {
             const counterparty = transfer.counterparty;
             if (!counterparty) continue;
-            
-            // Check if the counterparty matches a staking pool pattern
-            const isStakingPool = stakingPoolPatterns.some(pattern => pattern.test(counterparty));
-            if (!isStakingPool) continue;
+
+            if (!isStakingPool(counterparty)) continue;
             
             if (!poolData.has(counterparty)) {
                 poolData.set(counterparty, { deposits: [], withdrawals: [] });
@@ -417,41 +425,6 @@ function discoverStakingPoolsWithRanges(history: AccountHistory): StakingPoolRan
     return result;
 }
 
-function discoverStakingPools(history: AccountHistory): string[] {
-    const stakingPools = new Set<string>(history.stakingPools || []);
-    
-    // Common staking pool contract patterns
-    const stakingPoolPatterns = [
-        /\.poolv1\.near$/,
-        /\.pool\.near$/,
-        /\.poolv2\.near$/
-    ];
-    
-    // Common staking method names that indicate a staking pool
-    const stakingMethods = ['deposit_and_stake', 'stake', 'unstake', 'unstake_all', 'withdraw_from_staking_pool'];
-    
-    for (const tx of history.transactions) {
-        if (!tx.transfers) continue;
-        
-        for (const transfer of tx.transfers) {
-            const counterparty = transfer.counterparty;
-            if (!counterparty) continue;
-            
-            // Check if the counterparty matches a staking pool pattern
-            const isStakingPool = stakingPoolPatterns.some(pattern => pattern.test(counterparty));
-            
-            // Or if the method name indicates staking
-            const isStakingMethod = transfer.memo && stakingMethods.includes(transfer.memo);
-            
-            if (isStakingPool || isStakingMethod) {
-                stakingPools.add(counterparty);
-            }
-        }
-    }
-    
-    return Array.from(stakingPools);
-}
-
 /**
  * Enrich transaction entry with staking pool balances if it involves staking pool transfers
  */
@@ -464,9 +437,8 @@ export async function enrichWithStakingPoolBalances(
     }
 
     // Find staking pool transfers (deposits/withdrawals)
-    const stakingPoolPattern = /\.pool.*\.near$/;
     const stakingPools = entry.transfers
-        .filter(t => t.counterparty && stakingPoolPattern.test(t.counterparty))
+        .filter(t => t.counterparty && isStakingPool(t.counterparty))
         .map(t => t.counterparty!)
         .filter((pool, index, self) => self.indexOf(pool) === index); // unique
 
@@ -552,6 +524,33 @@ export async function enrichWithStakingPoolBalances(
 
 /**
  * Collect staking reward entries between transactions
+ * Run the full staking repair pipeline:
+ * 1. collectStakingRewards - epoch boundary snapshots
+ * 2. repairMissingStakingRecordsV2 - find missing deposit/withdrawal records
+ * 3. fillStakingGapsV2 - fill reward gaps between records
+ */
+async function runStakingPipeline(
+    accountId: string,
+    history: AccountHistory,
+    outputFile: string,
+    maxEpochsToCheck?: number,
+    endBlock?: number
+): Promise<void> {
+    const stakingRewards = await collectStakingRewards(accountId, history, outputFile, maxEpochsToCheck, endBlock);
+    if (stakingRewards > 0) {
+        console.log(`\nAdded ${stakingRewards} staking reward entries`);
+    }
+    const stakingRecordsRepaired = await repairMissingStakingRecordsV2(accountId, history, outputFile);
+    if (stakingRecordsRepaired > 0) {
+        console.log(`\nRepaired ${stakingRecordsRepaired} missing staking record(s)`);
+    }
+    const gapsFilled = await fillStakingGapsV2(accountId, history, outputFile);
+    if (gapsFilled > 0) {
+        console.log(`\nFilled ${gapsFilled} staking gap(s) with binary search`);
+    }
+}
+
+/**
  * Creates synthetic transaction entries for staking balance changes at epoch boundaries
  * Only checks epochs where staking was active (between first deposit and full withdrawal)
  */
@@ -613,6 +612,74 @@ export async function collectStakingRewards(
         });
     }
     
+    // Ensure withdrawal records exist for fully withdrawn pools.
+    // This catches the case where the pool balance dropped to 0 at the withdrawal block
+    // but no staking record was created (e.g., no adjacent unstake fee transaction).
+    if (history.records && history.records.length > 0) {
+        for (const range of activeRanges) {
+            const poolRange = poolRanges.find(r => r.pool === range.pool);
+            if (!poolRange?.lastWithdrawalBlock || range.endBlock !== poolRange.lastWithdrawalBlock) {
+                continue; // Not fully withdrawn
+            }
+
+            const withdrawalBlock = poolRange.lastWithdrawalBlock;
+
+            // Check if a withdrawal staking record already exists near this block
+            const hasWithdrawalRecord = history.records.some(r =>
+                r.token_id === range.pool &&
+                r.balance_after === '0' &&
+                Math.abs(r.block_height - withdrawalBlock) <= 2
+            );
+            if (hasWithdrawalRecord) continue;
+
+            // Search for the balance transition near the withdrawal block.
+            // The pool balance may drop 1-2 blocks before the NEAR transfer arrives.
+            let transitionBlock: number | undefined;
+            let balBefore = 0n;
+            let balAfter = 0n;
+
+            for (let offset = 0; offset <= 2; offset++) {
+                const checkBlock = withdrawalBlock - offset;
+                const before = BigInt((await getStakingPoolBalances(accountId, checkBlock - 1, [range.pool]))[range.pool] || '0');
+                const after = BigInt((await getStakingPoolBalances(accountId, checkBlock, [range.pool]))[range.pool] || '0');
+                if (after - before !== 0n) {
+                    transitionBlock = checkBlock;
+                    balBefore = before;
+                    balAfter = after;
+                    break;
+                }
+            }
+
+            if (transitionBlock !== undefined) {
+                const blockTimestamp = await getBlockTimestamp(transitionBlock);
+                const nearTransfer = history.records.find(r =>
+                    r.token_id === 'near' &&
+                    r.counterparty === range.pool &&
+                    Math.abs(r.block_height - withdrawalBlock) <= 2
+                );
+
+                const record: BalanceChangeRecord = {
+                    block_height: transitionBlock,
+                    block_timestamp: blockTimestamp ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString() : null,
+                    tx_hash: nearTransfer?.tx_hash || null,
+                    tx_block: nearTransfer?.tx_block || null,
+                    signer_id: nearTransfer?.signer_id || null,
+                    receiver_id: nearTransfer?.receiver_id || null,
+                    predecessor_id: nearTransfer?.predecessor_id || null,
+                    token_id: range.pool,
+                    receipt_id: nearTransfer?.receipt_id || null,
+                    counterparty: range.pool,
+                    amount: (balAfter - balBefore).toString(),
+                    balance_before: balBefore.toString(),
+                    balance_after: balAfter.toString()
+                };
+
+                history.records.push(record);
+                console.log(`  Created withdrawal staking record for ${range.pool} at block ${transitionBlock}`);
+            }
+        }
+    }
+
     // Find all staking balance changes at epoch boundaries for each pool's active range
     let allChanges: StakingBalanceChange[] = [];
     let updatedExistingEntries = 0;
@@ -633,8 +700,6 @@ export async function collectStakingRewards(
             }
         }
     }
-    
-    const EPOCH_LENGTH = 43200;
     
     for (const range of activeRanges) {
         console.log(`\nChecking staking balance changes for ${range.pool}...`);
@@ -852,173 +917,6 @@ export async function collectStakingRewards(
 }
 
 /**
- * Fill gaps in staking balance history using binary search.
- *
- * This function is called after collectStakingRewards() creates snapshots at epoch boundaries.
- * It detects gaps between consecutive snapshots (where balance_after[n] != balance_before[n+1])
- * and uses binary search to find the exact block where the reward was applied.
- *
- * @param accountId - The account to fill gaps for
- * @param history - The account history (will be modified in place)
- * @param outputFile - Path to save the history file
- * @returns Number of reward entries added
- */
-export async function fillStakingGaps(
-    accountId: string,
-    history: AccountHistory,
-    outputFile: string
-): Promise<number> {
-    // Get all staking pool IDs from the history
-    const stakingPools = new Set<string>();
-    for (const tx of history.transactions) {
-        if (tx.balanceAfter?.stakingPools) {
-            for (const pool of Object.keys(tx.balanceAfter.stakingPools)) {
-                stakingPools.add(pool);
-            }
-        }
-    }
-
-    if (stakingPools.size === 0) {
-        console.log('No staking pools found in history');
-        return 0;
-    }
-
-    console.log(`\nChecking for staking gaps in ${stakingPools.size} pool(s)...`);
-
-    let totalGapsFound = 0;
-    let totalRewardsAdded = 0;
-
-    for (const pool of stakingPools) {
-        // Get all records for this pool, sorted by block
-        const poolRecords = history.transactions
-            .filter(tx => tx.balanceAfter?.stakingPools?.[pool] !== undefined)
-            .sort((a, b) => a.block - b.block);
-
-        if (poolRecords.length < 2) {
-            continue;
-        }
-
-        // Find gaps between consecutive records
-        const gaps: Array<{
-            fromBlock: number;
-            toBlock: number;
-            expectedBalance: string;  // balance_after of earlier record
-            actualBalance: string;    // balance_before of later record
-        }> = [];
-
-        for (let i = 0; i < poolRecords.length - 1; i++) {
-            const current = poolRecords[i]!;
-            const next = poolRecords[i + 1]!;
-
-            const currentBalanceAfter = current.balanceAfter?.stakingPools?.[pool] || '0';
-            const nextBalanceBefore = next.balanceBefore?.stakingPools?.[pool] || '0';
-
-            if (currentBalanceAfter !== nextBalanceBefore) {
-                gaps.push({
-                    fromBlock: current.block,
-                    toBlock: next.block,
-                    expectedBalance: currentBalanceAfter,
-                    actualBalance: nextBalanceBefore
-                });
-            }
-        }
-
-        if (gaps.length === 0) {
-            continue;
-        }
-
-        console.log(`  ${pool}: Found ${gaps.length} gap(s) to fill`);
-        totalGapsFound += gaps.length;
-
-        // Fill each gap using binary search
-        for (const gap of gaps) {
-            if (getStopSignal()) {
-                break;
-            }
-
-            const rewardBlock = await findStakingRewardBlock(
-                accountId,
-                pool,
-                gap.fromBlock,
-                gap.toBlock,
-                gap.expectedBalance
-            );
-
-            if (rewardBlock) {
-                // Query exact balances at the reward block
-                const balanceBefore = await getStakingPoolBalances(accountId, rewardBlock - 1, [pool]);
-                const balanceAfter = await getStakingPoolBalances(accountId, rewardBlock, [pool]);
-                const blockTimestamp = await getBlockTimestamp(rewardBlock);
-
-                const beforeAmount = BigInt(balanceBefore[pool] || '0');
-                const afterAmount = BigInt(balanceAfter[pool] || '0');
-                const diff = afterAmount - beforeAmount;
-
-                if (diff !== 0n) {
-                    // Create a reward entry
-                    const entry: TransactionEntry = {
-                        block: rewardBlock,
-                        transactionBlock: null,
-                        timestamp: blockTimestamp,
-                        transactionHashes: [],
-                        transactions: [],
-                        transfers: [{
-                            type: 'staking_reward',
-                            direction: diff > 0n ? 'in' : 'out',
-                            amount: (diff > 0n ? diff : -diff).toString(),
-                            counterparty: pool,
-                            tokenId: pool,
-                            memo: 'staking_reward'
-                        } as TransferDetail],
-                        balanceBefore: {
-                            near: '0',
-                            fungibleTokens: {},
-                            intentsTokens: {},
-                            stakingPools: balanceBefore
-                        },
-                        balanceAfter: {
-                            near: '0',
-                            fungibleTokens: {},
-                            intentsTokens: {},
-                            stakingPools: balanceAfter
-                        },
-                        changes: {
-                            nearChanged: false,
-                            tokensChanged: {},
-                            intentsChanged: {},
-                            stakingChanged: {
-                                [pool]: {
-                                    start: beforeAmount.toString(),
-                                    end: afterAmount.toString(),
-                                    diff: diff.toString()
-                                }
-                            }
-                        }
-                    };
-
-                    history.transactions.push(entry);
-                    totalRewardsAdded++;
-                    console.log(`    Found reward at block ${rewardBlock}: ${diff.toString()} (${gap.fromBlock} -> ${gap.toBlock})`);
-                }
-            }
-        }
-    }
-
-    if (totalRewardsAdded > 0) {
-        // Sort and save
-        history.transactions.sort((a, b) => b.block - a.block);
-        history.updatedAt = new Date().toISOString();
-        history.metadata.totalTransactions = history.transactions.length;
-        saveHistory(outputFile, history);
-        console.log(`\nAdded ${totalRewardsAdded} staking reward entries from ${totalGapsFound} gap(s)`);
-    } else if (totalGapsFound > 0) {
-        console.log(`\nFound ${totalGapsFound} gap(s) but no rewards to add`);
-    }
-
-    return totalRewardsAdded;
-}
-
-/**
  * Fill gaps in V2 format staking balance history using binary search.
  *
  * V2 format stores each balance change as a separate BalanceChangeRecord.
@@ -1040,20 +938,10 @@ export async function fillStakingGapsV2(
         return 0;
     }
 
-    // Find staking pool tokens (token_id contains .pool pattern)
-    const stakingPoolPatterns = [
-        /\.poolv1\.near$/,
-        /\.pool\.near$/,
-        /\.poolv2\.near$/
-    ];
-
-    const isStakingToken = (tokenId: string) =>
-        stakingPoolPatterns.some(pattern => pattern.test(tokenId));
-
     // Group records by staking pool token
     const poolRecords = new Map<string, BalanceChangeRecord[]>();
     for (const record of history.records) {
-        if (isStakingToken(record.token_id)) {
+        if (isStakingPool(record.token_id)) {
             if (!poolRecords.has(record.token_id)) {
                 poolRecords.set(record.token_id, []);
             }
@@ -1122,8 +1010,6 @@ export async function fillStakingGapsV2(
 
         // Fill each gap by iterating through epoch boundaries
         // Staking rewards only accrue at epoch boundaries (~43,200 blocks / ~12 hours)
-        const EPOCH_LENGTH = 43200;
-
         for (const gap of gaps) {
             if (getStopSignal()) {
                 break;
@@ -1194,13 +1080,7 @@ export async function fillStakingGapsV2(
     }
 
     if (totalRewardsAdded > 0) {
-        // Sort records by block height descending (most recent first)
-        history.records!.sort((a, b) => b.block_height - a.block_height);
-        history.updatedAt = new Date().toISOString();
-        if (history.metadata) {
-            history.metadata.totalRecords = history.records!.length;
-        }
-        saveHistory(outputFile, history);
+        saveHistoryAfterRepair(history, outputFile);
         console.log(`\nAdded ${totalRewardsAdded} staking reward entries from ${totalGapsFound} gap(s)`);
     } else if (totalGapsFound > 0) {
         console.log(`\nFound ${totalGapsFound} gap(s) but no rewards to add`);
@@ -1231,13 +1111,11 @@ export async function repairMissingStakingRecordsV2(
         return 0;
     }
 
-    const stakingPoolPattern = /\.pool.*\.near$/;
-
     // Find NEAR records that involve staking pools
     const nearStakingTransfers = history.records.filter(record =>
         record.token_id === 'near' &&
         record.counterparty &&
-        stakingPoolPattern.test(record.counterparty)
+        isStakingPool(record.counterparty)
     );
 
     if (nearStakingTransfers.length === 0) {
@@ -1268,8 +1146,9 @@ export async function repairMissingStakingRecordsV2(
         );
 
         // Find transfers that don't have a corresponding staking record
-        // Note: staking operations typically execute at block+1, so check both block and block+1
+        // Check block-1, block, and block+1 since staking operations can settle at any of these
         const missingTransfers = transfers.filter(t =>
+            !existingStakingBlocks.has(t.block_height - 1) &&
             !existingStakingBlocks.has(t.block_height) &&
             !existingStakingBlocks.has(t.block_height + 1)
         );
@@ -1285,49 +1164,53 @@ export async function repairMissingStakingRecordsV2(
                 break;
             }
 
-            // Query staking balance before and after the transfer
-            // Staking operations execute at block+1 after the NEAR transfer
-            const balanceBefore = await getStakingPoolBalances(accountId, transfer.block_height, [pool]);
-            const balanceAfter = await getStakingPoolBalances(accountId, transfer.block_height + 1, [pool]);
+            // Try to find the block where the staking balance changed.
+            // Check forward (N→N+1, N+1→N+2) for deposits,
+            // and backward (N-1→N) for withdrawals where the balance already dropped at block N.
+            const balAtN = BigInt((await getStakingPoolBalances(accountId, transfer.block_height, [pool]))[pool] || '0');
+            const balAtN1 = BigInt((await getStakingPoolBalances(accountId, transfer.block_height + 1, [pool]))[pool] || '0');
 
-            const beforeAmount = BigInt(balanceBefore[pool] || '0');
-            const afterAmount = BigInt(balanceAfter[pool] || '0');
-            const diff = afterAmount - beforeAmount;
+            let recordBlock: number | undefined;
+            let balBefore: bigint;
+            let balAfter: bigint;
 
-            if (diff === 0n) {
-                // No change at this block, try one more block later
-                const balanceAfter2 = await getStakingPoolBalances(accountId, transfer.block_height + 2, [pool]);
-                const afterAmount2 = BigInt(balanceAfter2[pool] || '0');
-                const diff2 = afterAmount2 - afterAmount;
-
-                if (diff2 !== 0n) {
-                    // Found change at block+2
-                    const blockTimestamp = await getBlockTimestamp(transfer.block_height + 2);
-                    const record: BalanceChangeRecord = {
-                        block_height: transfer.block_height + 2,
-                        block_timestamp: blockTimestamp ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString() : null,
-                        tx_hash: transfer.tx_hash,
-                        tx_block: transfer.tx_block,
-                        signer_id: transfer.signer_id,
-                        receiver_id: transfer.receiver_id,
-                        predecessor_id: transfer.predecessor_id,
-                        token_id: pool,
-                        receipt_id: transfer.receipt_id,
-                        counterparty: pool,
-                        amount: diff2.toString(),
-                        balance_before: afterAmount.toString(),
-                        balance_after: afterAmount2.toString()
-                    };
-
-                    history.records!.push(record);
-                    recordsAdded++;
-                    console.log(`    Added staking record at block ${transfer.block_height + 2}: ${diff2.toString()}`);
-                }
+            const diffForward = balAtN1 - balAtN;
+            if (diffForward !== 0n) {
+                // Balance changed at block N+1 (typical for deposits)
+                recordBlock = transfer.block_height + 1;
+                balBefore = balAtN;
+                balAfter = balAtN1;
             } else {
-                // Found change at block+1
-                const blockTimestamp = await getBlockTimestamp(transfer.block_height + 1);
+                // No change N→N+1, try N+1→N+2
+                const balAtN2 = BigInt((await getStakingPoolBalances(accountId, transfer.block_height + 2, [pool]))[pool] || '0');
+                const diffForward2 = balAtN2 - balAtN1;
+                if (diffForward2 !== 0n) {
+                    recordBlock = transfer.block_height + 2;
+                    balBefore = balAtN1;
+                    balAfter = balAtN2;
+                } else {
+                    // No forward change found. Check backward: the pool balance may have
+                    // dropped 1-2 blocks before the NEAR transfer arrived.
+                    // Cross-contract calls: withdraw_all at block M → pool receipt at M+1 → NEAR arrives at M+1 or M+2
+                    for (let back = 1; back <= 2; back++) {
+                        const checkBlock = transfer.block_height - back;
+                        const balAtPrev = BigInt((await getStakingPoolBalances(accountId, checkBlock, [pool]))[pool] || '0');
+                        const balAtCheck = BigInt((await getStakingPoolBalances(accountId, checkBlock + 1, [pool]))[pool] || '0');
+                        const diffBackward = balAtCheck - balAtPrev;
+                        if (diffBackward !== 0n) {
+                            recordBlock = checkBlock + 1;
+                            balBefore = balAtPrev;
+                            balAfter = balAtCheck;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (recordBlock! !== undefined) {
+                const blockTimestamp = await getBlockTimestamp(recordBlock!);
                 const record: BalanceChangeRecord = {
-                    block_height: transfer.block_height + 1,
+                    block_height: recordBlock!,
                     block_timestamp: blockTimestamp ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString() : null,
                     tx_hash: transfer.tx_hash,
                     tx_block: transfer.tx_block,
@@ -1337,26 +1220,20 @@ export async function repairMissingStakingRecordsV2(
                     token_id: pool,
                     receipt_id: transfer.receipt_id,
                     counterparty: pool,
-                    amount: diff.toString(),
-                    balance_before: beforeAmount.toString(),
-                    balance_after: afterAmount.toString()
+                    amount: (balAfter! - balBefore!).toString(),
+                    balance_before: balBefore!.toString(),
+                    balance_after: balAfter!.toString()
                 };
 
                 history.records!.push(record);
                 recordsAdded++;
-                console.log(`    Added staking record at block ${transfer.block_height + 1}: ${diff.toString()}`);
+                console.log(`    Added staking record at block ${recordBlock}: ${record.amount}`);
             }
         }
     }
 
     if (recordsAdded > 0) {
-        // Sort records by block height descending (most recent first)
-        history.records!.sort((a, b) => b.block_height - a.block_height);
-        history.updatedAt = new Date().toISOString();
-        if (history.metadata) {
-            history.metadata.totalRecords = history.records!.length;
-        }
-        saveHistory(outputFile, history);
+        saveHistoryAfterRepair(history, outputFile);
         console.log(`\nAdded ${recordsAdded} missing staking balance record(s)`);
     }
 
@@ -1382,7 +1259,6 @@ export function repairInvalidStakingRewards(
         return 0;
     }
 
-    const stakingPoolPattern = /\.pool.*\.near$/;
     const TEN_NEAR = BigInt('10000000000000000000000000'); // 10 NEAR in yoctoNEAR
 
     const originalCount = history.records.length;
@@ -1390,7 +1266,7 @@ export function repairInvalidStakingRewards(
     // Filter out invalid reward records
     history.records = history.records.filter(record => {
         // Keep all non-staking records
-        if (!stakingPoolPattern.test(record.token_id)) {
+        if (!isStakingPool(record.token_id)) {
             return true;
         }
 
@@ -1415,59 +1291,11 @@ export function repairInvalidStakingRewards(
     const removedCount = originalCount - history.records.length;
 
     if (removedCount > 0) {
-        history.updatedAt = new Date().toISOString();
-        if (history.metadata) {
-            history.metadata.totalRecords = history.records.length;
-        }
-        saveHistory(outputFile, history);
+        saveHistoryAfterRepair(history, outputFile);
         console.log(`Removed ${removedCount} invalid staking reward record(s)`);
     }
 
     return removedCount;
-}
-
-/**
- * Binary search to find the exact block where a staking balance changed.
- *
- * @param accountId - The account to query
- * @param pool - The staking pool address
- * @param fromBlock - Start of search range (balance is expectedBalance here)
- * @param toBlock - End of search range (balance has changed by here)
- * @param expectedBalance - The balance at fromBlock
- * @returns The block where the balance changed, or null if not found
- */
-async function findStakingRewardBlock(
-    accountId: string,
-    pool: string,
-    fromBlock: number,
-    toBlock: number,
-    expectedBalance: string
-): Promise<number | null> {
-    // Binary search for the first block where balance differs from expected
-    let low = fromBlock;
-    let high = toBlock;
-    let resultBlock: number | null = null;
-
-    while (low < high) {
-        if (getStopSignal()) {
-            return null;
-        }
-
-        const mid = Math.floor((low + high) / 2);
-        const balance = await getStakingPoolBalances(accountId, mid, [pool]);
-        const midBalance = balance[pool] || '0';
-
-        if (midBalance === expectedBalance) {
-            // Balance hasn't changed yet, search in upper half
-            low = mid + 1;
-        } else {
-            // Balance has changed, search in lower half to find first change
-            resultBlock = mid;
-            high = mid;
-        }
-    }
-
-    return resultBlock;
 }
 
 /**
@@ -2553,20 +2381,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         
         // Early return if stakingOnly mode (only wanted staking rewards)
         if (stakingOnly) {
-            const stakingRewards = await collectStakingRewards(accountId, history, outputFile, options.maxEpochsToCheck, endBlock);
-            if (stakingRewards > 0) {
-                console.log(`\nAdded ${stakingRewards} staking reward entries`);
-            }
-            // Repair missing staking records from NEAR transfers to/from pools
-            const stakingRecordsRepaired = await repairMissingStakingRecordsV2(accountId, history, outputFile);
-            if (stakingRecordsRepaired > 0) {
-                console.log(`\nRepaired ${stakingRecordsRepaired} missing staking record(s)`);
-            }
-            // Fill gaps in staking balance history using binary search
-            const gapsFilled = await fillStakingGapsV2(accountId, history, outputFile);
-            if (gapsFilled > 0) {
-                console.log(`\nFilled ${gapsFilled} staking gap(s) with binary search`);
-            }
+            await runStakingPipeline(accountId, history, outputFile, options.maxEpochsToCheck, endBlock);
             return history;
         }
 
@@ -2835,20 +2650,7 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
     // ===================================================================================
     const hasData = history.transactions.length > 0 || (history.records && history.records.length > 0);
     if (!getStopSignal() && hasData) {
-        const stakingRewards = await collectStakingRewards(accountId, history, outputFile, options.maxEpochsToCheck, endBlock);
-        if (stakingRewards > 0) {
-            console.log(`\nAdded ${stakingRewards} staking reward entries`);
-        }
-        // Repair missing staking records from NEAR transfers to/from pools
-        const stakingRecordsRepaired = await repairMissingStakingRecordsV2(accountId, history, outputFile);
-        if (stakingRecordsRepaired > 0) {
-            console.log(`\nRepaired ${stakingRecordsRepaired} missing staking record(s)`);
-        }
-        // Fill gaps in staking balance history using binary search (V2 format)
-        const gapsFilled = await fillStakingGapsV2(accountId, history, outputFile);
-        if (gapsFilled > 0) {
-            console.log(`\nFilled ${gapsFilled} staking gap(s) with binary search`);
-        }
+        await runStakingPipeline(accountId, history, outputFile, options.maxEpochsToCheck, endBlock);
     }
 
     // Final sort and save
@@ -3190,9 +2992,6 @@ export async function reEnrichStakingPoolBalances(
         return 0;
     }
 
-    // Pattern to match staking pool contract addresses
-    const stakingPoolPattern = /\.pool.*\.near$/;
-
     // Find entries that have staking pool transfers but are missing those pools in stakingPools
     const entriesToEnrich = history.transactions.filter(tx => {
         if (!tx.transfers || tx.transfers.length === 0) {
@@ -3202,7 +3001,7 @@ export async function reEnrichStakingPoolBalances(
         // Get staking pools from transfers
         const stakingPoolsInTransfers = new Set(
             tx.transfers
-                .filter(t => t.counterparty && stakingPoolPattern.test(t.counterparty))
+                .filter(t => t.counterparty && isStakingPool(t.counterparty))
                 .map(t => t.counterparty!)
         );
 

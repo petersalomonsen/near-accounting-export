@@ -5,6 +5,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { isStakingPool } from './balance-tracker.js';
 
 interface BalanceChangeRecord {
     block_height: number;
@@ -61,7 +62,7 @@ function formatAmount(amount: string, decimals: number): string {
 // Get token decimals
 function getDecimals(tokenId: string): number {
     if (tokenId === 'near') return 24;
-    if (tokenId.includes('.poolv1.near') || tokenId.includes('.pool.near')) return 24;
+    if (isStakingPool(tokenId)) return 24;
     if (tokenId === 'wrap.near' || tokenId.includes('nep141:wrap.near')) return 24;
     if (tokenId.includes('nep141:eth.omft.near')) return 18;
     if (tokenId.includes('nep141:btc.omft.near')) return 8;
@@ -144,7 +145,7 @@ function generateReport(inputFile: string): string {
     // Staking pools summary
     const stakingPools = new Map<string, { deposits: bigint; withdrawals: bigint; rewards: bigint; balance: string }>();
     for (const record of records) {
-        if (!record.token_id.includes('.pool')) continue;
+        if (!isStakingPool(record.token_id)) continue;
         const pool = record.token_id;
         if (!stakingPools.has(pool)) {
             stakingPools.set(pool, { deposits: 0n, withdrawals: 0n, rewards: 0n, balance: '0' });
@@ -219,7 +220,7 @@ function generateReport(inputFile: string): string {
     md += `|---------|--------------|----------|------|\n`;
 
     const sortedCounterparties = [...counterpartyStats.entries()]
-        .filter(([cp]) => !cp.includes('.pool') && cp !== 'system')
+        .filter(([cp]) => !isStakingPool(cp) && cp !== 'system')
         .sort((a, b) => b[1].count - a[1].count)
         .slice(0, 20);
 
@@ -259,7 +260,7 @@ function generateReport(inputFile: string): string {
 
         if (record.token_id === 'near') {
             // External transfers (not to/from staking pools)
-            const isStakingCounterparty = record.counterparty?.includes('.pool') || false;
+            const isStakingCounterparty = record.counterparty ? isStakingPool(record.counterparty) : false;
             if (!isStakingCounterparty) {
                 if (amount > 0n) {
                     flows.received += amount;
@@ -267,7 +268,7 @@ function generateReport(inputFile: string): string {
                     flows.sent += -amount;
                 }
             }
-        } else if (record.token_id.includes('.pool')) {
+        } else if (isStakingPool(record.token_id)) {
             // Staking rewards (positive amounts without tx_hash)
             if (amount > 0n && !record.tx_hash) {
                 flows.stakingRewards += amount;
@@ -296,7 +297,7 @@ function generateReport(inputFile: string): string {
         for (const [tokenId, balance] of runningBalances) {
             if (tokenId === 'near') {
                 nearBalance = balance;
-            } else if (tokenId.includes('.pool')) {
+            } else if (isStakingPool(tokenId)) {
                 stakingBalance += balance;
             }
         }

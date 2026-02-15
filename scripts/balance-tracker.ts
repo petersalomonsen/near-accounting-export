@@ -105,7 +105,22 @@ export interface BalanceChangeRecord {
 }
 
 // Mainnet epoch length in blocks (roughly 12 hours)
-const EPOCH_LENGTH = 43200;
+export const EPOCH_LENGTH = 43200;
+
+// Canonical staking pool pattern matcher
+const STAKING_POOL_PATTERNS = [
+    /\.poolv1\.near$/,
+    /\.pool\.near$/,
+    /\.poolv2\.near$/
+];
+
+/**
+ * Check if an account/token ID is a staking pool contract.
+ * Matches: *.poolv1.near, *.pool.near, *.poolv2.near
+ */
+export function isStakingPool(id: string): boolean {
+    return STAKING_POOL_PATTERNS.some(p => p.test(id));
+}
 
 // Contract creation blocks - skip querying contracts before they existed
 // For intents.near, we use the block when mt_tokens_for_owner became available
