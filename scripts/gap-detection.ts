@@ -1,11 +1,21 @@
 /**
  * Gap Detection Module
- * 
+ *
  * Pure functions for detecting gaps in transaction history.
  * Gaps are detected by comparing balances between consecutive records.
- * 
+ *
  * This module is stateless and performs no I/O - it operates purely on in-memory data.
+ *
+ * Supports both:
+ * - V1 format: TransactionEntry[] with nested balanceBefore/balanceAfter snapshots
+ * - V2 format: BalanceChangeRecord[] with flat per-token records
  */
+
+import {
+    type BalanceChangeRecord,
+    detectTokenGaps,
+    type TokenGap
+} from './balance-tracker.js';
 
 /**
  * A balance snapshot at a specific block
@@ -426,3 +436,89 @@ export function getAllTokensFromGaps(gaps: Gap[]): {
         stakingPools: [...stakingPools]
     };
 }
+
+// ============================================================================
+// V2 FORMAT SUPPORT (BalanceChangeRecord[])
+// ============================================================================
+
+/**
+ * Gap analysis result for V2 format.
+ * Simplified compared to V1 since V2 is already per-token.
+ */
+export interface GapAnalysisV2 {
+    /** Total number of gaps detected across all tokens */
+    totalGaps: number;
+    /** Per-token gaps detected */
+    tokenGaps: TokenGap[];
+    /** Unique tokens with gaps */
+    tokensWithGaps: string[];
+    /** Whether the history is complete (no gaps) */
+    isComplete: boolean;
+}
+
+/**
+ * Detect gaps in V2 format (BalanceChangeRecord[]).
+ *
+ * For V2 format, we use the per-token gap detection from balance-tracker.ts.
+ * This is much simpler because each record is already per-token.
+ *
+ * @param records - Array of BalanceChangeRecord objects
+ * @returns GapAnalysisV2 with detected gaps
+ */
+export function detectGapsV2(records: BalanceChangeRecord[]): GapAnalysisV2 {
+    const tokenGaps = detectTokenGaps(records);
+
+    const tokensWithGaps = [...new Set(tokenGaps.map(g => g.token_id))];
+
+    return {
+        totalGaps: tokenGaps.length,
+        tokenGaps,
+        tokensWithGaps,
+        isComplete: tokenGaps.length === 0
+    };
+}
+
+/**
+ * Convert V1 Gap[] to V2-compatible TokenGap[].
+ * Useful for transitioning code from V1 to V2.
+ */
+export function convertGapsToTokenGaps(gaps: Gap[]): TokenGap[] {
+    const tokenGaps: TokenGap[] = [];
+
+    for (const gap of gaps) {
+        for (const error of gap.verification.errors) {
+            let tokenId: string;
+
+            switch (error.type) {
+                case 'near_balance_mismatch':
+                    tokenId = 'near';
+                    break;
+                case 'token_balance_mismatch':
+                    tokenId = error.token || 'unknown';
+                    break;
+                case 'intents_balance_mismatch':
+                    tokenId = error.token || 'unknown';
+                    break;
+                case 'staking_balance_mismatch':
+                    tokenId = error.pool || 'unknown';
+                    break;
+                default:
+                    continue;
+            }
+
+            tokenGaps.push({
+                token_id: tokenId,
+                from_block: gap.startBlock,
+                to_block: gap.endBlock,
+                expected_balance: error.expected,
+                actual_balance: error.actual,
+                diff: (BigInt(error.actual) - BigInt(error.expected)).toString()
+            });
+        }
+    }
+
+    return tokenGaps;
+}
+
+// Re-export TokenGap type from balance-tracker for convenience
+export type { TokenGap, BalanceChangeRecord };

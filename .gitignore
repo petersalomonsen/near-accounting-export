@@ -13,6 +13,7 @@ test/test-output.json
 data/
 downloaded_data/
 *.csv
+accounts/
 
 # IDE
 .idea/
