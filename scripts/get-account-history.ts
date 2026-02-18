@@ -30,7 +30,8 @@ import {
     detectBalanceChanges,
     normalizeBalanceSnapshots,
     isStakingPool,
-    EPOCH_LENGTH
+    EPOCH_LENGTH,
+    WEEKLY_SNAPSHOT_INTERVAL
 } from './balance-tracker.js';
 import {
     getAllTransactionBlocks,
@@ -52,7 +53,7 @@ import {
     type GapAnalysisV2,
     type TokenGap
 } from './gap-detection.js';
-import type { BalanceSnapshot, BalanceChanges, TransactionInfo, TransferDetail, StakingBalanceChange, BalanceChangeRecord } from './balance-tracker.js';
+import type { BalanceSnapshot, BalanceChanges, TransactionInfo, TransferDetail, BalanceChangeRecord } from './balance-tracker.js';
 import { createBalanceChangeRecords, detectTokenGaps } from './balance-tracker.js';
 import type { TransactionBlock } from './nearblocks-api.js';
 import type { IntentsTransactionBlock } from './intents-explorer-api.js';
@@ -354,9 +355,11 @@ function mergeAndDeduplicateRecords(
 }
 
 /**
- * Discover staking pools from transaction transfers
- * Looks for transfers to contracts that match staking pool patterns
- * (e.g., deposit_and_stake, unstake, withdraw operations)
+ * Discover staking pools and their active ranges from V2 records.
+ * Sources (in order of priority):
+ * 1. Staking pool records (token_id matches pool pattern) — direct pool balance history
+ * 2. NEAR records with staking pool counterparties — deposit/withdrawal transfers
+ * 3. history.stakingPools array — fallback from stored metadata
  */
 interface StakingPoolRange {
     pool: string;
@@ -365,63 +368,67 @@ interface StakingPoolRange {
 }
 
 function discoverStakingPoolsWithRanges(history: AccountHistory): StakingPoolRange[] {
-    const poolData = new Map<string, { deposits: number[], withdrawals: number[] }>();
+    const poolData = new Map<string, { firstBlock: number, lastBlock: number, lastWithdrawalBlock: number | null }>();
+    const records = history.records || [];
 
-    // Method names for deposits vs withdrawals
-    const depositMethods = ['deposit_and_stake', 'stake'];
-    const withdrawMethods = ['unstake', 'unstake_all', 'withdraw_all', 'withdraw'];
+    // Source 1: Staking pool records (token_id is a staking pool)
+    for (const record of records) {
+        if (!isStakingPool(record.token_id)) continue;
+        const pool = record.token_id;
 
-    // Sort transactions by block
-    const sortedTxs = [...history.transactions].sort((a, b) => a.block - b.block);
+        if (!poolData.has(pool)) {
+            poolData.set(pool, { firstBlock: record.block_height, lastBlock: record.block_height, lastWithdrawalBlock: null });
+        }
+        const data = poolData.get(pool)!;
+        data.firstBlock = Math.min(data.firstBlock, record.block_height);
+        data.lastBlock = Math.max(data.lastBlock, record.block_height);
+    }
 
-    for (const tx of sortedTxs) {
-        if (!tx.transfers) continue;
+    // Source 2: NEAR records with staking pool counterparties
+    for (const record of records) {
+        if (record.token_id !== 'near' || !record.counterparty) continue;
+        if (!isStakingPool(record.counterparty)) continue;
+        const pool = record.counterparty;
 
-        for (const transfer of tx.transfers) {
-            const counterparty = transfer.counterparty;
-            if (!counterparty) continue;
+        if (!poolData.has(pool)) {
+            poolData.set(pool, { firstBlock: record.block_height, lastBlock: record.block_height, lastWithdrawalBlock: null });
+        }
+        const data = poolData.get(pool)!;
+        data.firstBlock = Math.min(data.firstBlock, record.block_height);
+        data.lastBlock = Math.max(data.lastBlock, record.block_height);
 
-            if (!isStakingPool(counterparty)) continue;
-            
-            if (!poolData.has(counterparty)) {
-                poolData.set(counterparty, { deposits: [], withdrawals: [] });
-            }
-            
-            const data = poolData.get(counterparty)!;
-            
-            // Determine if this is a deposit or withdrawal based on direction and method
-            if (transfer.direction === 'out') {
-                // Outgoing NEAR to pool = deposit
-                const isDeposit = !transfer.memo || depositMethods.includes(transfer.memo);
-                if (isDeposit) {
-                    data.deposits.push(tx.block);
-                }
-            } else if (transfer.direction === 'in') {
-                // Incoming NEAR from pool = withdrawal
-                data.withdrawals.push(tx.block);
+        // Positive NEAR amount from a pool = withdrawal (incoming NEAR)
+        if (BigInt(record.amount) > 0n) {
+            data.lastWithdrawalBlock = data.lastWithdrawalBlock
+                ? Math.max(data.lastWithdrawalBlock, record.block_height)
+                : record.block_height;
+        }
+    }
+
+    // Source 3: Fallback to stakingPools array from history metadata
+    if (poolData.size === 0 && history.stakingPools && history.stakingPools.length > 0) {
+        for (const pool of history.stakingPools) {
+            const poolRecords = records.filter(r => r.token_id === pool);
+            if (poolRecords.length > 0) {
+                const blocks = poolRecords.map(r => r.block_height);
+                poolData.set(pool, {
+                    firstBlock: Math.min(...blocks),
+                    lastBlock: Math.max(...blocks),
+                    lastWithdrawalBlock: null
+                });
             }
         }
     }
-    
+
     const result: StakingPoolRange[] = [];
-    
     for (const [pool, data] of poolData) {
-        if (data.deposits.length === 0) continue;
-        
-        const firstDepositBlock = Math.min(...data.deposits);
-        // Last withdrawal is the latest block where we received NEAR from the pool
-        // This might not be a "full withdrawal" - we'll check the balance to confirm
-        const lastWithdrawalBlock = data.withdrawals.length > 0 
-            ? Math.max(...data.withdrawals) 
-            : null;
-        
         result.push({
             pool,
-            firstDepositBlock,
-            lastWithdrawalBlock
+            firstDepositBlock: data.firstBlock,
+            lastWithdrawalBlock: data.lastWithdrawalBlock
         });
     }
-    
+
     return result;
 }
 
@@ -681,58 +688,50 @@ export async function collectStakingRewards(
     }
 
     // Find all staking balance changes at epoch boundaries for each pool's active range
-    let allChanges: StakingBalanceChange[] = [];
-    let updatedExistingEntries = 0;
+    if (!history.records) history.records = [];
 
-    // Cache queried balances to avoid redundant RPC calls
-    const queriedBalances = new Map<string, Record<string, string>>(); // key: `${block}`, value: { pool -> balance }
-
-    // Build a map of existing staking data by block and pool
-    const existingStakingData = new Map<string, Set<string>>();
-    for (const tx of history.transactions) {
-        if (tx.balanceAfter?.stakingPools) {
-            for (const pool of Object.keys(tx.balanceAfter.stakingPools)) {
-                const key = `${tx.block}:${pool}`;
-                if (!existingStakingData.has(key)) {
-                    existingStakingData.set(key, new Set());
-                }
-                existingStakingData.get(key)!.add(pool);
-            }
+    // Build a set of existing staking data by block and pool from V2 records
+    const existingStakingData = new Set<string>();
+    for (const record of history.records) {
+        if (isStakingPool(record.token_id)) {
+            existingStakingData.add(`${record.block_height}:${record.token_id}`);
         }
     }
-    
+
+    let addedCount = 0;
+
     for (const range of activeRanges) {
         console.log(`\nChecking staking balance changes for ${range.pool}...`);
         console.log(`  Block range: ${range.startBlock} - ${range.endBlock}`);
-        
+
         // Calculate which epoch boundaries need to be checked
         const firstEpochBoundary = Math.ceil(range.startBlock / EPOCH_LENGTH) * EPOCH_LENGTH;
         const epochBoundaries: number[] = [];
-        
+
         for (let block = firstEpochBoundary; block <= range.endBlock; block += EPOCH_LENGTH) {
             const key = `${block}:${range.pool}`;
             if (!existingStakingData.has(key)) {
                 epochBoundaries.push(block);
             }
         }
-        
+
         // Note: We intentionally do NOT check the "final block" if it's not at an epoch boundary.
         // Staking rewards only accrue at epoch boundaries (every 43200 blocks / ~12 hours).
         // Checking non-epoch blocks during frequent sync cycles would create redundant entries
         // since the balance won't have changed from rewards within an incomplete epoch.
         // Withdrawal transactions are captured separately as regular transfers.
-        
+
         const totalEpochs = Math.ceil((range.endBlock - firstEpochBoundary) / EPOCH_LENGTH);
         const alreadyChecked = totalEpochs - epochBoundaries.length;
         if (alreadyChecked > 0) {
             console.log(`  Skipping ${alreadyChecked} epoch(s) with existing staking data`);
         }
-        
+
         if (epochBoundaries.length === 0) {
             console.log('  All epochs already have staking data');
             continue;
         }
-        
+
         // Limit epochs to check if maxEpochsToCheck is set (for incremental sync)
         const epochsToCheck = maxEpochsToCheck && maxEpochsToCheck < epochBoundaries.length
             ? epochBoundaries.slice(0, maxEpochsToCheck)
@@ -757,161 +756,47 @@ export async function collectStakingRewards(
             console.log(`    Checking epoch ${i + 1}/${epochsToCheck.length} at block ${block}...`);
 
             const currentBalances = await getStakingPoolBalances(accountId, block, [range.pool]);
+            const currentBalance = currentBalances[range.pool] || '0';
 
-            // Cache the queried balance for later reuse
-            const blockKey = block.toString();
-            if (!queriedBalances.has(blockKey)) {
-                queriedBalances.set(blockKey, {});
-            }
-            Object.assign(queriedBalances.get(blockKey)!, currentBalances);
+            // Fetch block timestamp
+            const blockTimestamp = await getBlockTimestamp(block);
+            const timestampStr = blockTimestamp
+                ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString()
+                : null;
 
-            const currentBalance = BigInt(currentBalances[range.pool] || '0');
-
-            // Update existing entry if this block already exists in history
-            const existingEntry = history.transactions.find(tx => tx.block === block);
-            const poolBalance = currentBalances[range.pool];
-            if (existingEntry && poolBalance !== undefined) {
-                // Add the newly queried pool balance to the existing entry
-                if (!existingEntry.balanceAfter) {
-                    existingEntry.balanceAfter = {
-                        near: '0',
-                        fungibleTokens: {},
-                        intentsTokens: {},
-                        stakingPools: {}
-                    };
-                }
-                if (!existingEntry.balanceAfter.stakingPools) {
-                    existingEntry.balanceAfter.stakingPools = {};
-                }
-                existingEntry.balanceAfter.stakingPools[range.pool] = poolBalance;
-
-                // Also update balanceBefore if it exists
-                if (existingEntry.balanceBefore) {
-                    if (!existingEntry.balanceBefore.stakingPools) {
-                        existingEntry.balanceBefore.stakingPools = {};
-                    }
-                    // Get balance from previous block to populate balanceBefore
-                    const prevBlockBalances = await getStakingPoolBalances(accountId, block - 1, [range.pool]);
-                    const prevPoolBalance = prevBlockBalances[range.pool];
-                    if (prevPoolBalance !== undefined) {
-                        existingEntry.balanceBefore.stakingPools[range.pool] = prevPoolBalance;
-                    }
-                }
-
-                updatedExistingEntries++;
-            }
-
-            // Always create a snapshot entry at each epoch boundary
-            // Snapshots have amount=0 and balance_before=balance_after
-            // Gap detection will identify missing rewards between snapshots
-            allChanges.push({
-                block,
-                pool: range.pool,
-                startBalance: currentBalance.toString(),  // Snapshot: balance at this point
-                endBalance: currentBalance.toString(),    // Same value for snapshots
-                diff: '0'                                 // No change in a snapshot
+            // Create V2 snapshot record directly
+            history.records.push({
+                block_height: block,
+                block_timestamp: timestampStr,
+                tx_hash: null,
+                tx_block: null,
+                signer_id: null,
+                receiver_id: null,
+                predecessor_id: null,
+                token_id: range.pool,
+                receipt_id: null,
+                counterparty: range.pool,
+                amount: '0',
+                balance_before: currentBalance,
+                balance_after: currentBalance
             });
+            addedCount++;
+
+            // Save periodically
+            if (addedCount % 10 === 0) {
+                saveHistoryAfterRepair(history, outputFile);
+                console.log(`  Added ${addedCount} staking snapshots...`);
+            }
         }
     }
-    
-    // Save if we updated existing entries
-    if (updatedExistingEntries > 0) {
-        console.log(`Updated ${updatedExistingEntries} existing entries with new pool data`);
-        history.updatedAt = new Date().toISOString();
-        saveHistory(outputFile, history);
-    }
 
-    if (allChanges.length === 0) {
+    if (addedCount === 0) {
         console.log('No new staking snapshots to create');
         return 0;
     }
 
-    console.log(`\nCreating ${allChanges.length} staking snapshot(s)...`);
-
-    // Filter out snapshots that already exist in history (avoid duplicates)
-    const existingBlocks = new Set(history.transactions.map(tx => tx.block));
-    const newSnapshots = allChanges.filter(change => !existingBlocks.has(change.block));
-
-    if (newSnapshots.length === 0) {
-        console.log('All epoch boundaries already have staking data');
-        return 0;
-    }
-
-    // Create snapshot entries for each epoch boundary
-    // Snapshots record the balance at a point in time (amount=0, balance_before=balance_after)
-    // Gap detection will identify where actual rewards occurred between snapshots
-    let addedCount = 0;
-    for (const snapshot of newSnapshots) {
-        if (getStopSignal()) {
-            break;
-        }
-
-        // Get cached balance (already queried above)
-        const blockKey = snapshot.block.toString();
-        const cachedBalance = queriedBalances.get(blockKey);
-
-        // For snapshots, balance_before = balance_after (no change at this exact block)
-        const snapshotBalances: Record<string, string> = cachedBalance && cachedBalance[snapshot.pool]
-            ? { [snapshot.pool]: cachedBalance[snapshot.pool]! }
-            : { [snapshot.pool]: snapshot.endBalance };
-
-        // Fetch block timestamp
-        const blockTimestamp = await getBlockTimestamp(snapshot.block);
-
-        // Create the snapshot entry
-        // Snapshots are synthetic entries that record balance at epoch boundaries
-        // They have amount=0 and balance_before=balance_after
-        const entry: TransactionEntry = {
-            block: snapshot.block,
-            transactionBlock: null, // Synthetic entry, no transaction block
-            timestamp: blockTimestamp,
-            transactionHashes: [], // No actual transaction
-            transactions: [], // No actual transaction
-            transfers: [], // No transfers in a snapshot
-            balanceBefore: {
-                near: '0', // Not tracked for staking-only entries
-                fungibleTokens: {},
-                intentsTokens: {},
-                stakingPools: snapshotBalances  // Same as balanceAfter for snapshots
-            },
-            balanceAfter: {
-                near: '0',
-                fungibleTokens: {},
-                intentsTokens: {},
-                stakingPools: snapshotBalances
-            },
-            changes: {
-                nearChanged: false,
-                tokensChanged: {},
-                intentsChanged: {},
-                stakingChanged: {
-                    [snapshot.pool]: {
-                        start: snapshot.startBalance,   // Same as end for snapshots
-                        end: snapshot.endBalance,
-                        diff: '0'                       // No change in a snapshot
-                    }
-                }
-            }
-        };
-
-        history.transactions.push(entry);
-        addedCount++;
-
-        // Save periodically
-        if (addedCount % 10 === 0) {
-            history.updatedAt = new Date().toISOString();
-            history.metadata.totalTransactions = history.transactions.length;
-            saveHistory(outputFile, history);
-            console.log(`  Added ${addedCount} staking snapshots...`);
-        }
-    }
-
-    // Final sort and save
-    history.transactions.sort((a, b) => b.block - a.block); // Sort descending by block
-    history.updatedAt = new Date().toISOString();
-    history.metadata.totalTransactions = history.transactions.length;
-    saveHistory(outputFile, history);
-
+    // Final save
+    saveHistoryAfterRepair(history, outputFile);
     console.log(`Created ${addedCount} staking snapshot(s)`);
     return addedCount;
 }
@@ -2476,6 +2361,17 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         }
 
         // -----------------------------------------------------------------------------
+        // PHASE 2b: Create weekly balance snapshots if lastBlock is still behind
+        // -----------------------------------------------------------------------------
+        if (!getStopSignal()) {
+            const updatedLastBlock = history.metadata.lastBlock || 0;
+            if (currentBlock - updatedLastBlock > WEEKLY_SNAPSHOT_INTERVAL) {
+                console.log(`\n=== Phase 2b: Creating weekly balance snapshots ===`);
+                await createWeeklySnapshots(accountId, history, outputFile, updatedLastBlock + 1, currentBlock);
+            }
+        }
+
+        // -----------------------------------------------------------------------------
         // PHASE 3: Look for old data (before firstBlock) - "gap to creation"
         // Skip for V2-only files (no transaction-based gap analysis available)
         // -----------------------------------------------------------------------------
@@ -2668,6 +2564,198 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
 }
 
 /**
+ * Calculate weekly boundary block numbers aligned to fixed multiples of WEEKLY_SNAPSHOT_INTERVAL.
+ */
+function getWeeklyBoundaryBlocks(startBlock: number, endBlock: number): number[] {
+    const boundaries: number[] = [];
+    const firstBoundary = Math.ceil(startBlock / WEEKLY_SNAPSHOT_INTERVAL) * WEEKLY_SNAPSHOT_INTERVAL;
+    for (let block = firstBoundary; block <= endBlock; block += WEEKLY_SNAPSHOT_INTERVAL) {
+        boundaries.push(block);
+    }
+    return boundaries;
+}
+
+/**
+ * Extract known non-staking token IDs from existing records.
+ * Returns NEAR tracking flag, FT contract addresses, and intents token IDs.
+ * Staking pools are excluded since they already have epoch boundary records.
+ */
+function getKnownNonStakingTokens(records: BalanceChangeRecord[]): {
+    nearTracked: boolean;
+    ftContracts: string[];
+    intentsTokens: string[];
+} {
+    const tokenIds = new Set(records.map(r => r.token_id));
+    const nearTracked = tokenIds.has('near');
+
+    const ftContracts: string[] = [];
+    const intentsTokens: string[] = [];
+
+    for (const tokenId of tokenIds) {
+        if (tokenId === 'near') continue;
+        if (isStakingPool(tokenId)) continue;
+        if (tokenId.startsWith('nep141:')) {
+            intentsTokens.push(tokenId);
+        } else {
+            ftContracts.push(tokenId);
+        }
+    }
+
+    return { nearTracked, ftContracts, intentsTokens };
+}
+
+/**
+ * Create weekly balance snapshot records for periods with no activity.
+ * Snapshots confirm balances haven't changed and advance metadata.lastBlock.
+ * Only covers non-staking tokens (NEAR, FT, intents) — staking pools
+ * already have epoch boundary records.
+ */
+async function createWeeklySnapshots(
+    accountId: string,
+    history: AccountHistory,
+    outputFile: string,
+    startBlock: number,
+    endBlock: number
+): Promise<number> {
+    const boundaries = getWeeklyBoundaryBlocks(startBlock, endBlock);
+    if (boundaries.length === 0) return 0;
+
+    const allRecords = [
+        ...(history.records || []),
+        ...convertToRecords(history.transactions)
+    ];
+    const knownTokens = getKnownNonStakingTokens(allRecords);
+    if (!knownTokens.nearTracked && knownTokens.ftContracts.length === 0 && knownTokens.intentsTokens.length === 0) {
+        return 0;
+    }
+
+    // Filter out boundaries that already have snapshot records
+    const existingSnapshotBlocks = new Set(
+        allRecords
+            .filter(r => r.tx_hash === null && r.amount === '0')
+            .map(r => r.block_height)
+    );
+    const maxSnapshotsPerCycle = 10;
+    const newBoundaries = boundaries
+        .filter(b => !existingSnapshotBlocks.has(b))
+        .slice(0, maxSnapshotsPerCycle);
+    if (newBoundaries.length === 0) return 0;
+
+    let snapshotsCreated = 0;
+    if (!history.records) history.records = [];
+
+    for (const boundaryBlock of newBoundaries) {
+        if (getStopSignal()) break;
+
+        try {
+            const snapshot = await getAllBalances(
+                accountId,
+                boundaryBlock,
+                knownTokens.ftContracts.length > 0 ? knownTokens.ftContracts : null,
+                knownTokens.intentsTokens.length > 0 ? knownTokens.intentsTokens : null,
+                knownTokens.nearTracked,
+                null  // No staking pools
+            );
+
+            const blockTimestamp = await getBlockTimestamp(boundaryBlock);
+            const timestampStr = blockTimestamp
+                ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString()
+                : null;
+
+            let recordsAtBoundary = 0;
+
+            // NEAR snapshot
+            if (knownTokens.nearTracked && BigInt(snapshot.near || '0') > 0n) {
+                history.records.push({
+                    block_height: boundaryBlock,
+                    block_timestamp: timestampStr,
+                    tx_hash: null,
+                    tx_block: null,
+                    signer_id: null,
+                    receiver_id: null,
+                    predecessor_id: null,
+                    token_id: 'near',
+                    receipt_id: null,
+                    counterparty: null,
+                    amount: '0',
+                    balance_before: snapshot.near,
+                    balance_after: snapshot.near
+                });
+                recordsAtBoundary++;
+            }
+
+            // FT snapshots
+            for (const contract of knownTokens.ftContracts) {
+                const balance = snapshot.fungibleTokens?.[contract] || '0';
+                if (BigInt(balance) > 0n) {
+                    history.records.push({
+                        block_height: boundaryBlock,
+                        block_timestamp: timestampStr,
+                        tx_hash: null,
+                        tx_block: null,
+                        signer_id: null,
+                        receiver_id: null,
+                        predecessor_id: null,
+                        token_id: contract,
+                        receipt_id: null,
+                        counterparty: null,
+                        amount: '0',
+                        balance_before: balance,
+                        balance_after: balance
+                    });
+                    recordsAtBoundary++;
+                }
+            }
+
+            // Intents token snapshots
+            for (const tokenId of knownTokens.intentsTokens) {
+                const balance = snapshot.intentsTokens?.[tokenId] || '0';
+                if (BigInt(balance) > 0n) {
+                    history.records.push({
+                        block_height: boundaryBlock,
+                        block_timestamp: timestampStr,
+                        tx_hash: null,
+                        tx_block: null,
+                        signer_id: null,
+                        receiver_id: null,
+                        predecessor_id: null,
+                        token_id: tokenId,
+                        receipt_id: null,
+                        counterparty: null,
+                        amount: '0',
+                        balance_before: balance,
+                        balance_after: balance
+                    });
+                    recordsAtBoundary++;
+                }
+            }
+
+            if (recordsAtBoundary > 0) {
+                snapshotsCreated += recordsAtBoundary;
+                console.log(`    Snapshot at block ${boundaryBlock}: ${recordsAtBoundary} token(s)`);
+            }
+        } catch (error: any) {
+            if (error.message?.includes('rate limit') || error.message?.includes('cancelled')) {
+                break;
+            }
+            console.warn(`    Warning: could not create snapshot at block ${boundaryBlock}: ${error.message}`);
+        }
+    }
+
+    if (snapshotsCreated > 0) {
+        // Update lastBlock to the highest snapshot boundary
+        const highestBoundary = newBoundaries[Math.min(newBoundaries.length, maxSnapshotsPerCycle) - 1]!;
+        if (highestBoundary > (history.metadata.lastBlock || 0)) {
+            history.metadata.lastBlock = highestBoundary;
+        }
+        saveHistory(outputFile, history);
+        console.log(`    Created ${snapshotsCreated} weekly snapshot record(s)`);
+    }
+
+    return snapshotsCreated;
+}
+
+/**
  * Binary search for transactions in a block range.
  * Returns the number of transactions found and added.
  */
@@ -2744,11 +2832,16 @@ async function searchForTransactions(
         }
         
         if (!balanceChange.hasChanges || !balanceChange.block) {
+            // Create weekly snapshots for the scanned range (forward only)
+            if (direction === 'forward') {
+                await createWeeklySnapshots(accountId, history, outputFile, currentStart, currentEnd);
+            }
+
             // No changes found - expand range
             if (currentRangeSize < maxRangeSize) {
                 currentRangeSize = Math.min(currentRangeSize * 2, maxRangeSize);
             }
-            
+
             if (direction === 'backward') {
                 currentEnd = currentStart - 1;
                 currentStart = Math.max(0, currentEnd - currentRangeSize);
@@ -2766,7 +2859,7 @@ async function searchForTransactions(
                     break;
                 }
             }
-            
+
             saveHistory(outputFile, history);
             continue;
         }
