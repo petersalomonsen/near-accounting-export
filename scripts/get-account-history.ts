@@ -743,6 +743,19 @@ export async function collectStakingRewards(
 
         console.log(`  Checking ${epochsToCheck.length} epoch(s) without existing data`);
 
+        // Determine previous balance from the last existing staking record for this pool
+        const existingPoolRecords = history.records
+            .filter(r => r.token_id === range.pool)
+            .sort((a, b) => a.block_height - b.block_height);
+
+        // Find the record just before the first epoch to check
+        let prevBalance: string | null = null;
+        for (const rec of existingPoolRecords) {
+            if (epochsToCheck.length > 0 && rec.block_height < epochsToCheck[0]!) {
+                prevBalance = rec.balance_after;
+            }
+        }
+
         for (let i = 0; i < epochsToCheck.length; i++) {
             if (getStopSignal()) {
                 throw new Error('Operation cancelled by user');
@@ -758,13 +771,26 @@ export async function collectStakingRewards(
             const currentBalances = await getStakingPoolBalances(accountId, block, [range.pool]);
             const currentBalance = currentBalances[range.pool] || '0';
 
+            // Compute reward amount by comparing with previous balance
+            let balanceBefore: string;
+            let amount: string;
+            if (prevBalance !== null) {
+                balanceBefore = prevBalance;
+                const diff = BigInt(currentBalance) - BigInt(prevBalance);
+                amount = diff.toString();
+            } else {
+                // First snapshot - no previous balance to compare with
+                balanceBefore = currentBalance;
+                amount = '0';
+            }
+
             // Fetch block timestamp
             const blockTimestamp = await getBlockTimestamp(block);
             const timestampStr = blockTimestamp
                 ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString()
                 : null;
 
-            // Create V2 snapshot record directly
+            // Create V2 record with proper balance tracking
             history.records.push({
                 block_height: block,
                 block_timestamp: timestampStr,
@@ -776,11 +802,12 @@ export async function collectStakingRewards(
                 token_id: range.pool,
                 receipt_id: null,
                 counterparty: range.pool,
-                amount: '0',
-                balance_before: currentBalance,
+                amount: amount,
+                balance_before: balanceBefore,
                 balance_after: currentBalance
             });
             addedCount++;
+            prevBalance = currentBalance;
 
             // Save periodically
             if (addedCount % 10 === 0) {
@@ -915,7 +942,31 @@ export async function fillStakingGapsV2(
             }
 
             if (epochBoundaries.length === 0) {
-                // No epoch boundaries in gap - nothing to fill
+                // No intermediate epoch boundaries (single-epoch gap).
+                // The reward happened between the two consecutive records.
+                // Create a correction record at the later block to capture the balance change.
+                const balanceDiff = BigInt(gap.actualBalance) - BigInt(gap.expectedBalance);
+                if (balanceDiff > 0n) {
+                    const blockTimestamp = await getBlockTimestamp(gap.toBlock);
+                    const record: BalanceChangeRecord = {
+                        block_height: gap.toBlock,
+                        block_timestamp: blockTimestamp ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString() : null,
+                        tx_hash: null,
+                        tx_block: null,
+                        signer_id: null,
+                        receiver_id: null,
+                        predecessor_id: null,
+                        token_id: pool,
+                        receipt_id: null,
+                        counterparty: pool,
+                        amount: balanceDiff.toString(),
+                        balance_before: gap.expectedBalance,
+                        balance_after: gap.actualBalance
+                    };
+                    history.records!.push(record);
+                    totalRewardsAdded++;
+                    console.log(`    Fixed single-epoch gap at block ${gap.toBlock}: reward ${balanceDiff.toString()}`);
+                }
                 continue;
             }
 
