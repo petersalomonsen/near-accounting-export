@@ -558,6 +558,46 @@ async function runStakingPipeline(
 }
 
 /**
+ * Binary search to find the exact block where a staking pool balance changed.
+ * Returns the first block where the balance differs from expectedBalance,
+ * or null if no change point was found.
+ */
+async function findStakingBalanceChangeBlock(
+    accountId: string,
+    pool: string,
+    fromBlock: number,
+    toBlock: number,
+    expectedBalance: string
+): Promise<number | null> {
+    let low = fromBlock + 1;  // fromBlock already has expectedBalance
+    let high = toBlock;
+
+    while (low < high) {
+        if (getStopSignal()) return null;
+        const mid = Math.floor((low + high) / 2);
+        const balances = await getStakingPoolBalances(accountId, mid, [pool]);
+        const balance = balances[pool] || '0';
+
+        if (balance === expectedBalance) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    if (low > fromBlock + 1 || low <= toBlock) {
+        // Verify the found block actually has a different balance
+        const balances = await getStakingPoolBalances(accountId, low, [pool]);
+        const balance = balances[pool] || '0';
+        if (balance !== expectedBalance) {
+            return low;
+        }
+    }
+
+    return null;
+}
+
+/**
  * Creates synthetic transaction entries for staking balance changes at epoch boundaries
  * Only checks epochs where staking was active (between first deposit and full withdrawal)
  */
@@ -743,16 +783,18 @@ export async function collectStakingRewards(
 
         console.log(`  Checking ${epochsToCheck.length} epoch(s) without existing data`);
 
-        // Determine previous balance from the last existing staking record for this pool
+        // Determine previous balance and block from the last existing staking record for this pool
         const existingPoolRecords = history.records
             .filter(r => r.token_id === range.pool)
             .sort((a, b) => a.block_height - b.block_height);
 
         // Find the record just before the first epoch to check
         let prevBalance: string | null = null;
+        let prevBlock: number = range.startBlock;
         for (const rec of existingPoolRecords) {
             if (epochsToCheck.length > 0 && rec.block_height < epochsToCheck[0]!) {
                 prevBalance = rec.balance_after;
+                prevBlock = rec.block_height;
             }
         }
 
@@ -784,6 +826,99 @@ export async function collectStakingRewards(
                 amount = '0';
             }
 
+            // Detect deposits/withdrawals: if the balance change is much larger than
+            // a typical staking reward, it likely includes a deposit or withdrawal.
+            // Typical rewards are < 0.1% of stake per epoch. A change > 1% is suspicious.
+            const ONE_NEAR = 1_000_000_000_000_000_000_000_000n;
+            const diffBigInt = BigInt(currentBalance) - BigInt(prevBalance || '0');
+            const absDiff = diffBigInt < 0n ? -diffBigInt : diffBigInt;
+            const prevBalBigInt = BigInt(prevBalance || '0');
+            const depositThreshold = prevBalBigInt > 0n
+                ? (prevBalBigInt / 100n > ONE_NEAR ? prevBalBigInt / 100n : ONE_NEAR)
+                : ONE_NEAR;
+
+            if (prevBalance !== null && absDiff > depositThreshold && prevBlock < block) {
+                // Likely a deposit or withdrawal - find the exact transaction
+                const changeBlock = await findStakingBalanceChangeBlock(
+                    accountId, range.pool, prevBlock, block, prevBalance
+                );
+
+                if (changeBlock !== null && changeBlock !== block) {
+                    // Get balance before and after the deposit/withdrawal
+                    const balBeforeChange = (await getStakingPoolBalances(accountId, changeBlock - 1, [range.pool]))[range.pool] || '0';
+                    const balAfterChange = (await getStakingPoolBalances(accountId, changeBlock, [range.pool]))[range.pool] || '0';
+                    const changeAmount = BigInt(balAfterChange) - BigInt(balBeforeChange);
+                    const absChangeAmount = changeAmount < 0n ? -changeAmount : changeAmount;
+
+                    // Only split if the deposit/withdrawal amount is significant
+                    // (skip if the binary search landed on a block with no actual balance change)
+                    if (absChangeAmount > depositThreshold) {
+                    // Find a nearby NEAR record to link the tx_hash
+                    const nearRecord = history.records.find(r =>
+                        r.token_id === 'near' &&
+                        Math.abs(r.block_height - changeBlock) <= 2
+                    );
+
+                    const changeBlockTimestamp = await getBlockTimestamp(changeBlock);
+                    const changeTimestampStr = changeBlockTimestamp
+                        ? new Date(Math.floor(changeBlockTimestamp / 1_000_000)).toISOString()
+                        : null;
+
+                    // Create the deposit/withdrawal record at the actual transaction block
+                    history.records.push({
+                        block_height: changeBlock,
+                        block_timestamp: changeTimestampStr,
+                        tx_hash: nearRecord?.tx_hash || null,
+                        tx_block: nearRecord?.tx_block || null,
+                        signer_id: nearRecord?.signer_id || null,
+                        receiver_id: nearRecord?.receiver_id || null,
+                        predecessor_id: nearRecord?.predecessor_id || null,
+                        token_id: range.pool,
+                        receipt_id: nearRecord?.receipt_id || null,
+                        counterparty: range.pool,
+                        amount: changeAmount.toString(),
+                        balance_before: balBeforeChange,
+                        balance_after: balAfterChange
+                    });
+                    addedCount++;
+                    existingStakingData.add(`${changeBlock}:${range.pool}`);
+                    console.log(`      Found deposit/withdrawal at block ${changeBlock}: ${changeAmount.toString()}${nearRecord?.tx_hash ? ` (tx: ${nearRecord.tx_hash})` : ''}`);
+
+                    // Now create the epoch boundary record with just the reward since the deposit
+                    const rewardSinceChange = BigInt(currentBalance) - BigInt(balAfterChange);
+                    const epochBlockTimestamp = await getBlockTimestamp(block);
+                    const epochTimestampStr = epochBlockTimestamp
+                        ? new Date(Math.floor(epochBlockTimestamp / 1_000_000)).toISOString()
+                        : null;
+
+                    history.records.push({
+                        block_height: block,
+                        block_timestamp: epochTimestampStr,
+                        tx_hash: null,
+                        tx_block: null,
+                        signer_id: null,
+                        receiver_id: null,
+                        predecessor_id: null,
+                        token_id: range.pool,
+                        receipt_id: null,
+                        counterparty: range.pool,
+                        amount: rewardSinceChange.toString(),
+                        balance_before: balAfterChange,
+                        balance_after: currentBalance
+                    });
+                    addedCount++;
+                    prevBalance = currentBalance;
+                    prevBlock = block;
+
+                    if (addedCount % 10 === 0) {
+                        saveHistoryAfterRepair(history, outputFile);
+                        console.log(`  Added ${addedCount} staking snapshots...`);
+                    }
+                    continue;  // Skip the normal record creation below
+                    }  // absChangeAmount > depositThreshold
+                }  // changeBlock !== null
+            }
+
             // Fetch block timestamp
             const blockTimestamp = await getBlockTimestamp(block);
             const timestampStr = blockTimestamp
@@ -808,6 +943,7 @@ export async function collectStakingRewards(
             });
             addedCount++;
             prevBalance = currentBalance;
+            prevBlock = block;
 
             // Save periodically
             if (addedCount % 10 === 0) {
@@ -1023,6 +1159,137 @@ export async function fillStakingGapsV2(
     }
 
     return totalRewardsAdded;
+}
+
+/**
+ * Repair staking records that look like deposits/withdrawals but have tx_hash=null.
+ * These occur when collectStakingRewards() captures a deposit as an epoch boundary snapshot.
+ *
+ * For each suspicious record (tx_hash=null with amount > threshold), this function:
+ * 1. Binary searches to find the exact block where the balance changed
+ * 2. Links the tx_hash from a nearby NEAR record
+ * 3. Splits the record into a deposit record (with tx_hash) and a reward record
+ */
+export async function repairStakingDepositsWithoutTxHash(
+    accountId: string,
+    history: AccountHistory,
+    outputFile: string
+): Promise<number> {
+    if (!history.records || history.records.length === 0) {
+        return 0;
+    }
+
+    const ONE_NEAR = 1_000_000_000_000_000_000_000_000n;
+
+    // Find staking records with tx_hash=null and large amounts (likely deposits)
+    const stakingRecords = history.records.filter(r =>
+        isStakingPool(r.token_id) && r.tx_hash === null
+    );
+
+    // Sort by token_id and block_height to find consecutive pairs
+    const byPool = new Map<string, BalanceChangeRecord[]>();
+    for (const record of stakingRecords) {
+        if (!byPool.has(record.token_id)) {
+            byPool.set(record.token_id, []);
+        }
+        byPool.get(record.token_id)!.push(record);
+    }
+
+    let totalFixed = 0;
+
+    for (const [pool, records] of byPool) {
+        const sorted = records.sort((a, b) => a.block_height - b.block_height);
+
+        for (const record of sorted) {
+            const amountBigInt = BigInt(record.amount);
+            const absDiff = amountBigInt < 0n ? -amountBigInt : amountBigInt;
+            const balBeforeBigInt = BigInt(record.balance_before);
+            const threshold = balBeforeBigInt > 0n
+                ? (balBeforeBigInt / 100n > ONE_NEAR ? balBeforeBigInt / 100n : ONE_NEAR)
+                : ONE_NEAR;
+
+            if (absDiff <= threshold) {
+                continue;  // Normal reward, skip
+            }
+
+            // Find the previous record for this pool to get the search range
+            const allPoolRecords = history.records
+                .filter(r => r.token_id === pool)
+                .sort((a, b) => a.block_height - b.block_height);
+            const idx = allPoolRecords.findIndex(r => r === record);
+            const prevRecord = idx > 0 ? allPoolRecords[idx - 1] : null;
+            const fromBlock = prevRecord ? prevRecord.block_height : record.block_height - EPOCH_LENGTH;
+
+            if (fromBlock >= record.block_height) continue;
+
+            // Binary search for the exact deposit block
+            const changeBlock = await findStakingBalanceChangeBlock(
+                accountId, pool, fromBlock, record.block_height, record.balance_before
+            );
+
+            if (changeBlock === null || changeBlock === record.block_height) {
+                continue;  // Can't find the deposit block, or it IS the epoch boundary
+            }
+
+            // Get balance before and after the deposit
+            const balBeforeChange = (await getStakingPoolBalances(accountId, changeBlock - 1, [pool]))[pool] || '0';
+            const balAfterChange = (await getStakingPoolBalances(accountId, changeBlock, [pool]))[pool] || '0';
+            const changeAmount = BigInt(balAfterChange) - BigInt(balBeforeChange);
+            const absChangeAmount = changeAmount < 0n ? -changeAmount : changeAmount;
+
+            // Only repair if the deposit amount is actually significant
+            if (absChangeAmount <= threshold) {
+                continue;
+            }
+
+            // Find a nearby NEAR record for the tx_hash
+            const nearRecord = history.records.find(r =>
+                r.token_id === 'near' &&
+                Math.abs(r.block_height - changeBlock) <= 2
+            );
+
+            const changeBlockTimestamp = await getBlockTimestamp(changeBlock);
+            const changeTimestampStr = changeBlockTimestamp
+                ? new Date(Math.floor(changeBlockTimestamp / 1_000_000)).toISOString()
+                : null;
+
+            // Create the deposit record at the actual transaction block
+            history.records.push({
+                block_height: changeBlock,
+                block_timestamp: changeTimestampStr,
+                tx_hash: nearRecord?.tx_hash || null,
+                tx_block: nearRecord?.tx_block || null,
+                signer_id: nearRecord?.signer_id || null,
+                receiver_id: nearRecord?.receiver_id || null,
+                predecessor_id: nearRecord?.predecessor_id || null,
+                token_id: pool,
+                receipt_id: nearRecord?.receipt_id || null,
+                counterparty: pool,
+                amount: changeAmount.toString(),
+                balance_before: balBeforeChange,
+                balance_after: balAfterChange
+            });
+
+            // Update the existing epoch boundary record to only show the reward since deposit
+            const rewardSinceChange = BigInt(record.balance_after) - BigInt(balAfterChange);
+            record.amount = rewardSinceChange.toString();
+            record.balance_before = balAfterChange;
+
+            totalFixed++;
+            console.log(`  Repaired ${pool} at block ${record.block_height}: split deposit at block ${changeBlock} (${changeAmount.toString()})${nearRecord?.tx_hash ? ` tx: ${nearRecord.tx_hash}` : ''}`);
+
+            if (getStopSignal()) break;
+        }
+
+        if (getStopSignal()) break;
+    }
+
+    if (totalFixed > 0) {
+        saveHistoryAfterRepair(history, outputFile);
+        console.log(`Repaired ${totalFixed} staking deposit(s) without tx_hash`);
+    }
+
+    return totalFixed;
 }
 
 /**

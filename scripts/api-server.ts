@@ -13,7 +13,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances, repairMissingStakingRecordsV2, repairInvalidStakingRewards } from './get-account-history.js';
+import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances, repairMissingStakingRecordsV2, repairInvalidStakingRewards, repairStakingDepositsWithoutTxHash } from './get-account-history.js';
 import { convertJsonToCsv } from './json-to-csv.js';
 import { callViewFunction } from './rpc.js';
 import { detectGapsV2 } from './gap-detection.js';
@@ -1291,6 +1291,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
                 (accountId, data, filePath) => repairMissingStakingRecordsV2(accountId, data as any, filePath));
             await forEachV2AccountFile('Invalid staking rewards repair',
                 (_accountId, data, filePath) => repairInvalidStakingRewards(data as any, filePath));
+            await forEachV2AccountFile('Staking deposits without tx_hash repair',
+                (accountId, data, filePath) => repairStakingDepositsWithoutTxHash(accountId, data as any, filePath));
         })().catch(err => {
             console.error('Error during startup repairs:', err);
         });
