@@ -107,6 +107,9 @@ export interface BalanceChangeRecord {
 // Mainnet epoch length in blocks (roughly 12 hours)
 export const EPOCH_LENGTH = 43200;
 
+// Weekly snapshot interval in blocks (~1 week, 1 block/sec)
+export const WEEKLY_SNAPSHOT_INTERVAL = 604800;
+
 // Canonical staking pool pattern matcher
 const STAKING_POOL_PATTERNS = [
     /\.poolv1\.near$/,
