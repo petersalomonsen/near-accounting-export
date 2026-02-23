@@ -76,7 +76,7 @@ export interface StakingBalanceChange {
  * Per-token balance change record - the core data structure for accounting.
  * Each record represents a single token balance change at a specific block.
  *
- * This is the flat output format described in BALANCE-DISCOVERY-FLOW.md.
+ * This is the flat output format described in docs/balance-discovery-flow.md.
  * Benefits:
  * - One row per token change (easy CSV export, SQL, spreadsheets)
  * - No nested objects to parse
