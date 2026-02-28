@@ -213,6 +213,74 @@ export async function viewAccount(
 }
 
 /**
+ * View contract code at a specific block.
+ * Returns the WASM binary as a base64-encoded string.
+ * Retries with adjacent blocks if the block is not found (skipped block).
+ */
+export interface ContractCodeView {
+    code_base64?: string;   // Raw RPC field name
+    codeBase64?: string;    // SDK may camelCase it
+    hash?: string;
+}
+
+export async function viewContractCode(
+    contractId: string,
+    blockId: number | string
+): Promise<ContractCodeView> {
+    if (stopSignal) {
+        throw new Error('Operation cancelled by user');
+    }
+
+    // For numeric block IDs, retry with adjacent blocks if not found
+    if (typeof blockId === 'number') {
+        let currentBlock = blockId;
+        let lastError: any = null;
+
+        for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+                return await wrapRpcCall(() =>
+                    query(getClient(), {
+                        requestType: 'view_code',
+                        accountId: contractId,
+                        blockId: currentBlock,
+                        finality: undefined
+                    }) as unknown as Promise<ContractCodeView>
+                );
+            } catch (error: any) {
+                lastError = error;
+                if (isUnknownBlockError(error)) {
+                    console.warn(`Block ${currentBlock} not found for view_code ${contractId}, trying block ${currentBlock - 1}`);
+                    currentBlock--;
+                } else if (isAccountNotFoundError(error)) {
+                    throw new Error(`Contract ${contractId} does not exist at block ${blockId}`);
+                } else {
+                    console.error(`RPC error in viewContractCode for ${contractId} at block ${blockId}:`, error.message);
+                    throw error;
+                }
+            }
+        }
+
+        console.error(`RPC error in viewContractCode for ${contractId} at block ${blockId}: Could not find valid block after 5 attempts`);
+        throw lastError || new Error(`Could not find valid block near ${blockId}`);
+    }
+
+    // For string block IDs (like 'final'), just do a single attempt
+    try {
+        return await wrapRpcCall(() =>
+            query(getClient(), {
+                requestType: 'view_code',
+                accountId: contractId,
+                blockId: blockId,
+                finality: blockId === 'final' ? 'final' : undefined
+            }) as unknown as Promise<ContractCodeView>
+        );
+    } catch (error: any) {
+        console.error(`RPC error in viewContractCode for ${contractId} at block ${blockId}:`, error.message);
+        throw error;
+    }
+}
+
+/**
  * Call a view function on a contract
  * Retries with adjacent blocks if the block is not found (skipped block)
  */
