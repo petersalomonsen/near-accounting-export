@@ -15,7 +15,8 @@ import {
     getStopSignal,
     fetchNeardataBlock,
     fetchBlockData,
-    getBlockTimestamp
+    getBlockTimestamp,
+    callViewFunction
 } from './rpc.js';
 import {
     findLatestBalanceChangingBlock,
@@ -685,6 +686,7 @@ export async function collectStakingRewards(
     const poolRanges = discovery.stakingPools;
 
     // Store discovered FT contracts (dual-interface like meta-pool.near)
+    // and create an immediate balance snapshot for any that lack records
     if (discovery.discoveredFtContracts.length > 0) {
         if (!history.discoveredFtContracts) history.discoveredFtContracts = [];
         for (const ft of discovery.discoveredFtContracts) {
@@ -693,6 +695,46 @@ export async function collectStakingRewards(
             }
         }
         console.log(`\nDiscovered FT contracts (dual-interface): ${discovery.discoveredFtContracts.join(', ')}`);
+
+        // Find discovered FTs that have no records yet
+        const existingFtTokenIds = new Set(history.records?.map(r => r.token_id) || []);
+        const ftsMissingRecords = history.discoveredFtContracts.filter(ft => !existingFtTokenIds.has(ft));
+
+        if (ftsMissingRecords.length > 0) {
+            if (!history.records) history.records = [];
+            const snapshotBlock = endBlockLimit || await getCurrentBlockHeight();
+            const blockTimestamp = await getBlockTimestamp(snapshotBlock);
+            const timestampStr = blockTimestamp
+                ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString()
+                : null;
+
+            for (const ft of ftsMissingRecords) {
+                try {
+                    const balance = await callViewFunction(ft, 'ft_balance_of', { account_id: accountId }, snapshotBlock) as string;
+                    if (balance && BigInt(balance) > 0n) {
+                        history.records.push({
+                            block_height: snapshotBlock,
+                            block_timestamp: timestampStr,
+                            tx_hash: null,
+                            tx_block: null,
+                            signer_id: null,
+                            receiver_id: null,
+                            predecessor_id: null,
+                            token_id: ft,
+                            receipt_id: null,
+                            counterparty: null,
+                            amount: '0',
+                            balance_before: balance,
+                            balance_after: balance
+                        });
+                        console.log(`    Created initial snapshot for ${ft}: balance=${balance}`);
+                    }
+                } catch {
+                    // ft_balance_of failed — skip
+                }
+            }
+            saveHistory(outputFile, history);
+        }
     }
 
     if (poolRanges.length === 0) {
