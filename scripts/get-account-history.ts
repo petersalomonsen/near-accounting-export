@@ -32,7 +32,8 @@ import {
     normalizeBalanceSnapshots,
     isStakingPool,
     EPOCH_LENGTH,
-    WEEKLY_SNAPSHOT_INTERVAL
+    WEEKLY_SNAPSHOT_INTERVAL,
+    filterRecordsByToken
 } from './balance-tracker.js';
 import {
     getAllTransactionBlocks,
@@ -604,6 +605,206 @@ export async function enrichWithStakingPoolBalances(
 }
 
 /**
+ * Backfill historical balance records for discovered FT contracts.
+ * When a new FT is discovered with a non-zero balance, this searches backward
+ * to find when the balance was first acquired and creates records for all changes.
+ */
+async function backfillDiscoveredFtHistory(
+    accountId: string,
+    history: AccountHistory,
+    outputFile: string
+): Promise<number> {
+    if (!history.discoveredFtContracts || history.discoveredFtContracts.length === 0) {
+        return 0;
+    }
+    if (!history.records || history.records.length === 0) {
+        return 0;
+    }
+
+    const MAX_ITERATIONS = 20;
+    let totalRecordsAdded = 0;
+
+    for (const ftContract of history.discoveredFtContracts) {
+        if (getStopSignal()) break;
+
+        // Get existing records for this FT
+        const ftRecords = filterRecordsByToken(history.records, ftContract);
+        if (ftRecords.length === 0) continue;
+
+        // Sort by block height ascending and check if earliest has non-zero balance_before
+        const sorted = [...ftRecords].sort((a, b) => a.block_height - b.block_height);
+        const earliest = sorted[0]!;
+
+        if (earliest.balance_before === '0') {
+            // Already have full history for this FT
+            continue;
+        }
+
+        // Determine search range: from account's first known block to the earliest FT record
+        const searchStart = history.metadata?.firstBlock || 0;
+        const searchEnd = earliest.block_height - 1;
+
+        if (searchEnd <= searchStart) continue;
+
+        console.log(`\n  Backfilling ${ftContract}: searching blocks ${searchStart.toLocaleString()} - ${searchEnd.toLocaleString()}`);
+
+        let currentSearchEnd = searchEnd;
+        let iterations = 0;
+
+        while (iterations < MAX_ITERATIONS && !getStopSignal()) {
+            if (currentSearchEnd <= searchStart) {
+                console.log(`    Reached account start — backfill complete`);
+                break;
+            }
+
+            let balanceChange;
+            try {
+                balanceChange = await findLatestBalanceChangingBlock(
+                    accountId,
+                    searchStart,
+                    currentSearchEnd,
+                    [ftContract],  // Only search for this FT
+                    null,          // No intents tokens
+                    false          // Don't check NEAR
+                );
+            } catch (error: any) {
+                if (error.message.includes('rate limit') || error.message.includes('cancelled')) {
+                    console.log(`    Rate limited — saving progress`);
+                    saveHistory(outputFile, history);
+                    break;
+                }
+                if (error.message.includes('does not exist')) {
+                    console.log(`    Account didn't exist — backfill complete`);
+                    break;
+                }
+                throw error;
+            }
+
+            if (!balanceChange.hasChanges || !balanceChange.block) {
+                console.log(`    No more changes found — backfill complete`);
+                break;
+            }
+
+            // Extract FT balance before and after the change
+            const ftBalanceBefore = balanceChange.startBalance?.fungibleTokens?.[ftContract] || '0';
+            const ftBalanceAfter = balanceChange.endBalance?.fungibleTokens?.[ftContract] || '0';
+
+            if (ftBalanceBefore === ftBalanceAfter) {
+                // The binary search found a change in another asset (shouldn't happen with filter, but be safe)
+                currentSearchEnd = balanceChange.block - 1;
+                iterations++;
+                continue;
+            }
+
+            const amount = (BigInt(ftBalanceAfter) - BigInt(ftBalanceBefore)).toString();
+            const blockTimestamp = await getBlockTimestamp(balanceChange.block);
+            const timestampStr = blockTimestamp
+                ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString()
+                : null;
+
+            const record: BalanceChangeRecord = {
+                block_height: balanceChange.block,
+                block_timestamp: timestampStr,
+                tx_hash: null,
+                tx_block: null,
+                signer_id: null,
+                receiver_id: null,
+                predecessor_id: null,
+                token_id: ftContract,
+                receipt_id: null,
+                counterparty: null,
+                amount,
+                balance_before: ftBalanceBefore,
+                balance_after: ftBalanceAfter
+            };
+
+            history.records.push(record);
+            totalRecordsAdded++;
+            console.log(`    Found change at block ${balanceChange.block.toLocaleString()}: ${ftBalanceBefore} → ${ftBalanceAfter}`);
+
+            saveHistory(outputFile, history);
+
+            // If balance_before is '0', we've found the initial acquisition
+            if (ftBalanceBefore === '0') {
+                console.log(`    Found initial acquisition — backfill complete`);
+                break;
+            }
+
+            // Continue searching earlier
+            currentSearchEnd = balanceChange.block - 1;
+            iterations++;
+        }
+
+        // After backfill, fill any intermediate gaps
+        if (totalRecordsAdded > 0 && !getStopSignal()) {
+            const updatedFtRecords = filterRecordsByToken(history.records, ftContract);
+            const gaps = detectTokenGaps(updatedFtRecords);
+            const ftGaps = gaps.filter(g => g.token_id === ftContract);
+
+            if (ftGaps.length > 0) {
+                console.log(`    Found ${ftGaps.length} intermediate gap(s) — filling...`);
+                for (const gap of ftGaps) {
+                    if (getStopSignal()) break;
+
+                    let gapChange;
+                    try {
+                        gapChange = await findLatestBalanceChangingBlock(
+                            accountId,
+                            gap.from_block,
+                            gap.to_block,
+                            [ftContract],
+                            null,
+                            false
+                        );
+                    } catch {
+                        continue;
+                    }
+
+                    if (gapChange.hasChanges && gapChange.block) {
+                        const gapFtBefore = gapChange.startBalance?.fungibleTokens?.[ftContract] || '0';
+                        const gapFtAfter = gapChange.endBalance?.fungibleTokens?.[ftContract] || '0';
+                        if (gapFtBefore !== gapFtAfter) {
+                            const gapAmount = (BigInt(gapFtAfter) - BigInt(gapFtBefore)).toString();
+                            const gapTimestamp = await getBlockTimestamp(gapChange.block);
+                            const gapTimestampStr = gapTimestamp
+                                ? new Date(Math.floor(gapTimestamp / 1_000_000)).toISOString()
+                                : null;
+
+                            history.records.push({
+                                block_height: gapChange.block,
+                                block_timestamp: gapTimestampStr,
+                                tx_hash: null,
+                                tx_block: null,
+                                signer_id: null,
+                                receiver_id: null,
+                                predecessor_id: null,
+                                token_id: ftContract,
+                                receipt_id: null,
+                                counterparty: null,
+                                amount: gapAmount,
+                                balance_before: gapFtBefore,
+                                balance_after: gapFtAfter
+                            });
+                            totalRecordsAdded++;
+                            console.log(`    Filled gap at block ${gapChange.block.toLocaleString()}: ${gapFtBefore} → ${gapFtAfter}`);
+                        }
+                    }
+                }
+                if (totalRecordsAdded > 0) {
+                    saveHistory(outputFile, history);
+                }
+            }
+        }
+    }
+
+    if (totalRecordsAdded > 0) {
+        console.log(`\n  Backfilled ${totalRecordsAdded} FT record(s) total`);
+    }
+
+    return totalRecordsAdded;
+}
+
+/**
  * Collect staking reward entries between transactions
  * Run the full staking repair pipeline:
  * 1. collectStakingRewards - epoch boundary snapshots
@@ -735,6 +936,9 @@ export async function collectStakingRewards(
             }
             saveHistory(outputFile, history);
         }
+
+        // Backfill historical records for discovered FTs
+        await backfillDiscoveredFtHistory(accountId, history, outputFile);
     }
 
     if (poolRanges.length === 0) {
