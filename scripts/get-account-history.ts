@@ -830,6 +830,12 @@ async function runStakingPipeline(
     if (gapsFilled > 0) {
         console.log(`\nFilled ${gapsFilled} staking gap(s) with binary search`);
     }
+
+    // Fix any records with null timestamps (e.g. from missing epoch boundary blocks)
+    const timestampsRepaired = await repairNullTimestamps(history, outputFile);
+    if (timestampsRepaired > 0) {
+        console.log(`\nRepaired ${timestampsRepaired} null timestamp(s)`);
+    }
 }
 
 /**
@@ -1830,6 +1836,52 @@ export function repairInvalidStakingRewards(
     }
 
     return removedCount;
+}
+
+/**
+ * Repair records with null block_timestamp by fetching the timestamp from the RPC.
+ * Records with null timestamps cause downstream bugs (e.g. dates resolving to 1970-01-01).
+ */
+export async function repairNullTimestamps(
+    history: AccountHistory,
+    outputFile: string
+): Promise<number> {
+    if (!history.records || history.records.length === 0) {
+        return 0;
+    }
+
+    const nullTimestampRecords = history.records.filter(r => r.block_timestamp === null);
+    if (nullTimestampRecords.length === 0) {
+        return 0;
+    }
+
+    // Deduplicate block heights to minimize RPC calls
+    const uniqueBlocks = [...new Set(nullTimestampRecords.map(r => r.block_height))];
+    const timestampCache = new Map<number, string | null>();
+
+    for (const block of uniqueBlocks) {
+        if (getStopSignal()) break;
+        const ts = await getBlockTimestamp(block);
+        if (ts) {
+            timestampCache.set(block, new Date(Math.floor(ts / 1_000_000)).toISOString());
+        }
+    }
+
+    let repaired = 0;
+    for (const record of nullTimestampRecords) {
+        const ts = timestampCache.get(record.block_height);
+        if (ts) {
+            record.block_timestamp = ts;
+            repaired++;
+        }
+    }
+
+    if (repaired > 0) {
+        saveHistoryAfterRepair(history, outputFile);
+        console.log(`Repaired ${repaired} record(s) with null timestamps`);
+    }
+
+    return repaired;
 }
 
 /**

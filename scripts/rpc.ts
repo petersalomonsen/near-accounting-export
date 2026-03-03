@@ -365,15 +365,30 @@ export async function getBlockTimestamp(blockHeight: number): Promise<number | n
         throw new Error('Operation cancelled by user');
     }
 
-    try {
-        const blockData = await wrapRpcCall(() =>
-            getBlock(getClient(), { blockId: blockHeight })
-        );
-        return blockData.header?.timestamp || null;
-    } catch (error: any) {
-        console.warn(`Could not fetch timestamp for block ${blockHeight}: ${error.message}`);
-        return null;
+    // Try the exact block, then search backward (balance was captured at or before this block)
+    const offsets = [0, -1, -2, -3, -4];
+    for (const offset of offsets) {
+        const tryBlock = blockHeight + offset;
+        if (tryBlock < 0) continue;
+        try {
+            const blockData = await wrapRpcCall(() =>
+                getBlock(getClient(), { blockId: tryBlock })
+            );
+            if (blockData.header?.timestamp) {
+                return blockData.header.timestamp;
+            }
+        } catch (error: any) {
+            if (isUnknownBlockError(error)) {
+                continue; // Try next offset
+            }
+            if (stopSignal) return null;
+            // For other errors (rate limit, network), don't try more offsets
+            console.warn(`Could not fetch timestamp for block ${blockHeight}: ${error.message}`);
+            return null;
+        }
     }
+    console.warn(`Could not fetch timestamp for block ${blockHeight}: block not found (tried offsets ${offsets.join(',')})`);
+    return null;
 }
 
 /**
