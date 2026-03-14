@@ -975,9 +975,21 @@ export async function collectStakingRewards(
             );
             
             if (BigInt(balanceAfterWithdrawal[range.pool] || '0') === 0n) {
-                // Full withdrawal - only check epochs up to the withdrawal
-                endBlock = range.lastWithdrawalBlock;
-                console.log(`  ${range.pool}: active from block ${range.firstDepositBlock} to ${endBlock} (fully withdrawn)`);
+                // Balance was 0 shortly after withdrawal — but check current block
+                // in case the account re-staked shortly after (unstake + re-deposit
+                // within the same transaction batch can create a brief zero-balance gap)
+                const currentBalance = await getStakingPoolBalances(
+                    accountId, currentBlockHeight, [range.pool]
+                );
+                if (BigInt(currentBalance[range.pool] || '0') > 0n) {
+                    // Re-staked after withdrawal — continue tracking
+                    endBlock = currentBlockHeight;
+                    console.log(`  ${range.pool}: active from block ${range.firstDepositBlock} to ${endBlock} (re-staked after withdrawal)`);
+                } else {
+                    // Full withdrawal - only check epochs up to the withdrawal
+                    endBlock = range.lastWithdrawalBlock;
+                    console.log(`  ${range.pool}: active from block ${range.firstDepositBlock} to ${endBlock} (fully withdrawn)`);
+                }
             } else {
                 // Partial withdrawal - still active, check to current block height
                 endBlock = currentBlockHeight;

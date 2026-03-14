@@ -164,4 +164,36 @@ describe('Staking Balance Tracking', () => {
             assert.ok(BigInt(stakingChange!.endBalance) > BigInt('999000000000000000000000000'));
         });
     });
+
+    describe('Unstake + re-stake in same transaction batch (neardevgov pool)', () => {
+        /**
+         * Regression test for: staking rewards lost after unstake + re-stake in same batch.
+         *
+         * petersalomonsen.near unstaked from neardevgov.poolv1.near at block 114812582,
+         * balance hit 0, then re-deposited 100 NEAR at block 114812640 (~57 blocks later).
+         * The old logic checked balance at lastWithdrawalBlock + 10 and saw 0, marking the
+         * pool as fully withdrawn — missing all subsequent staking rewards.
+         */
+        it('should show 0 balance at withdrawal block + 10 (the gap)', async () => {
+            const balances = await getStakingPoolBalances(
+                'petersalomonsen.near',
+                114812583 + 10, // lastWithdrawalBlock + 10
+                ['neardevgov.poolv1.near']
+            );
+            // Balance is 0 in the gap between unstake and re-deposit
+            assert.equal(balances['neardevgov.poolv1.near'], '0');
+        });
+
+        it('should show non-zero balance at a later block after re-stake', async () => {
+            const balances = await getStakingPoolBalances(
+                'petersalomonsen.near',
+                183000000,
+                ['neardevgov.poolv1.near']
+            );
+            const balance = BigInt(balances['neardevgov.poolv1.near'] || '0');
+            // Should have approximately 104-106 NEAR staked
+            assert.ok(balance > BigInt('100000000000000000000000000'),
+                `Expected > 100 NEAR staked, got ${balance}`);
+        });
+    });
 });
