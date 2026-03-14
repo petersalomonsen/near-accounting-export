@@ -141,6 +141,13 @@ Example: For the gap-filling issue at block 158500929, we created `test/integrat
 - Asserts that binary search SHOULD detect balance changes (fails until fixed)
 - Asserts that after filling, there should be NO gaps remaining
 
+## Documentation
+
+Architecture and design docs are in the `docs/` folder:
+- `docs/balance-tracking.md` - Dataset format, gap detection, orchestration
+- `docs/balance-discovery-flow.md` - Complete balance discovery and tracking flow
+- `docs/contract-type-detection.md` - WASM-based contract type detection design
+
 ## Contributing
 
 When adding new features:

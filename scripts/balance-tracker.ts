@@ -76,7 +76,7 @@ export interface StakingBalanceChange {
  * Per-token balance change record - the core data structure for accounting.
  * Each record represents a single token balance change at a specific block.
  *
- * This is the flat output format described in BALANCE-DISCOVERY-FLOW.md.
+ * This is the flat output format described in docs/balance-discovery-flow.md.
  * Benefits:
  * - One row per token change (easy CSV export, SQL, spreadsheets)
  * - No nested objects to parse
@@ -118,11 +118,30 @@ const STAKING_POOL_PATTERNS = [
 ];
 
 /**
- * Check if an account/token ID is a staking pool contract.
+ * Check if an account/token ID is a staking pool contract by name pattern.
  * Matches: *.poolv1.near, *.pool.near, *.poolv2.near
+ *
+ * This is a fast synchronous check. For contracts that don't match these patterns
+ * but may still implement the staking pool interface (e.g. meta-pool.near),
+ * use isStakingPoolAsync() which inspects the contract's WASM exports.
  */
 export function isStakingPool(id: string): boolean {
     return STAKING_POOL_PATTERNS.some(p => p.test(id));
+}
+
+/**
+ * Check if a contract implements the staking pool interface.
+ * Tries the fast regex check first, then falls back to WASM export inspection.
+ */
+export async function isStakingPoolAsync(id: string, blockId?: number | string): Promise<boolean> {
+    if (isStakingPool(id)) return true;
+    try {
+        const { getContractType } = await import('./contract-type.js');
+        const contractType = await getContractType(id, blockId || 'final');
+        return contractType.isStakingPool;
+    } catch {
+        return false;
+    }
 }
 
 // Contract creation blocks - skip querying contracts before they existed

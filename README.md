@@ -9,7 +9,7 @@ This project is written in **TypeScript** and uses the official **@near-js/jsonr
 - **API Server**: REST API for automatic data collection, account registration, and downloads (see [API.md](API.md))
 - **Binary Search Discovery**: Efficiently finds balance-changing transactions using binary search instead of scanning every block
 - **Gap Detection & Filling**: Automatically detects and fills gaps in transaction history where balance connectivity is broken
-- **Multiple Asset Types**: Tracks NEAR balance, fungible tokens (USDC, wNEAR, USDT, etc.), and NEAR Intents tokens
+- **Multiple Asset Types**: Tracks NEAR balance, fungible tokens (USDC, wNEAR, USDT, etc.), NEAR Intents tokens, and staking pool balances
 - **Resumable**: Save progress to file and continue from where you left off
 - **Bidirectional**: Search forward or backward in time
 - **Verification**: Verify transaction connectivity by checking that balance changes match between adjacent transactions
@@ -162,44 +162,40 @@ The script automatically:
 
 ## Output Format
 
-The output JSON file contains:
+The output JSON file uses a flat V2 format where each record represents a single token balance change:
 
 ```json
 {
+  "version": 2,
   "accountId": "myaccount.near",
   "createdAt": "2024-01-01T00:00:00.000Z",
   "updatedAt": "2024-01-01T00:01:00.000Z",
-  "transactions": [
-    {
-      "block": 123456789,
-      "timestamp": "1234567890000000000",
-      "transactionHashes": ["..."],
-      "transactions": [...],
-      "balanceBefore": {
-        "near": "1000000000000000000000000",
-        "fungibleTokens": {...},
-        "intentsTokens": {...}
-      },
-      "balanceAfter": {
-        "near": "900000000000000000000000",
-        "fungibleTokens": {...},
-        "intentsTokens": {...}
-      },
-      "changes": {
-        "nearChanged": true,
-        "nearDiff": "-100000000000000000000000",
-        "tokensChanged": {},
-        "intentsChanged": {}
-      }
-    }
-  ],
   "metadata": {
     "firstBlock": 123456700,
     "lastBlock": 123456789,
-    "totalTransactions": 10
-  }
+    "totalRecords": 42
+  },
+  "records": [
+    {
+      "block_height": 123456789,
+      "block_timestamp": "2024-01-15T12:00:00.000Z",
+      "tx_hash": "ABC123...",
+      "tx_block": 123456788,
+      "signer_id": "alice.near",
+      "receiver_id": "bob.near",
+      "predecessor_id": "alice.near",
+      "token_id": "near",
+      "receipt_id": "DEF456...",
+      "counterparty": "bob.near",
+      "amount": "-1000000000000000000000000",
+      "balance_before": "5000000000000000000000000",
+      "balance_after": "4000000000000000000000000"
+    }
+  ]
 }
 ```
+
+Each record tracks one token (`token_id`) at one block. The `token_id` can be `"near"`, an FT contract address (e.g., `"wrap.near"`), an intents token (e.g., `"nep141:wrap.near"`), or a staking pool address. See [docs/balance-tracking.md](docs/balance-tracking.md) for detailed format documentation.
 
 ## Testing
 

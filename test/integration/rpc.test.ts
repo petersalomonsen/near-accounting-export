@@ -12,6 +12,7 @@ import {
     fetchNeardataBlock,
     fetchBlockData,
     getTransactionStatusWithReceipts,
+    getBlockTimestamp,
     setStopSignal
 } from '../../scripts/rpc.js';
 
@@ -311,6 +312,23 @@ describe('RPC Fallback for Neardata.xyz', function() {
             'RPC should find FT events if neardata found them');
 
         console.log(`✓ Can extract FT events from RPC transaction logs`);
+    });
+
+    it('should get timestamp for a known existing block', async function() {
+        const timestamp = await getBlockTimestamp(TEST_BLOCK);
+        assert.ok(timestamp, 'Should return a timestamp for an existing block');
+        assert.ok(timestamp > 0, 'Timestamp should be positive');
+        console.log(`✓ Block ${TEST_BLOCK} timestamp: ${new Date(Math.floor(timestamp / 1_000_000)).toISOString()}`);
+    });
+
+    it('should get timestamp for an UNKNOWN_BLOCK by trying nearby blocks', async function() {
+        // Block 175608000 is a known missing/skipped block on the archival RPC
+        const MISSING_BLOCK = 175608000;
+        const timestamp = await getBlockTimestamp(MISSING_BLOCK);
+        assert.ok(timestamp, `Should return a timestamp even for missing block ${MISSING_BLOCK} by falling back to nearby blocks`);
+        assert.ok(timestamp > 0, 'Timestamp should be positive');
+        // The timestamp should be from a nearby block (within a few seconds of the missing block)
+        console.log(`✓ Missing block ${MISSING_BLOCK} resolved to timestamp: ${new Date(Math.floor(timestamp / 1_000_000)).toISOString()}`);
     });
 
     it('should use RPC fallback when neardata.xyz returns null', async function() {

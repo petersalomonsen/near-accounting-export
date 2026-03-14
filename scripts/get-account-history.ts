@@ -15,7 +15,8 @@ import {
     getStopSignal,
     fetchNeardataBlock,
     fetchBlockData,
-    getBlockTimestamp
+    getBlockTimestamp,
+    callViewFunction
 } from './rpc.js';
 import {
     findLatestBalanceChangingBlock,
@@ -31,7 +32,8 @@ import {
     normalizeBalanceSnapshots,
     isStakingPool,
     EPOCH_LENGTH,
-    WEEKLY_SNAPSHOT_INTERVAL
+    WEEKLY_SNAPSHOT_INTERVAL,
+    filterRecordsByToken
 } from './balance-tracker.js';
 import {
     getAllTransactionBlocks,
@@ -45,6 +47,7 @@ import {
     getAllPikespeakTransactionBlocks,
     isPikespeakAvailable
 } from './pikespeak-api.js';
+import { getContractType } from './contract-type.js';
 import {
     detectGaps,
     detectGapsV2,
@@ -115,6 +118,7 @@ interface AccountHistoryV2 {
     updatedAt: string;
     records: BalanceChangeRecord[];
     stakingPools?: string[];
+    discoveredFtContracts?: string[];
     metadata: {
         firstBlock: number | null;
         lastBlock: number | null;
@@ -131,6 +135,7 @@ interface AccountHistory {
     transactions: TransactionEntry[];  // Used during sync for block-level operations
     records?: BalanceChangeRecord[];    // V2 records (populated on save/load)
     stakingPools?: string[];
+    discoveredFtContracts?: string[];   // Dual-interface contracts tracked as FTs (e.g. meta-pool.near)
     metadata: {
         firstBlock: number | null;
         lastBlock: number | null;
@@ -247,6 +252,7 @@ function loadExistingHistory(filePath: string): AccountHistory | null {
                     transactions: [], // V2 doesn't have transactions, start fresh
                     records: parsed.records,
                     stakingPools: parsed.stakingPools,
+                    discoveredFtContracts: parsed.discoveredFtContracts,
                     metadata: {
                         firstBlock: parsed.metadata.firstBlock,
                         lastBlock: parsed.metadata.lastBlock,
@@ -302,6 +308,7 @@ function saveHistory(filePath: string, history: AccountHistory): void {
         updatedAt: history.updatedAt,
         records: allRecords,
         stakingPools: history.stakingPools,
+        discoveredFtContracts: history.discoveredFtContracts,
         metadata: {
             firstBlock,
             lastBlock,
@@ -360,6 +367,8 @@ function mergeAndDeduplicateRecords(
  * 1. Staking pool records (token_id matches pool pattern) — direct pool balance history
  * 2. NEAR records with staking pool counterparties — deposit/withdrawal transfers
  * 3. history.stakingPools array — fallback from stored metadata
+ * 4. WASM export inspection — counterparties not matched by regex are checked via getContractType()
+ *    Dual-interface contracts (staking + FT, e.g. meta-pool.near) are tracked as FTs, not staking pools.
  */
 interface StakingPoolRange {
     pool: string;
@@ -367,7 +376,12 @@ interface StakingPoolRange {
     lastWithdrawalBlock: number | null; // null if still has balance
 }
 
-function discoverStakingPoolsWithRanges(history: AccountHistory): StakingPoolRange[] {
+interface DiscoveryResult {
+    stakingPools: StakingPoolRange[];
+    discoveredFtContracts: string[];  // Dual-interface contracts tracked as FTs
+}
+
+async function discoverStakingPoolsWithRanges(history: AccountHistory): Promise<DiscoveryResult> {
     const poolData = new Map<string, { firstBlock: number, lastBlock: number, lastWithdrawalBlock: number | null }>();
     const records = history.records || [];
 
@@ -384,7 +398,7 @@ function discoverStakingPoolsWithRanges(history: AccountHistory): StakingPoolRan
         data.lastBlock = Math.max(data.lastBlock, record.block_height);
     }
 
-    // Source 2: NEAR records with staking pool counterparties
+    // Source 2: NEAR records with staking pool counterparties (regex match)
     for (const record of records) {
         if (record.token_id !== 'near' || !record.counterparty) continue;
         if (!isStakingPool(record.counterparty)) continue;
@@ -420,16 +434,73 @@ function discoverStakingPoolsWithRanges(history: AccountHistory): StakingPoolRan
         }
     }
 
-    const result: StakingPoolRange[] = [];
+    // Source 4: WASM export inspection for NEAR transfer counterparties not matched by regex
+    // Skip well-known non-contract accounts
+    const skipAccounts = new Set(['system', 'near', 'aurora']);
+    const uncheckedCounterparties = new Set<string>();
+    for (const record of records) {
+        if (record.token_id !== 'near' || !record.counterparty) continue;
+        if (isStakingPool(record.counterparty)) continue; // Already handled by Source 2
+        if (poolData.has(record.counterparty)) continue;  // Already discovered
+        if (skipAccounts.has(record.counterparty)) continue;
+        uncheckedCounterparties.add(record.counterparty);
+    }
+
+    const discoveredFtContracts: string[] = [];
+
+    if (uncheckedCounterparties.size > 0) {
+        console.log(`  Checking ${uncheckedCounterparties.size} NEAR transfer counterparties via WASM inspection...`);
+        let rateLimited = false;
+        for (const counterparty of uncheckedCounterparties) {
+            if (getStopSignal() || rateLimited) break;
+            try {
+                const contractType = await getContractType(counterparty);
+                if (contractType.isStakingPool && contractType.isFungibleToken) {
+                    // Dual-interface (e.g. meta-pool.near): track as FT, not staking pool.
+                    // The FT token (e.g. stNEAR) is the real asset; the staking balance
+                    // is just its NEAR value and would double-count.
+                    console.log(`    Found dual-interface contract (staking+FT) via WASM: ${counterparty} — tracking as FT`);
+                    discoveredFtContracts.push(counterparty);
+                } else if (contractType.isStakingPool) {
+                    console.log(`    Found staking pool via WASM: ${counterparty}`);
+                    // Gather block range from NEAR records with this counterparty
+                    for (const record of records) {
+                        if (record.token_id !== 'near' || record.counterparty !== counterparty) continue;
+                        if (!poolData.has(counterparty)) {
+                            poolData.set(counterparty, { firstBlock: record.block_height, lastBlock: record.block_height, lastWithdrawalBlock: null });
+                        }
+                        const data = poolData.get(counterparty)!;
+                        data.firstBlock = Math.min(data.firstBlock, record.block_height);
+                        data.lastBlock = Math.max(data.lastBlock, record.block_height);
+
+                        if (BigInt(record.amount) > 0n) {
+                            data.lastWithdrawalBlock = data.lastWithdrawalBlock
+                                ? Math.max(data.lastWithdrawalBlock, record.block_height)
+                                : record.block_height;
+                        }
+                    }
+                }
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (msg.includes('rate limit') || msg.includes('Rate limit') || msg.includes('-429')) {
+                    console.log(`    Rate limit hit during WASM inspection, stopping checks`);
+                    rateLimited = true;
+                }
+                // Other errors: contract may not exist or WASM download failed — skip silently
+            }
+        }
+    }
+
+    const stakingPools: StakingPoolRange[] = [];
     for (const [pool, data] of poolData) {
-        result.push({
+        stakingPools.push({
             pool,
             firstDepositBlock: data.firstBlock,
             lastWithdrawalBlock: data.lastWithdrawalBlock
         });
     }
 
-    return result;
+    return { stakingPools, discoveredFtContracts };
 }
 
 /**
@@ -437,15 +508,19 @@ function discoverStakingPoolsWithRanges(history: AccountHistory): StakingPoolRan
  */
 export async function enrichWithStakingPoolBalances(
     accountId: string,
-    entry: TransactionEntry
+    entry: TransactionEntry,
+    knownStakingPools?: string[]
 ): Promise<void> {
     if (!entry.transfers || entry.transfers.length === 0) {
         return;
     }
 
+    const knownSet = knownStakingPools ? new Set(knownStakingPools) : null;
+
     // Find staking pool transfers (deposits/withdrawals)
+    // Match by regex OR by known staking pools discovered via WASM inspection
     const stakingPools = entry.transfers
-        .filter(t => t.counterparty && isStakingPool(t.counterparty))
+        .filter(t => t.counterparty && (isStakingPool(t.counterparty) || knownSet?.has(t.counterparty)))
         .map(t => t.counterparty!)
         .filter((pool, index, self) => self.indexOf(pool) === index); // unique
 
@@ -530,6 +605,206 @@ export async function enrichWithStakingPoolBalances(
 }
 
 /**
+ * Backfill historical balance records for discovered FT contracts.
+ * When a new FT is discovered with a non-zero balance, this searches backward
+ * to find when the balance was first acquired and creates records for all changes.
+ */
+async function backfillDiscoveredFtHistory(
+    accountId: string,
+    history: AccountHistory,
+    outputFile: string
+): Promise<number> {
+    if (!history.discoveredFtContracts || history.discoveredFtContracts.length === 0) {
+        return 0;
+    }
+    if (!history.records || history.records.length === 0) {
+        return 0;
+    }
+
+    const MAX_ITERATIONS = 20;
+    let totalRecordsAdded = 0;
+
+    for (const ftContract of history.discoveredFtContracts) {
+        if (getStopSignal()) break;
+
+        // Get existing records for this FT
+        const ftRecords = filterRecordsByToken(history.records, ftContract);
+        if (ftRecords.length === 0) continue;
+
+        // Sort by block height ascending and check if earliest has non-zero balance_before
+        const sorted = [...ftRecords].sort((a, b) => a.block_height - b.block_height);
+        const earliest = sorted[0]!;
+
+        if (earliest.balance_before === '0') {
+            // Already have full history for this FT
+            continue;
+        }
+
+        // Determine search range: from account's first known block to the earliest FT record
+        const searchStart = history.metadata?.firstBlock || 0;
+        const searchEnd = earliest.block_height - 1;
+
+        if (searchEnd <= searchStart) continue;
+
+        console.log(`\n  Backfilling ${ftContract}: searching blocks ${searchStart.toLocaleString()} - ${searchEnd.toLocaleString()}`);
+
+        let currentSearchEnd = searchEnd;
+        let iterations = 0;
+
+        while (iterations < MAX_ITERATIONS && !getStopSignal()) {
+            if (currentSearchEnd <= searchStart) {
+                console.log(`    Reached account start — backfill complete`);
+                break;
+            }
+
+            let balanceChange;
+            try {
+                balanceChange = await findLatestBalanceChangingBlock(
+                    accountId,
+                    searchStart,
+                    currentSearchEnd,
+                    [ftContract],  // Only search for this FT
+                    null,          // No intents tokens
+                    false          // Don't check NEAR
+                );
+            } catch (error: any) {
+                if (error.message.includes('rate limit') || error.message.includes('cancelled')) {
+                    console.log(`    Rate limited — saving progress`);
+                    saveHistory(outputFile, history);
+                    break;
+                }
+                if (error.message.includes('does not exist')) {
+                    console.log(`    Account didn't exist — backfill complete`);
+                    break;
+                }
+                throw error;
+            }
+
+            if (!balanceChange.hasChanges || !balanceChange.block) {
+                console.log(`    No more changes found — backfill complete`);
+                break;
+            }
+
+            // Extract FT balance before and after the change
+            const ftBalanceBefore = balanceChange.startBalance?.fungibleTokens?.[ftContract] || '0';
+            const ftBalanceAfter = balanceChange.endBalance?.fungibleTokens?.[ftContract] || '0';
+
+            if (ftBalanceBefore === ftBalanceAfter) {
+                // The binary search found a change in another asset (shouldn't happen with filter, but be safe)
+                currentSearchEnd = balanceChange.block - 1;
+                iterations++;
+                continue;
+            }
+
+            const amount = (BigInt(ftBalanceAfter) - BigInt(ftBalanceBefore)).toString();
+            const blockTimestamp = await getBlockTimestamp(balanceChange.block);
+            const timestampStr = blockTimestamp
+                ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString()
+                : null;
+
+            const record: BalanceChangeRecord = {
+                block_height: balanceChange.block,
+                block_timestamp: timestampStr,
+                tx_hash: null,
+                tx_block: null,
+                signer_id: null,
+                receiver_id: null,
+                predecessor_id: null,
+                token_id: ftContract,
+                receipt_id: null,
+                counterparty: null,
+                amount,
+                balance_before: ftBalanceBefore,
+                balance_after: ftBalanceAfter
+            };
+
+            history.records.push(record);
+            totalRecordsAdded++;
+            console.log(`    Found change at block ${balanceChange.block.toLocaleString()}: ${ftBalanceBefore} → ${ftBalanceAfter}`);
+
+            saveHistory(outputFile, history);
+
+            // If balance_before is '0', we've found the initial acquisition
+            if (ftBalanceBefore === '0') {
+                console.log(`    Found initial acquisition — backfill complete`);
+                break;
+            }
+
+            // Continue searching earlier
+            currentSearchEnd = balanceChange.block - 1;
+            iterations++;
+        }
+
+        // After backfill, fill any intermediate gaps
+        if (totalRecordsAdded > 0 && !getStopSignal()) {
+            const updatedFtRecords = filterRecordsByToken(history.records, ftContract);
+            const gaps = detectTokenGaps(updatedFtRecords);
+            const ftGaps = gaps.filter(g => g.token_id === ftContract);
+
+            if (ftGaps.length > 0) {
+                console.log(`    Found ${ftGaps.length} intermediate gap(s) — filling...`);
+                for (const gap of ftGaps) {
+                    if (getStopSignal()) break;
+
+                    let gapChange;
+                    try {
+                        gapChange = await findLatestBalanceChangingBlock(
+                            accountId,
+                            gap.from_block,
+                            gap.to_block,
+                            [ftContract],
+                            null,
+                            false
+                        );
+                    } catch {
+                        continue;
+                    }
+
+                    if (gapChange.hasChanges && gapChange.block) {
+                        const gapFtBefore = gapChange.startBalance?.fungibleTokens?.[ftContract] || '0';
+                        const gapFtAfter = gapChange.endBalance?.fungibleTokens?.[ftContract] || '0';
+                        if (gapFtBefore !== gapFtAfter) {
+                            const gapAmount = (BigInt(gapFtAfter) - BigInt(gapFtBefore)).toString();
+                            const gapTimestamp = await getBlockTimestamp(gapChange.block);
+                            const gapTimestampStr = gapTimestamp
+                                ? new Date(Math.floor(gapTimestamp / 1_000_000)).toISOString()
+                                : null;
+
+                            history.records.push({
+                                block_height: gapChange.block,
+                                block_timestamp: gapTimestampStr,
+                                tx_hash: null,
+                                tx_block: null,
+                                signer_id: null,
+                                receiver_id: null,
+                                predecessor_id: null,
+                                token_id: ftContract,
+                                receipt_id: null,
+                                counterparty: null,
+                                amount: gapAmount,
+                                balance_before: gapFtBefore,
+                                balance_after: gapFtAfter
+                            });
+                            totalRecordsAdded++;
+                            console.log(`    Filled gap at block ${gapChange.block.toLocaleString()}: ${gapFtBefore} → ${gapFtAfter}`);
+                        }
+                    }
+                }
+                if (totalRecordsAdded > 0) {
+                    saveHistory(outputFile, history);
+                }
+            }
+        }
+    }
+
+    if (totalRecordsAdded > 0) {
+        console.log(`\n  Backfilled ${totalRecordsAdded} FT record(s) total`);
+    }
+
+    return totalRecordsAdded;
+}
+
+/**
  * Collect staking reward entries between transactions
  * Run the full staking repair pipeline:
  * 1. collectStakingRewards - epoch boundary snapshots
@@ -554,6 +829,12 @@ async function runStakingPipeline(
     const gapsFilled = await fillStakingGapsV2(accountId, history, outputFile);
     if (gapsFilled > 0) {
         console.log(`\nFilled ${gapsFilled} staking gap(s) with binary search`);
+    }
+
+    // Fix any records with null timestamps (e.g. from missing epoch boundary blocks)
+    const timestampsRepaired = await repairNullTimestamps(history, outputFile);
+    if (timestampsRepaired > 0) {
+        console.log(`\nRepaired ${timestampsRepaired} null timestamp(s)`);
     }
 }
 
@@ -608,13 +889,69 @@ export async function collectStakingRewards(
     maxEpochsToCheck?: number,
     endBlockLimit?: number
 ): Promise<number> {
-    const poolRanges = discoverStakingPoolsWithRanges(history);
-    
+    const discovery = await discoverStakingPoolsWithRanges(history);
+    const poolRanges = discovery.stakingPools;
+
+    // Store discovered FT contracts (dual-interface like meta-pool.near)
+    // and create an immediate balance snapshot for any that lack records
+    if (discovery.discoveredFtContracts.length > 0) {
+        if (!history.discoveredFtContracts) history.discoveredFtContracts = [];
+        for (const ft of discovery.discoveredFtContracts) {
+            if (!history.discoveredFtContracts.includes(ft)) {
+                history.discoveredFtContracts.push(ft);
+            }
+        }
+        console.log(`\nDiscovered FT contracts (dual-interface): ${discovery.discoveredFtContracts.join(', ')}`);
+
+        // Find discovered FTs that have no records yet
+        const existingFtTokenIds = new Set(history.records?.map(r => r.token_id) || []);
+        const ftsMissingRecords = history.discoveredFtContracts.filter(ft => !existingFtTokenIds.has(ft));
+
+        if (ftsMissingRecords.length > 0) {
+            if (!history.records) history.records = [];
+            const snapshotBlock = endBlockLimit || await getCurrentBlockHeight();
+            const blockTimestamp = await getBlockTimestamp(snapshotBlock);
+            const timestampStr = blockTimestamp
+                ? new Date(Math.floor(blockTimestamp / 1_000_000)).toISOString()
+                : null;
+
+            for (const ft of ftsMissingRecords) {
+                try {
+                    const balance = await callViewFunction(ft, 'ft_balance_of', { account_id: accountId }, snapshotBlock) as string;
+                    if (balance && BigInt(balance) > 0n) {
+                        history.records.push({
+                            block_height: snapshotBlock,
+                            block_timestamp: timestampStr,
+                            tx_hash: null,
+                            tx_block: null,
+                            signer_id: null,
+                            receiver_id: null,
+                            predecessor_id: null,
+                            token_id: ft,
+                            receipt_id: null,
+                            counterparty: null,
+                            amount: '0',
+                            balance_before: balance,
+                            balance_after: balance
+                        });
+                        console.log(`    Created initial snapshot for ${ft}: balance=${balance}`);
+                    }
+                } catch {
+                    // ft_balance_of failed — skip
+                }
+            }
+            saveHistory(outputFile, history);
+        }
+
+        // Backfill historical records for discovered FTs
+        await backfillDiscoveredFtHistory(accountId, history, outputFile);
+    }
+
     if (poolRanges.length === 0) {
         console.log('No staking pools discovered from transaction history');
         return 0;
     }
-    
+
     const stakingPools = poolRanges.map(r => r.pool);
     console.log(`\nDiscovered staking pools: ${stakingPools.join(', ')}`);
     history.stakingPools = stakingPools;
@@ -1502,6 +1839,52 @@ export function repairInvalidStakingRewards(
 }
 
 /**
+ * Repair records with null block_timestamp by fetching the timestamp from the RPC.
+ * Records with null timestamps cause downstream bugs (e.g. dates resolving to 1970-01-01).
+ */
+export async function repairNullTimestamps(
+    history: AccountHistory,
+    outputFile: string
+): Promise<number> {
+    if (!history.records || history.records.length === 0) {
+        return 0;
+    }
+
+    const nullTimestampRecords = history.records.filter(r => r.block_timestamp === null);
+    if (nullTimestampRecords.length === 0) {
+        return 0;
+    }
+
+    // Deduplicate block heights to minimize RPC calls
+    const uniqueBlocks = [...new Set(nullTimestampRecords.map(r => r.block_height))];
+    const timestampCache = new Map<number, string | null>();
+
+    for (const block of uniqueBlocks) {
+        if (getStopSignal()) break;
+        const ts = await getBlockTimestamp(block);
+        if (ts) {
+            timestampCache.set(block, new Date(Math.floor(ts / 1_000_000)).toISOString());
+        }
+    }
+
+    let repaired = 0;
+    for (const record of nullTimestampRecords) {
+        const ts = timestampCache.get(record.block_height);
+        if (ts) {
+            record.block_timestamp = ts;
+            repaired++;
+        }
+    }
+
+    if (repaired > 0) {
+        saveHistoryAfterRepair(history, outputFile);
+        console.log(`Repaired ${repaired} record(s) with null timestamps`);
+    }
+
+    return repaired;
+}
+
+/**
  * Verify that a transaction's balance changes match the expected changes
  */
 function verifyTransactionConnectivity(
@@ -1944,7 +2327,7 @@ async function processDiscoveredBlocks(
             };
 
             // Enrich with staking pool balances if this is a staking deposit/withdrawal
-            await enrichWithStakingPoolBalances(accountId, entry);
+            await enrichWithStakingPoolBalances(accountId, entry, history.stakingPools);
 
             // Add to history
             history.transactions.push(entry);
@@ -2178,7 +2561,7 @@ async function fillGapWithBinarySearch(
         };
 
         // Enrich with staking pool balances if this is a staking deposit/withdrawal
-        await enrichWithStakingPoolBalances(accountId, entry);
+        await enrichWithStakingPoolBalances(accountId, entry, history.stakingPools);
 
         history.transactions.push(entry);
         totalFound++;
@@ -2584,7 +2967,13 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
         
         // Early return if stakingOnly mode (only wanted staking rewards)
         if (stakingOnly) {
-            await runStakingPipeline(accountId, history, outputFile, options.maxEpochsToCheck, endBlock);
+            try {
+                await runStakingPipeline(accountId, history, outputFile, options.maxEpochsToCheck, endBlock);
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                console.error(`Staking pipeline error (partial results saved): ${msg}`);
+            }
+            saveHistory(outputFile, history);
             return history;
         }
 
@@ -2864,7 +3253,12 @@ export async function getAccountHistory(options: GetAccountHistoryOptions): Prom
     // ===================================================================================
     const hasData = history.transactions.length > 0 || (history.records && history.records.length > 0);
     if (!getStopSignal() && hasData) {
-        await runStakingPipeline(accountId, history, outputFile, options.maxEpochsToCheck, endBlock);
+        try {
+            await runStakingPipeline(accountId, history, outputFile, options.maxEpochsToCheck, endBlock);
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`Staking pipeline error (partial results saved): ${msg}`);
+        }
     }
 
     // Final sort and save
@@ -2898,7 +3292,7 @@ function getWeeklyBoundaryBlocks(startBlock: number, endBlock: number): number[]
  * Returns NEAR tracking flag, FT contract addresses, and intents token IDs.
  * Staking pools are excluded since they already have epoch boundary records.
  */
-function getKnownNonStakingTokens(records: BalanceChangeRecord[]): {
+function getKnownNonStakingTokens(records: BalanceChangeRecord[], additionalFtContracts?: string[]): {
     nearTracked: boolean;
     ftContracts: string[];
     intentsTokens: string[];
@@ -2916,6 +3310,15 @@ function getKnownNonStakingTokens(records: BalanceChangeRecord[]): {
             intentsTokens.push(tokenId);
         } else {
             ftContracts.push(tokenId);
+        }
+    }
+
+    // Include FT contracts discovered via WASM inspection (e.g. dual-interface like meta-pool.near)
+    if (additionalFtContracts) {
+        for (const ft of additionalFtContracts) {
+            if (!ftContracts.includes(ft)) {
+                ftContracts.push(ft);
+            }
         }
     }
 
@@ -2942,7 +3345,7 @@ async function createWeeklySnapshots(
         ...(history.records || []),
         ...convertToRecords(history.transactions)
     ];
-    const knownTokens = getKnownNonStakingTokens(allRecords);
+    const knownTokens = getKnownNonStakingTokens(allRecords, history.discoveredFtContracts);
     if (!knownTokens.nearTracked && knownTokens.ftContracts.length === 0 && knownTokens.intentsTokens.length === 0) {
         return 0;
     }
@@ -3222,7 +3625,7 @@ async function searchForTransactions(
         };
 
         // Enrich with staking pool balances if this is a staking deposit/withdrawal
-        await enrichWithStakingPoolBalances(accountId, entry);
+        await enrichWithStakingPoolBalances(accountId, entry, history.stakingPools);
 
         history.transactions.push(entry);
         transactionsFound++;
@@ -3409,10 +3812,11 @@ export async function reEnrichStakingPoolBalances(
             return false;
         }
 
-        // Get staking pools from transfers
+        // Get staking pools from transfers (regex match OR known from WASM inspection)
+        const knownSet = history.stakingPools ? new Set(history.stakingPools) : null;
         const stakingPoolsInTransfers = new Set(
             tx.transfers
-                .filter(t => t.counterparty && isStakingPool(t.counterparty))
+                .filter(t => t.counterparty && (isStakingPool(t.counterparty) || knownSet?.has(t.counterparty)))
                 .map(t => t.counterparty!)
         );
 
@@ -3454,7 +3858,7 @@ export async function reEnrichStakingPoolBalances(
             console.log(`[${accountId}] Re-enriching staking pool balances at block ${tx.block}...`);
 
             // Call the enrichment function
-            await enrichWithStakingPoolBalances(accountId, tx);
+            await enrichWithStakingPoolBalances(accountId, tx, history.stakingPools);
 
             enriched++;
 
