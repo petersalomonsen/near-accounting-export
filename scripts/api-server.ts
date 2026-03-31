@@ -36,9 +36,11 @@ const PAYMENT_CONFIG = {
 // Continuous sync configuration
 const SYNC_CONFIG = {
     batchSize: parseInt(process.env.BATCH_SIZE || '10', 10),
-    cycleDelayMs: parseInt(process.env.CYCLE_DELAY_MS || '30000', 10),
+    cycleDelayMs: parseInt(process.env.CYCLE_DELAY_MS || '60000', 10),  // 1 minute loop check interval
     maxEpochsPerCycle: parseInt(process.env.MAX_EPOCHS_PER_CYCLE || '50', 10),
-    accountTimeoutMs: parseInt(process.env.ACCOUNT_TIMEOUT_MS || '300000', 10) // 5 minutes default
+    accountTimeoutMs: parseInt(process.env.ACCOUNT_TIMEOUT_MS || '300000', 10), // 5 minutes default
+    completeAccountIntervalMs: parseInt(process.env.COMPLETE_ACCOUNT_INTERVAL_MS || '28800000', 10),    // 8 hours for complete accounts
+    incompleteAccountIntervalMs: parseInt(process.env.INCOMPLETE_ACCOUNT_INTERVAL_MS || '300000', 10),  // 5 min for accounts with gaps
 };
 
 // CORS configuration
@@ -536,43 +538,62 @@ export async function processAccountCycle(accountId: string): Promise<{ backward
 /**
  * Start the continuous sync loop
  */
+// Track last sync time per account to implement different polling intervals
+const lastSyncTime = new Map<string, number>();
+
 export async function startContinuousLoop(): Promise<void> {
     if (continuousSyncRunning) {
         console.log('Continuous sync loop is already running');
         return;
     }
-    
+
     continuousSyncRunning = true;
     continuousSyncShuttingDown = false;
     console.log(`Starting continuous sync loop`);
     console.log(`  Priority: Forward sync first (latest data), then backward sync (historical data)`);
     console.log(`  Batch size: ${SYNC_CONFIG.batchSize} transactions`);
     console.log(`  Cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms`);
+    console.log(`  Complete account interval: ${SYNC_CONFIG.completeAccountIntervalMs}ms (${(SYNC_CONFIG.completeAccountIntervalMs / 3600000).toFixed(1)}h)`);
+    console.log(`  Incomplete account interval: ${SYNC_CONFIG.incompleteAccountIntervalMs}ms (${(SYNC_CONFIG.incompleteAccountIntervalMs / 60000).toFixed(1)}min)`);
     console.log(`  Max epochs/cycle: ${SYNC_CONFIG.maxEpochsPerCycle}`);
     console.log(`  Account timeout: ${SYNC_CONFIG.accountTimeoutMs}ms`);
-    
+
     while (!continuousSyncShuttingDown) {
         try {
             const accountsDb = loadAccounts();
             const accounts = Object.values(accountsDb.accounts);
-            
-            console.log(`\n=== Starting sync cycle for ${accounts.length} registered account(s) ===`);
-            
+            const now = Date.now();
+
             let processedCount = 0;
             let skippedCount = 0;
-            
+            let deferredCount = 0;
+
             for (const account of accounts) {
                 if (continuousSyncShuttingDown) {
                     console.log('Shutdown signal received, stopping sync loop');
                     break;
                 }
-                
+
                 // Check payment validity
                 if (!isPaymentValid(account)) {
-                    console.log(`Skipping ${account.accountId} - payment expired or missing`);
                     skippedCount++;
                     continue;
                 }
+
+                // Determine sync interval based on history completeness
+                const historyFile = loadAccountHistoryFile(account.accountId);
+                const historyComplete = historyFile?.metadata?.historyComplete === true;
+                const interval = historyComplete
+                    ? SYNC_CONFIG.completeAccountIntervalMs
+                    : SYNC_CONFIG.incompleteAccountIntervalMs;
+
+                const lastSync = lastSyncTime.get(account.accountId) || 0;
+                if (now - lastSync < interval) {
+                    deferredCount++;
+                    continue;
+                }
+
+                console.log(`[${account.accountId}] Syncing (${historyComplete ? 'complete, checking for new' : 'incomplete, filling gaps'})`);
 
                 // Process account with timeout to prevent one account from blocking others
                 try {
@@ -587,17 +608,21 @@ export async function startContinuousLoop(): Promise<void> {
                     processedCount++;
                 } catch (error) {
                     if (error instanceof Error && error.message === 'Account timeout') {
-                        console.log(`[${account.accountId}] ⏱️  Timeout reached (${SYNC_CONFIG.accountTimeoutMs}ms), moving to next account`);
+                        console.log(`[${account.accountId}] Timeout reached (${SYNC_CONFIG.accountTimeoutMs}ms), moving to next account`);
                         processedCount++;
                     } else {
                         console.error(`[${account.accountId}] Error in sync cycle:`, error);
                         skippedCount++;
                     }
                 }
+
+                lastSyncTime.set(account.accountId, Date.now());
             }
-            
-            console.log(`=== Sync cycle complete: ${processedCount} processed, ${skippedCount} skipped ===\n`);
-            
+
+            if (processedCount > 0 || skippedCount > 0) {
+                console.log(`=== Sync cycle: ${processedCount} processed, ${skippedCount} skipped, ${deferredCount} deferred (not due yet) ===\n`);
+            }
+
             // Wait before next cycle (unless shutting down)
             if (!continuousSyncShuttingDown) {
                 await new Promise(resolve => setTimeout(resolve, SYNC_CONFIG.cycleDelayMs));
@@ -610,7 +635,7 @@ export async function startContinuousLoop(): Promise<void> {
             }
         }
     }
-    
+
     continuousSyncRunning = false;
     console.log('Continuous sync loop stopped');
 }
