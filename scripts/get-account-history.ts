@@ -47,6 +47,10 @@ import {
     getAllPikespeakTransactionBlocks,
     isPikespeakAvailable
 } from './pikespeak-api.js';
+import {
+    getAllFastNearTxTransactionBlocks,
+    isFastNearTxAvailable
+} from './fastnear-tx-api.js';
 import { getContractType } from './contract-type.js';
 import {
     detectGaps,
@@ -2100,7 +2104,7 @@ async function enrichBalancesWithDiscoveredTokens(
  */
 interface CombinedTransactionBlock {
     blockHeight: number;
-    source: 'nearblocks' | 'intents' | 'pikespeak';
+    source: 'nearblocks' | 'intents' | 'pikespeak' | 'fastnear';
     tokenIds?: string[];  // For intents/pikespeak transactions
 }
 
@@ -2122,10 +2126,35 @@ async function fetchTransactionBlocksFromAPIs(
     const allKnownBlocks: CombinedTransactionBlock[] = [];
     const seenBlockHeights = new Set<number>();
     
-    const rangeDesc = afterBlock || beforeBlock 
+    const rangeDesc = afterBlock || beforeBlock
         ? ` (range: ${afterBlock ?? 0} - ${beforeBlock ?? 'latest'})`
         : '';
-    
+
+    // Collect from FastNear TX API (free, comprehensive, no key required)
+    if (isFastNearTxAvailable()) {
+        console.log(`  Fetching from FastNear TX API${rangeDesc}...`);
+
+        try {
+            const fastNearBlocks = await getAllFastNearTxTransactionBlocks(accountId, {
+                afterBlock,
+                beforeBlock,
+            });
+
+            for (const block of fastNearBlocks) {
+                if (!seenBlockHeights.has(block.blockHeight)) {
+                    seenBlockHeights.add(block.blockHeight);
+                    allKnownBlocks.push({
+                        blockHeight: block.blockHeight,
+                        source: 'fastnear'
+                    });
+                }
+            }
+            console.log(`    Found ${fastNearBlocks.length} blocks from FastNear TX`);
+        } catch (error: any) {
+            console.warn(`    FastNear TX API error: ${error.message}`);
+        }
+    }
+
     // Collect from NearBlocks API
     if (isNearBlocksAvailable()) {
         console.log(`  Fetching from NearBlocks API${rangeDesc}...`);
