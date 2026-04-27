@@ -899,7 +899,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 
     app.use(cors(corsOptions));
 
-    // For standalone mode, use a simple getAccountId hook that reads from header or query param
+    // For standalone mode, use a simple getAccountId hook that reads from header or URL
     // This is for backward compatibility with existing clients
     const router = createRouter({
         getAccountId: (req: Request): string => {
@@ -909,14 +909,15 @@ if (import.meta.url === `file://${process.argv[1]}`) {
                 return headerAccountId;
             }
 
-            // Try to extract from URL path (e.g., /api/accounting/:accountId/...)
-            // This supports the old API pattern where accountId was in the path
+            // Extract from URL path
+            // req.path is relative to router mount point (e.g., /testaccount.near/status or /testaccount/status)
+            // Match NEAR account ID at start of path: /accountId/...
             const pathMatch = req.path.match(/^\/([a-z0-9_-]+(?:\.[a-z0-9_-]+)*)/);
             if (pathMatch && pathMatch[1]) {
                 return pathMatch[1];
             }
 
-            throw new Error('Account ID not provided. Use X-Account-Id header or include in URL path.');
+            throw new Error('Account ID not provided. Use X-Account-Id header or include accountId in URL path (e.g., /api/accounting/account.near/status)');
         },
         dataDir: DATA_DIR
     });
