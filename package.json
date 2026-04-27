@@ -7,6 +7,12 @@
   "bin": {
     "near-accounting-export": "./dist/scripts/get-account-history.js"
   },
+  "exports": {
+    ".": {
+      "import": "./dist/scripts/api-server.js",
+      "types": "./dist/scripts/api-server.d.ts"
+    }
+  },
   "scripts": {
     "build": "tsc",
     "prebuild": "rm -rf dist",

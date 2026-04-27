@@ -1,19 +1,16 @@
 #!/usr/bin/env node
 // API Server for NEAR Accounting Export
-// Provides REST endpoints for account registration, data collection jobs, and downloads
+// Provides REST endpoints for account data collection and downloads
 
 import express from 'express';
-import type { Request, Response, NextFunction } from 'express';
-import cors from 'cors';
-import type { CorsOptions } from 'cors';
+import type { Request, Response, NextFunction, Router } from 'express';
 import fs from 'fs';
 import path from 'path';
-import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-import { getAccountHistory, verifyHistoryFile, reEnrichFTBalances, repairMissingStakingRecordsV2, repairInvalidStakingRewards, repairStakingDepositsWithoutTxHash, repairNullTimestamps } from './get-account-history.js';
+import { getAccountHistory, reEnrichFTBalances, repairMissingStakingRecordsV2, repairInvalidStakingRewards, repairStakingDepositsWithoutTxHash, repairNullTimestamps } from './get-account-history.js';
 import { convertJsonToCsv } from './json-to-csv.js';
 import { callViewFunction } from './rpc.js';
 import { detectGapsV2 } from './gap-detection.js';
@@ -21,17 +18,6 @@ import { migrateToV2 } from './migrate-to-flat-format.js';
 import { isStakingPool } from './balance-tracker.js';
 import type { GapAnalysisV2 } from './gap-detection.js';
 import type { BalanceChangeRecord } from './balance-tracker.js';
-
-// Payment verification configuration
-const PAYMENT_CONFIG = {
-    requiredAmount: process.env.REGISTRATION_FEE_AMOUNT || '100000', // 0.1 ARIZ (6 decimals = 100000)
-    recipientAccount: process.env.REGISTRATION_FEE_RECIPIENT || 'arizcredits.near',
-    ftContractId: process.env.REGISTRATION_FEE_TOKEN || 'arizcredits.near', // Default to ARIZ
-    maxAge: parseInt(process.env.REGISTRATION_TX_MAX_AGE_MS || String(30 * 24 * 60 * 60 * 1000), 10), // Default 30 days
-    exemptAccounts: process.env.REGISTRATION_FEE_EXEMPT_ACCOUNTS
-        ? process.env.REGISTRATION_FEE_EXEMPT_ACCOUNTS.split(',').map(acc => acc.trim().toLowerCase())
-        : [] // Accounts that don't need to pay (e.g., for testing or special partnerships)
-};
 
 // Continuous sync configuration
 const SYNC_CONFIG = {
@@ -43,19 +29,10 @@ const SYNC_CONFIG = {
     incompleteAccountIntervalMs: parseInt(process.env.INCOMPLETE_ACCOUNT_INTERVAL_MS || '300000', 10),  // 5 min for accounts with gaps
 };
 
-// CORS configuration
-const CORS_CONFIG = {
-    allowedOrigins: process.env.CORS_ALLOWED_ORIGINS
-        ? process.env.CORS_ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
-        : ['*'] // Default to allow all origins if not configured
-};
-
 // Types
 interface RegisteredAccount {
     accountId: string;
     registeredAt: string;
-    paymentTransactionHash?: string;
-    paymentTransactionDate?: string;
 }
 
 interface Job {
@@ -82,147 +59,6 @@ interface AccountsDb {
     accounts: Record<string, RegisteredAccount>;
 }
 
-// Storage paths
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
-const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
-const JOBS_FILE = path.join(DATA_DIR, 'jobs.json');
-
-// Ensure data directory exists
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-
-// Initialize storage
-function loadAccounts(): AccountsDb {
-    if (!fs.existsSync(ACCOUNTS_FILE)) {
-        return { accounts: {} };
-    }
-    return JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
-}
-
-function saveAccounts(db: AccountsDb): void {
-    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(db, null, 2));
-}
-
-function loadJobs(): JobsDb {
-    if (!fs.existsSync(JOBS_FILE)) {
-        return { jobs: {} };
-    }
-    return JSON.parse(fs.readFileSync(JOBS_FILE, 'utf8'));
-}
-
-function saveJobs(db: JobsDb): void {
-    fs.writeFileSync(JOBS_FILE, JSON.stringify(db, null, 2));
-}
-
-function getAccountOutputFile(accountId: string): string {
-    return path.join(DATA_DIR, `${accountId}.json`);
-}
-
-function getAccountCsvFile(accountId: string): string {
-    return path.join(DATA_DIR, `${accountId}.csv`);
-}
-
-// Background job processor - tracks running jobs per account
-const runningJobs = new Map<string, Promise<void>>();
-
-async function processJob(jobId: string): Promise<void> {
-    const jobsDb = loadJobs();
-    const job = jobsDb.jobs[jobId];
-    
-    if (!job) {
-        console.error(`Job ${jobId} not found`);
-        return;
-    }
-    
-    try {
-        job.status = 'running';
-        job.startedAt = new Date().toISOString();
-        saveJobs(jobsDb);
-        
-        const outputFile = getAccountOutputFile(job.accountId);
-        
-        // Run the data collection - this will append/continue from existing file
-        await getAccountHistory({
-            accountId: job.accountId,
-            outputFile,
-            direction: job.options.direction || 'backward',
-            maxTransactions: job.options.maxTransactions || 100,
-            startBlock: job.options.startBlock,
-            endBlock: job.options.endBlock
-        });
-        
-        // Mark as completed
-        const updatedJobsDb = loadJobs();
-        const completedJob = updatedJobsDb.jobs[jobId];
-        if (completedJob) {
-            completedJob.status = 'completed';
-            completedJob.completedAt = new Date().toISOString();
-            saveJobs(updatedJobsDb);
-        }
-        
-        console.log(`Job ${jobId} completed successfully`);
-    } catch (error) {
-        // Mark as failed
-        const updatedJobsDb = loadJobs();
-        const failedJob = updatedJobsDb.jobs[jobId];
-        if (failedJob) {
-            failedJob.status = 'failed';
-            failedJob.error = error instanceof Error ? error.message : String(error);
-            failedJob.completedAt = new Date().toISOString();
-            saveJobs(updatedJobsDb);
-        }
-        
-        console.error(`Job ${jobId} failed:`, error);
-    } finally {
-        runningJobs.delete(job.accountId);
-    }
-}
-
-// Continuous sync state
-// Note: These module-level variables are intentional for a single-instance server.
-// The fly.toml configuration limits the server to a single instance (scale count 1)
-// to prevent data conflicts and ensure job tracking consistency.
-let continuousSyncRunning = false;
-let continuousSyncShuttingDown = false;
-
-/**
- * Check if an account is exempt from payment
- */
-function isAccountExempt(accountId: string): boolean {
-    return PAYMENT_CONFIG.exemptAccounts.includes(accountId.toLowerCase());
-}
-
-/**
- * Check if an account has a valid (non-expired) payment
- */
-function isPaymentValid(account: RegisteredAccount): boolean {
-    // If payment verification is disabled, all accounts are valid
-    if (PAYMENT_CONFIG.requiredAmount === '0') {
-        return true;
-    }
-    
-    // If account is exempt from payment, it's always valid
-    if (isAccountExempt(account.accountId)) {
-        return true;
-    }
-    
-    // If no payment date, account is invalid (for payment-required mode)
-    if (!account.paymentTransactionDate) {
-        return false;
-    }
-    
-    const paymentDate = new Date(account.paymentTransactionDate).getTime();
-    const now = Date.now();
-    const age = now - paymentDate;
-    
-    return age <= PAYMENT_CONFIG.maxAge;
-}
-
-/**
- * Load account history file and check if history is complete
- * V2 format only
- */
 interface AccountHistoryMetadata {
     historyComplete?: boolean;
     firstBlock: number | null;
@@ -237,23 +73,150 @@ interface AccountHistoryFile {
     records: BalanceChangeRecord[];
 }
 
+// Router configuration options
+export interface RouterConfig {
+    /**
+     * Hook function that extracts the authenticated account ID from the request.
+     * Should throw an error if the request is not authenticated.
+     */
+    getAccountId: (req: Request) => string;
+
+    /**
+     * Data directory path for storing account data and metadata.
+     * Defaults to process.env.DATA_DIR || './data'
+     */
+    dataDir?: string;
+}
+
+// Worker configuration options
+export interface WorkerConfig {
+    /**
+     * Data directory path for storing account data and metadata.
+     * Defaults to process.env.DATA_DIR || './data'
+     */
+    dataDir?: string;
+}
+
+// Worker control handle
+export interface WorkerHandle {
+    /** Stop the background sync worker */
+    stop(): Promise<void>;
+}
+
 function isV2Format(data: any): data is AccountHistoryFile {
     return data.version === 2 && Array.isArray(data.records);
+}
+
+/**
+ * Create storage access functions for a specific data directory
+ */
+function createStorage(dataDir: string) {
+    const ACCOUNTS_FILE = path.join(dataDir, 'accounts.json');
+    const JOBS_FILE = path.join(dataDir, 'jobs.json');
+
+    // Ensure data directory exists
+    if (!fs.existsSync(dataDir)) {
+        fs.mkdirSync(dataDir, { recursive: true });
+    }
+
+    function loadAccounts(): AccountsDb {
+        if (!fs.existsSync(ACCOUNTS_FILE)) {
+            return { accounts: {} };
+        }
+        return JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
+    }
+
+    function saveAccounts(db: AccountsDb): void {
+        fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(db, null, 2));
+    }
+
+    function loadJobs(): JobsDb {
+        if (!fs.existsSync(JOBS_FILE)) {
+            return { jobs: {} };
+        }
+        return JSON.parse(fs.readFileSync(JOBS_FILE, 'utf8'));
+    }
+
+    function saveJobs(db: JobsDb): void {
+        fs.writeFileSync(JOBS_FILE, JSON.stringify(db, null, 2));
+    }
+
+    function getAccountOutputFile(accountId: string): string {
+        return path.join(dataDir, `${accountId}.json`);
+    }
+
+    function getAccountCsvFile(accountId: string): string {
+        return path.join(dataDir, `${accountId}.csv`);
+    }
+
+    return {
+        loadAccounts,
+        saveAccounts,
+        loadJobs,
+        saveJobs,
+        getAccountOutputFile,
+        getAccountCsvFile
+    };
+}
+
+/**
+ * Lazy enrollment: Register an account if not already registered
+ */
+function ensureAccountRegistered(accountId: string, storage: ReturnType<typeof createStorage>): void {
+    const accountsDb = storage.loadAccounts();
+
+    if (!accountsDb.accounts[accountId]) {
+        console.log(`[Lazy Enrollment] Registering new account: ${accountId}`);
+        accountsDb.accounts[accountId] = {
+            accountId,
+            registeredAt: new Date().toISOString()
+        };
+        storage.saveAccounts(accountsDb);
+    }
+}
+
+/**
+ * Validation helpers
+ */
+function isValidNearAccountId(accountId: string): boolean {
+    return /^([a-z0-9_-]+\.)*[a-z0-9_-]+$/.test(accountId);
+}
+
+/**
+ * Load account history file and check if history is complete
+ * V2 format only
+ */
+function loadAccountHistoryFile(accountId: string, storage: ReturnType<typeof createStorage>): AccountHistoryFile | null {
+    const outputFile = storage.getAccountOutputFile(accountId);
+    if (!fs.existsSync(outputFile)) {
+        return null;
+    }
+    try {
+        const data = JSON.parse(fs.readFileSync(outputFile, 'utf8'));
+        if (!isV2Format(data)) {
+            console.warn(`Account ${accountId} has legacy V1 format, needs migration`);
+            return null;
+        }
+        return data;
+    } catch (error) {
+        console.error(`Error loading account history file for ${accountId}:`, error);
+        return null;
+    }
 }
 
 /**
  * Migrate all V1 format files in the data directory to V2 format
  * This runs on startup before the sync loop begins
  */
-function migrateAllV1Files(): { migrated: number; skipped: number; errors: string[] } {
+function migrateAllV1Files(dataDir: string): { migrated: number; skipped: number; errors: string[] } {
     const result = { migrated: 0, skipped: 0, errors: [] as string[] };
 
-    if (!fs.existsSync(DATA_DIR)) {
+    if (!fs.existsSync(dataDir)) {
         return result;
     }
 
     // Find all .json files that look like account history files (*.near.json)
-    const files = fs.readdirSync(DATA_DIR).filter(f => f.endsWith('.near.json'));
+    const files = fs.readdirSync(dataDir).filter(f => f.endsWith('.near.json'));
 
     if (files.length === 0) {
         return result;
@@ -262,7 +225,7 @@ function migrateAllV1Files(): { migrated: number; skipped: number; errors: strin
     console.log(`\n=== Checking ${files.length} account file(s) for V1 -> V2 migration ===`);
 
     for (const filename of files) {
-        const filePath = path.join(DATA_DIR, filename);
+        const filePath = path.join(dataDir, filename);
 
         try {
             const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
@@ -331,35 +294,25 @@ async function queryStakingBalanceAtBlock(
 }
 
 /**
- * Repair staking records by fixing incorrect balance_before values.
- *
- * Old buggy staking records have balance_before: "0" incorrectly.
- * This function queries the actual balance at the block and fixes the records.
- *
- * For records where balance_before was wrong:
- * 1. Query actual balance_before from RPC
- * 2. Recalculate amount = balance_after - balance_before
- * 3. If amount is 0, the record becomes a snapshot (can be kept or removed)
- */
-/**
  * Iterate all V2 account history files and apply a repair function to each.
  * Returns summary of files processed, total changes, and errors.
  */
 async function forEachV2AccountFile(
+    dataDir: string,
     description: string,
     repairFn: (accountId: string, data: AccountHistoryFile, filePath: string) => Promise<number> | number
 ): Promise<{ filesProcessed: number; totalChanges: number; errors: string[] }> {
     const result = { filesProcessed: 0, totalChanges: 0, errors: [] as string[] };
 
-    if (!fs.existsSync(DATA_DIR)) return result;
+    if (!fs.existsSync(dataDir)) return result;
 
-    const files = fs.readdirSync(DATA_DIR).filter(f => f.endsWith('.near.json'));
+    const files = fs.readdirSync(dataDir).filter(f => f.endsWith('.near.json'));
     if (files.length === 0) return result;
 
     console.log(`\n=== ${description}: checking ${files.length} account file(s) ===`);
 
     for (const filename of files) {
-        const filePath = path.join(DATA_DIR, filename);
+        const filePath = path.join(dataDir, filename);
         try {
             const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
             if (!isV2Format(data)) continue;
@@ -425,865 +378,567 @@ async function repairStakingBalanceBefore(
     return fixedCount;
 }
 
-function loadAccountHistoryFile(accountId: string): AccountHistoryFile | null {
-    const outputFile = getAccountOutputFile(accountId);
-    if (!fs.existsSync(outputFile)) {
-        return null;
-    }
-    try {
-        const data = JSON.parse(fs.readFileSync(outputFile, 'utf8'));
-        if (!isV2Format(data)) {
-            console.warn(`Account ${accountId} has legacy V1 format, needs migration`);
-            return null;
+/**
+ * Create Express router with account data endpoints
+ *
+ * @param config - Configuration including getAccountId hook and optional dataDir
+ * @returns Express Router instance with all /api/accounting/* endpoints
+ *
+ * @example
+ * // In ariz-gateway:
+ * const router = createRouter({
+ *   getAccountId: (req) => req.accountId, // Set by gateway's auth middleware
+ *   dataDir: '/data/accounting'
+ * });
+ * app.use('/api/accounting', router);
+ *
+ * @example
+ * // Standalone server with fixed account (local dev):
+ * const router = createRouter({
+ *   getAccountId: () => 'testaccount.near',
+ *   dataDir: './data'
+ * });
+ */
+export function createRouter(config: RouterConfig): Router {
+    const router = express.Router();
+    const dataDir = config.dataDir || process.env.DATA_DIR || path.join(process.cwd(), 'data');
+    const storage = createStorage(dataDir);
+
+    // Middleware to parse JSON bodies (router-level)
+    router.use(express.json());
+
+    // Middleware to log requests
+    router.use((req: Request, res: Response, next: NextFunction) => {
+        console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
+        next();
+    });
+
+    // Middleware to extract and validate accountId, plus lazy enrollment
+    router.use((req: Request, res: Response, next: NextFunction) => {
+        try {
+            const accountId = config.getAccountId(req);
+
+            if (!accountId || typeof accountId !== 'string') {
+                return res.status(401).json({ error: 'Unauthorized: account ID not found' });
+            }
+
+            if (!isValidNearAccountId(accountId)) {
+                return res.status(400).json({ error: 'Invalid NEAR account ID format' });
+            }
+
+            // Lazy enrollment: register account on first sight
+            ensureAccountRegistered(accountId, storage);
+
+            // Attach accountId to request for downstream handlers
+            (req as any).accountId = accountId;
+            next();
+        } catch (error) {
+            console.error('Authentication error:', error);
+            return res.status(401).json({
+                error: 'Unauthorized',
+                details: error instanceof Error ? error.message : String(error)
+            });
         }
-        return data;
-    } catch (error) {
-        console.error(`Error loading account history file for ${accountId}:`, error);
-        return null;
-    }
+    });
+
+    // GET /status - Get account data collection status
+    router.get('/status', (req: Request, res: Response) => {
+        const accountId = (req as any).accountId;
+
+        // Check for running job (use in-memory Map from worker)
+        const isRunning = false; // Worker manages this separately
+
+        // Check if data file exists and get metadata
+        const outputFile = storage.getAccountOutputFile(accountId);
+        let dataRange = null;
+        let hasData = false;
+        let format: 'v1' | 'v2' | null = null;
+
+        if (fs.existsSync(outputFile)) {
+            try {
+                const fileContent = fs.readFileSync(outputFile, 'utf8');
+                const accountHistory = JSON.parse(fileContent);
+                hasData = true;
+                format = isV2Format(accountHistory) ? 'v2' : 'v1';
+                dataRange = {
+                    firstBlock: accountHistory.metadata?.firstBlock || null,
+                    lastBlock: accountHistory.metadata?.lastBlock || null,
+                    totalTransactions: accountHistory.metadata?.totalTransactions || accountHistory.metadata?.totalRecords || 0,
+                    updatedAt: accountHistory.updatedAt || null
+                };
+            } catch (error) {
+                console.error('Error reading account data file:', error);
+            }
+        }
+
+        res.json({
+            accountId,
+            hasData,
+            format,
+            dataRange,
+            isRunning
+        });
+    });
+
+    // GET /download/json - Download account data as JSON
+    router.get('/download/json', (req: Request, res: Response) => {
+        const accountId = (req as any).accountId;
+        const outputFile = storage.getAccountOutputFile(accountId);
+
+        if (!fs.existsSync(outputFile)) {
+            return res.status(404).json({ error: 'No data file found for this account yet' });
+        }
+
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Disposition', `attachment; filename="${accountId}.json"`);
+
+        const fileStream = fs.createReadStream(outputFile);
+        fileStream.pipe(res);
+    });
+
+    // GET /download/csv - Download account data as CSV
+    router.get('/download/csv', async (req: Request, res: Response) => {
+        try {
+            const accountId = (req as any).accountId;
+            const outputFile = storage.getAccountOutputFile(accountId);
+
+            if (!fs.existsSync(outputFile)) {
+                return res.status(404).json({ error: 'No data file found for this account yet' });
+            }
+
+            const csvFile = storage.getAccountCsvFile(accountId);
+
+            // Generate CSV if it doesn't exist or if JSON is newer
+            const jsonStat = fs.statSync(outputFile);
+            const csvExists = fs.existsSync(csvFile);
+            const csvNeedsUpdate = !csvExists || (csvExists && fs.statSync(csvFile).mtime < jsonStat.mtime);
+
+            if (csvNeedsUpdate) {
+                try {
+                    await convertJsonToCsv(outputFile, csvFile);
+                } catch (error) {
+                    console.error('Error converting to CSV:', error);
+                    return res.status(500).json({
+                        error: 'Failed to convert data to CSV',
+                        details: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }
+
+            res.setHeader('Content-Type', 'text/csv');
+            res.setHeader('Content-Disposition', `attachment; filename="${accountId}.csv"`);
+
+            const fileStream = fs.createReadStream(csvFile);
+            fileStream.pipe(res);
+        } catch (error) {
+            console.error('Unexpected error in CSV download:', error);
+            res.status(500).json({
+                error: 'Internal server error',
+                message: error instanceof Error ? error.message : String(error)
+            });
+        }
+    });
+
+    // GET /gap-analysis - Get gap analysis report
+    router.get('/gap-analysis', (req: Request, res: Response) => {
+        try {
+            const accountId = (req as any).accountId;
+            const outputFile = storage.getAccountOutputFile(accountId);
+
+            if (!fs.existsSync(outputFile)) {
+                return res.status(404).json({ error: 'No data file found for this account yet' });
+            }
+
+            // Read and parse the account history file
+            const fileContent = fs.readFileSync(outputFile, 'utf-8');
+            const history = JSON.parse(fileContent);
+
+            if (!history.accountId) {
+                return res.status(500).json({ error: 'Invalid account history file format - missing accountId' });
+            }
+
+            // V2 format only
+            if (!isV2Format(history)) {
+                return res.status(400).json({
+                    error: 'Only V2 format is supported. Run migration script to convert.',
+                    hint: 'npx tsx scripts/migrate-to-flat-format.ts ' + outputFile
+                });
+            }
+
+            // Run per-token gap detection
+            const gapAnalysis: GapAnalysisV2 = detectGapsV2(history.records);
+
+            const response = {
+                accountId: history.accountId,
+                analyzedAt: new Date().toISOString(),
+                summary: {
+                    totalGaps: gapAnalysis.totalGaps,
+                    tokensWithGaps: gapAnalysis.tokensWithGaps,
+                    isComplete: gapAnalysis.isComplete
+                },
+                metadata: {
+                    totalRecords: history.records.length,
+                    firstBlock: history.metadata?.firstBlock || null,
+                    lastBlock: history.metadata?.lastBlock || null
+                },
+                gaps: gapAnalysis.tokenGaps.map(gap => ({
+                    type: 'token_gap',
+                    tokenId: gap.token_id,
+                    fromBlock: gap.from_block,
+                    toBlock: gap.to_block,
+                    expectedBalance: gap.expected_balance,
+                    actualBalance: gap.actual_balance,
+                    diff: gap.diff
+                }))
+            };
+
+            res.json(response);
+        } catch (error) {
+            console.error('Unexpected error in gap analysis:', error);
+            res.status(500).json({
+                error: 'Internal server error',
+                message: error instanceof Error ? error.message : String(error)
+            });
+        }
+    });
+
+    // Error handler
+    router.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+        console.error('Unhandled error:', err);
+        res.status(500).json({ error: 'Internal server error', message: err.message });
+    });
+
+    return router;
 }
 
 /**
- * Process a single account in the continuous sync loop
+ * Start the background sync worker
+ *
+ * @param config - Configuration including optional dataDir
+ * @returns WorkerHandle with stop() method for graceful shutdown
+ *
+ * @example
+ * const worker = await startWorker({ dataDir: '/data/accounting' });
+ * // Later, for graceful shutdown:
+ * await worker.stop();
  */
-export async function processAccountCycle(accountId: string): Promise<{ backward: boolean; forward: boolean }> {
-    const result = { backward: false, forward: false };
-    
-    // Skip if shutting down
-    if (continuousSyncShuttingDown) {
-        return result;
-    }
-    
-    // Skip if there's already a running job for this account
-    if (runningJobs.has(accountId)) {
-        console.log(`Skipping ${accountId} - job already running`);
-        return result;
-    }
-    
-    const outputFile = getAccountOutputFile(accountId);
-    const historyFile = loadAccountHistoryFile(accountId);
-    
-    // Check if history is complete (backward search done)
-    const historyComplete = historyFile?.metadata?.historyComplete === true;
+export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHandle> {
+    const dataDir = config.dataDir || process.env.DATA_DIR || path.join(process.cwd(), 'data');
+    const storage = createStorage(dataDir);
 
-    // Wrap entire sync operation in a single promise that stays in runningJobs
-    const syncPromise = (async () => {
-        try {
-            // ALWAYS search forward FIRST to get latest data (priority: freshness over completeness)
-            console.log(`[${accountId}] Searching forward (checking for new transactions)`);
-            result.forward = true;
+    // Background job processor - tracks running jobs per account
+    const runningJobs = new Map<string, Promise<void>>();
 
+    // Continuous sync state
+    let continuousSyncRunning = false;
+    let continuousSyncShuttingDown = false;
+
+    // Track last sync time per account to implement different polling intervals
+    const lastSyncTime = new Map<string, number>();
+
+    /**
+     * Process a single account in the continuous sync loop
+     */
+    async function processAccountCycle(accountId: string): Promise<{ backward: boolean; forward: boolean }> {
+        const result = { backward: false, forward: false };
+
+        // Skip if shutting down
+        if (continuousSyncShuttingDown) {
+            return result;
+        }
+
+        // Skip if there's already a running job for this account
+        if (runningJobs.has(accountId)) {
+            console.log(`Skipping ${accountId} - job already running`);
+            return result;
+        }
+
+        const outputFile = storage.getAccountOutputFile(accountId);
+        const historyFile = loadAccountHistoryFile(accountId, storage);
+
+        // Check if history is complete (backward search done)
+        const historyComplete = historyFile?.metadata?.historyComplete === true;
+
+        // Wrap entire sync operation in a single promise that stays in runningJobs
+        const syncPromise = (async () => {
             try {
-                await getAccountHistory({
-                    accountId,
-                    outputFile,
-                    direction: 'forward',
-                    maxTransactions: SYNC_CONFIG.batchSize,
-                    maxEpochsToCheck: SYNC_CONFIG.maxEpochsPerCycle
-                });
-            } catch (error) {
-                console.error(`[${accountId}] Forward search failed:`, error);
-            }
-
-            // Skip backward search if shutting down
-            if (continuousSyncShuttingDown) {
-                return;
-            }
-
-            // Then do incremental backward search if history is not complete
-            if (!historyComplete) {
-                console.log(`[${accountId}] Searching backward (incremental - history incomplete)`);
-                result.backward = true;
+                // ALWAYS search forward FIRST to get latest data (priority: freshness over completeness)
+                console.log(`[${accountId}] Searching forward (checking for new transactions)`);
+                result.forward = true;
 
                 try {
                     await getAccountHistory({
                         accountId,
                         outputFile,
-                        direction: 'backward',
+                        direction: 'forward',
                         maxTransactions: SYNC_CONFIG.batchSize,
                         maxEpochsToCheck: SYNC_CONFIG.maxEpochsPerCycle
                     });
                 } catch (error) {
-                    console.error(`[${accountId}] Backward search failed:`, error);
+                    console.error(`[${accountId}] Forward search failed:`, error);
                 }
-            }
 
-            // Skip FT re-enrichment if shutting down
-            if (continuousSyncShuttingDown) {
-                return;
-            }
-
-            // Re-enrich FT balances for entries that have FT transfers but missing FT balance snapshots
-            // This fixes entries created before FT balance enrichment was implemented
-            try {
-                await reEnrichFTBalances(accountId, outputFile, SYNC_CONFIG.batchSize);
-            } catch (error) {
-                console.error(`[${accountId}] FT re-enrichment failed:`, error);
-            }
-
-        } catch (error) {
-            console.error(`[${accountId}] Error processing account cycle:`, error);
-        } finally {
-            // Only remove from runningJobs after ALL phases complete (including staking sync)
-            runningJobs.delete(accountId);
-        }
-    })();
-
-    runningJobs.set(accountId, syncPromise);
-    await syncPromise;
-
-    return result;
-}
-
-/**
- * Start the continuous sync loop
- */
-// Track last sync time per account to implement different polling intervals
-const lastSyncTime = new Map<string, number>();
-
-export async function startContinuousLoop(): Promise<void> {
-    if (continuousSyncRunning) {
-        console.log('Continuous sync loop is already running');
-        return;
-    }
-
-    continuousSyncRunning = true;
-    continuousSyncShuttingDown = false;
-    console.log(`Starting continuous sync loop`);
-    console.log(`  Priority: Forward sync first (latest data), then backward sync (historical data)`);
-    console.log(`  Batch size: ${SYNC_CONFIG.batchSize} transactions`);
-    console.log(`  Cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms`);
-    console.log(`  Complete account interval: ${SYNC_CONFIG.completeAccountIntervalMs}ms (${(SYNC_CONFIG.completeAccountIntervalMs / 3600000).toFixed(1)}h)`);
-    console.log(`  Incomplete account interval: ${SYNC_CONFIG.incompleteAccountIntervalMs}ms (${(SYNC_CONFIG.incompleteAccountIntervalMs / 60000).toFixed(1)}min)`);
-    console.log(`  Max epochs/cycle: ${SYNC_CONFIG.maxEpochsPerCycle}`);
-    console.log(`  Account timeout: ${SYNC_CONFIG.accountTimeoutMs}ms`);
-
-    while (!continuousSyncShuttingDown) {
-        try {
-            const accountsDb = loadAccounts();
-            const accounts = Object.values(accountsDb.accounts);
-            const now = Date.now();
-
-            let processedCount = 0;
-            let skippedCount = 0;
-            let deferredCount = 0;
-
-            for (const account of accounts) {
+                // Skip backward search if shutting down
                 if (continuousSyncShuttingDown) {
-                    console.log('Shutdown signal received, stopping sync loop');
-                    break;
+                    return;
                 }
 
-                // Check payment validity
-                if (!isPaymentValid(account)) {
-                    skippedCount++;
-                    continue;
-                }
+                // Then do incremental backward search if history is not complete
+                if (!historyComplete) {
+                    console.log(`[${accountId}] Searching backward (incremental - history incomplete)`);
+                    result.backward = true;
 
-                // Determine sync interval based on history completeness
-                const historyFile = loadAccountHistoryFile(account.accountId);
-                const historyComplete = historyFile?.metadata?.historyComplete === true;
-                const interval = historyComplete
-                    ? SYNC_CONFIG.completeAccountIntervalMs
-                    : SYNC_CONFIG.incompleteAccountIntervalMs;
-
-                const lastSync = lastSyncTime.get(account.accountId) || 0;
-                if (now - lastSync < interval) {
-                    deferredCount++;
-                    continue;
-                }
-
-                console.log(`[${account.accountId}] Syncing (${historyComplete ? 'complete, checking for new' : 'incomplete, filling gaps'})`);
-
-                // Process account with timeout to prevent one account from blocking others
-                try {
-                    const timeoutPromise = new Promise<never>((_, reject) =>
-                        setTimeout(() => reject(new Error('Account timeout')), SYNC_CONFIG.accountTimeoutMs)
-                    );
-
-                    await Promise.race([
-                        processAccountCycle(account.accountId),
-                        timeoutPromise
-                    ]);
-                    processedCount++;
-                } catch (error) {
-                    if (error instanceof Error && error.message === 'Account timeout') {
-                        console.log(`[${account.accountId}] Timeout reached (${SYNC_CONFIG.accountTimeoutMs}ms), moving to next account`);
-                        processedCount++;
-                    } else {
-                        console.error(`[${account.accountId}] Error in sync cycle:`, error);
-                        skippedCount++;
+                    try {
+                        await getAccountHistory({
+                            accountId,
+                            outputFile,
+                            direction: 'backward',
+                            maxTransactions: SYNC_CONFIG.batchSize,
+                            maxEpochsToCheck: SYNC_CONFIG.maxEpochsPerCycle
+                        });
+                    } catch (error) {
+                        console.error(`[${accountId}] Backward search failed:`, error);
                     }
                 }
 
-                lastSyncTime.set(account.accountId, Date.now());
-            }
+                // Skip FT re-enrichment if shutting down
+                if (continuousSyncShuttingDown) {
+                    return;
+                }
 
-            if (processedCount > 0 || skippedCount > 0) {
-                console.log(`=== Sync cycle: ${processedCount} processed, ${skippedCount} skipped, ${deferredCount} deferred (not due yet) ===\n`);
-            }
+                // Re-enrich FT balances for entries that have FT transfers but missing FT balance snapshots
+                // This fixes entries created before FT balance enrichment was implemented
+                try {
+                    await reEnrichFTBalances(accountId, outputFile, SYNC_CONFIG.batchSize);
+                } catch (error) {
+                    console.error(`[${accountId}] FT re-enrichment failed:`, error);
+                }
 
-            // Wait before next cycle (unless shutting down)
-            if (!continuousSyncShuttingDown) {
-                await new Promise(resolve => setTimeout(resolve, SYNC_CONFIG.cycleDelayMs));
+            } catch (error) {
+                console.error(`[${accountId}] Error processing account cycle:`, error);
+            } finally {
+                // Only remove from runningJobs after ALL phases complete (including staking sync)
+                runningJobs.delete(accountId);
             }
-        } catch (error) {
-            console.error('Error in continuous sync loop:', error);
-            // Wait a bit before retrying
-            if (!continuousSyncShuttingDown) {
-                await new Promise(resolve => setTimeout(resolve, SYNC_CONFIG.cycleDelayMs));
-            }
-        }
+        })();
+
+        runningJobs.set(accountId, syncPromise);
+        await syncPromise;
+
+        return result;
     }
 
-    continuousSyncRunning = false;
-    console.log('Continuous sync loop stopped');
-}
+    /**
+     * Start the continuous sync loop
+     */
+    async function startContinuousLoop(): Promise<void> {
+        if (continuousSyncRunning) {
+            console.log('Continuous sync loop is already running');
+            return;
+        }
 
-/**
- * Stop the continuous sync loop
- */
-export function stopContinuousLoop(): void {
-    console.log('Stopping continuous sync loop...');
-    continuousSyncShuttingDown = true;
-}
+        continuousSyncRunning = true;
+        continuousSyncShuttingDown = false;
+        console.log(`Starting continuous sync loop`);
+        console.log(`  Priority: Forward sync first (latest data), then backward sync (historical data)`);
+        console.log(`  Batch size: ${SYNC_CONFIG.batchSize} transactions`);
+        console.log(`  Cycle delay: ${SYNC_CONFIG.cycleDelayMs}ms`);
+        console.log(`  Complete account interval: ${SYNC_CONFIG.completeAccountIntervalMs}ms (${(SYNC_CONFIG.completeAccountIntervalMs / 3600000).toFixed(1)}h)`);
+        console.log(`  Incomplete account interval: ${SYNC_CONFIG.incompleteAccountIntervalMs}ms (${(SYNC_CONFIG.incompleteAccountIntervalMs / 60000).toFixed(1)}min)`);
+        console.log(`  Max epochs/cycle: ${SYNC_CONFIG.maxEpochsPerCycle}`);
+        console.log(`  Account timeout: ${SYNC_CONFIG.accountTimeoutMs}ms`);
 
-/**
- * Check if continuous sync is running
- */
-export function isContinuousSyncRunning(): boolean {
-    return continuousSyncRunning;
-}
+        while (!continuousSyncShuttingDown) {
+            try {
+                const accountsDb = storage.loadAccounts();
+                const accounts = Object.values(accountsDb.accounts);
+                const now = Date.now();
 
-// Validation helpers
-function isValidNearAccountId(accountId: string): boolean {
-    return /^([a-z0-9_-]+\.)*[a-z0-9_-]+$/.test(accountId);
-}
+                let processedCount = 0;
+                let skippedCount = 0;
+                let deferredCount = 0;
 
-// Payment verification
-interface PaymentVerificationResult {
-    valid: boolean;
-    senderAccountId?: string;
-    transactionTimestamp?: string;
-    error?: string;
-}
+                for (const account of accounts) {
+                    if (continuousSyncShuttingDown) {
+                        console.log('Shutdown signal received, stopping sync loop');
+                        break;
+                    }
 
-async function verifyPaymentTransaction(txHash: string): Promise<PaymentVerificationResult> {
-    try {
-        const endpoint = process.env.NEAR_RPC_ENDPOINT || 'https://archival-rpc.mainnet.fastnear.com';
-        const headers: Record<string, string> = {
-            'Content-Type': 'application/json'
-        };
-        const apiKey = process.env.FASTNEAR_API_KEY;
-        if (apiKey) {
-            headers['Authorization'] = `Bearer ${apiKey}`;
-        }
-        
-        // Fetch transaction details using EXPERIMENTAL_tx_status
-        const response = await fetch(endpoint, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-                jsonrpc: '2.0',
-                id: 'dontcare',
-                method: 'EXPERIMENTAL_tx_status',
-                params: {
-                    tx_hash: txHash,
-                    sender_account_id: 'dontcare'
-                }
-            })
-        });
-        
-        if (!response.ok) {
-            return { valid: false, error: `RPC request failed: ${response.statusText}` };
-        }
-        
-        const data: any = await response.json();
-        
-        if (data.error) {
-            return { valid: false, error: `RPC error: ${data.error.message || JSON.stringify(data.error)}` };
-        }
-        
-        const txResult = data.result;
-        
-        if (!txResult || !txResult.transaction) {
-            return { valid: false, error: 'Transaction not found' };
-        }
-        
-        const transaction = txResult.transaction;
-        const senderAccountId = transaction.signer_id;
-        
-        // Get block hash from transaction outcome
-        const blockHash = txResult.transaction_outcome?.block_hash;
-        if (!blockHash) {
-            return { valid: false, error: 'Block hash not found in transaction outcome' };
-        }
-        
-        // Fetch block to get timestamp
-        const blockResponse = await fetch(endpoint, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-                jsonrpc: '2.0',
-                id: 'dontcare',
-                method: 'block',
-                params: {
-                    block_id: blockHash
-                }
-            })
-        });
-        
-        if (!blockResponse.ok) {
-            return { valid: false, error: `Failed to fetch block: ${blockResponse.statusText}` };
-        }
-        
-        const blockData: any = await blockResponse.json();
-        
-        if (blockData.error) {
-            return { valid: false, error: `Block fetch error: ${blockData.error.message || JSON.stringify(blockData.error)}` };
-        }
-        
-        const txTimestamp = blockData.result?.header?.timestamp || 0;
-        if (txTimestamp === 0) {
-            return { valid: false, error: 'Block timestamp not found' };
-        }
-        
-        // Check transaction age
-        const txAge = Date.now() * 1_000_000 - txTimestamp; // Convert to nanoseconds
-        if (txAge > PAYMENT_CONFIG.maxAge * 1_000_000) {
-            return { 
-                valid: false, 
-                error: `Transaction is too old (age: ${Math.floor(txAge / (1_000_000 * 1000))}ms, max: ${PAYMENT_CONFIG.maxAge}ms)` 
-            };
-        }
-        
-        // Check if transaction has FT transfer action (direct transfer)
-        const actions = transaction.actions || [];
-        let ftTransferFound = false;
-        let transferAmount = '0';
-        let actualSenderAccountId = senderAccountId; // May be updated if transfer is in receipts
-        let receiverId = transaction.receiver_id;
-        
-        for (const action of actions) {
-            if (action.FunctionCall) {
-                const methodName = action.FunctionCall.method_name;
-                
-                // Check if it's an FT transfer
-                if (methodName === 'ft_transfer' || methodName === 'ft_transfer_call') {
-                    // Check if receiver_id is the FT contract
-                    if (receiverId !== PAYMENT_CONFIG.ftContractId) {
+                    // Determine sync interval based on history completeness
+                    const historyFile = loadAccountHistoryFile(account.accountId, storage);
+                    const historyComplete = historyFile?.metadata?.historyComplete === true;
+                    const interval = historyComplete
+                        ? SYNC_CONFIG.completeAccountIntervalMs
+                        : SYNC_CONFIG.incompleteAccountIntervalMs;
+
+                    const lastSync = lastSyncTime.get(account.accountId) || 0;
+                    if (now - lastSync < interval) {
+                        deferredCount++;
                         continue;
                     }
-                    
-                    ftTransferFound = true;
-                    
-                    // Parse args to get receiver_id and amount
-                    const argsBase64 = action.FunctionCall.args;
-                    const argsStr = Buffer.from(argsBase64, 'base64').toString('utf8');
-                    const args = JSON.parse(argsStr);
-                    
-                    // Verify recipient
-                    if (args.receiver_id !== PAYMENT_CONFIG.recipientAccount) {
-                        return { 
-                            valid: false, 
-                            error: `Incorrect recipient. Expected: ${PAYMENT_CONFIG.recipientAccount}, Got: ${args.receiver_id}` 
-                        };
-                    }
-                    
-                    transferAmount = args.amount || '0';
-                    break;
-                }
-            }
-        }
-        
-        // If not found in transaction actions, check receipts (e.g., DAO proposals, other cross-contract calls)
-        if (!ftTransferFound && txResult.receipts) {
-            for (const receipt of txResult.receipts) {
-                // Skip receipts not directed to the FT contract
-                if (receipt.receiver_id !== PAYMENT_CONFIG.ftContractId) {
-                    continue;
-                }
-                
-                const receiptActions = receipt.receipt?.Action?.actions || [];
-                for (const action of receiptActions) {
-                    if (action.FunctionCall) {
-                        const methodName = action.FunctionCall.method_name;
-                        
-                        if (methodName === 'ft_transfer' || methodName === 'ft_transfer_call') {
-                            try {
-                                // Parse args to get receiver_id and amount
-                                const argsBase64 = action.FunctionCall.args;
-                                const argsStr = Buffer.from(argsBase64, 'base64').toString('utf8');
-                                const args = JSON.parse(argsStr);
-                                
-                                // Verify recipient
-                                if (args.receiver_id !== PAYMENT_CONFIG.recipientAccount) {
-                                    continue;
-                                }
-                                
-                                ftTransferFound = true;
-                                transferAmount = args.amount || '0';
-                                // The actual sender is the predecessor_id (the account that initiated the receipt)
-                                // This could be a DAO, multisig, or other contract acting on behalf of the user
-                                actualSenderAccountId = receipt.predecessor_id;
-                                break;
-                            } catch (e) {
-                                // Skip receipts with invalid args
-                                continue;
-                            }
+
+                    console.log(`[${account.accountId}] Syncing (${historyComplete ? 'complete, checking for new' : 'incomplete, filling gaps'})`);
+
+                    // Process account with timeout to prevent one account from blocking others
+                    try {
+                        const timeoutPromise = new Promise<never>((_, reject) =>
+                            setTimeout(() => reject(new Error('Account timeout')), SYNC_CONFIG.accountTimeoutMs)
+                        );
+
+                        await Promise.race([
+                            processAccountCycle(account.accountId),
+                            timeoutPromise
+                        ]);
+                        processedCount++;
+                    } catch (error) {
+                        if (error instanceof Error && error.message === 'Account timeout') {
+                            console.log(`[${account.accountId}] Timeout reached (${SYNC_CONFIG.accountTimeoutMs}ms), moving to next account`);
+                            processedCount++;
+                        } else {
+                            console.error(`[${account.accountId}] Error in sync cycle:`, error);
+                            skippedCount++;
                         }
                     }
+
+                    lastSyncTime.set(account.accountId, Date.now());
                 }
-                
-                if (ftTransferFound) break;
+
+                if (processedCount > 0 || skippedCount > 0) {
+                    console.log(`=== Sync cycle: ${processedCount} processed, ${skippedCount} skipped, ${deferredCount} deferred (not due yet) ===\n`);
+                }
+
+                // Wait before next cycle (unless shutting down)
+                if (!continuousSyncShuttingDown) {
+                    await new Promise(resolve => setTimeout(resolve, SYNC_CONFIG.cycleDelayMs));
+                }
+            } catch (error) {
+                console.error('Error in continuous sync loop:', error);
+                // Wait a bit before retrying
+                if (!continuousSyncShuttingDown) {
+                    await new Promise(resolve => setTimeout(resolve, SYNC_CONFIG.cycleDelayMs));
+                }
             }
         }
-        
-        if (!ftTransferFound) {
-            return { valid: false, error: 'No FT transfer found in transaction' };
-        }
-        
-        // Verify amount
-        if (BigInt(transferAmount) < BigInt(PAYMENT_CONFIG.requiredAmount)) {
-            return { 
-                valid: false, 
-                error: `Insufficient amount. Required: ${PAYMENT_CONFIG.requiredAmount}, Got: ${transferAmount}` 
-            };
-        }
-        
-        // Check transaction status - SuccessValue can be empty string "", which is valid
-        const status = txResult.status;
-        if (!status || (status.SuccessValue === undefined && !status.SuccessReceiptId)) {
-            return { valid: false, error: 'Transaction failed' };
-        }
-        
-        // Convert nanoseconds to ISO string
-        const txDate = new Date(txTimestamp / 1_000_000).toISOString();
-        
-        return { 
-            valid: true, 
-            senderAccountId: actualSenderAccountId,
-            transactionTimestamp: txDate
-        };
-        
-    } catch (error) {
-        console.error('Error verifying transaction:', error);
-        return { 
-            valid: false, 
-            error: `Failed to fetch transaction: ${error instanceof Error ? error.message : String(error)}` 
-        };
+
+        continuousSyncRunning = false;
+        console.log('Continuous sync loop stopped');
     }
+
+    /**
+     * Stop the continuous sync loop
+     */
+    function stopContinuousLoop(): void {
+        console.log('Stopping continuous sync loop...');
+        continuousSyncShuttingDown = true;
+    }
+
+    // Migrate any V1 format files before starting sync
+    migrateAllV1Files(dataDir);
+
+    // Run startup repairs
+    (async () => {
+        await forEachV2AccountFile(dataDir, 'Staking balance_before repair', repairStakingBalanceBefore);
+        await forEachV2AccountFile(dataDir, 'Missing staking transfer repair',
+            (accountId, data, filePath) => repairMissingStakingRecordsV2(accountId, data as any, filePath));
+        await forEachV2AccountFile(dataDir, 'Invalid staking rewards repair',
+            (_accountId, data, filePath) => repairInvalidStakingRewards(data as any, filePath));
+        await forEachV2AccountFile(dataDir, 'Staking deposits without tx_hash repair',
+            (accountId, data, filePath) => repairStakingDepositsWithoutTxHash(accountId, data as any, filePath));
+        await forEachV2AccountFile(dataDir, 'Null timestamp repair',
+            (_accountId, data, filePath) => repairNullTimestamps(data as any, filePath));
+    })().catch(err => {
+        console.error('Error during startup repairs:', err);
+    });
+
+    // Start continuous sync loop
+    const loopPromise = startContinuousLoop();
+
+    return {
+        async stop() {
+            stopContinuousLoop();
+            await loopPromise;
+        }
+    };
 }
 
-// Express app
-const app = express();
-app.use(express.json());
-
-// Configure CORS
-const corsOptions: CorsOptions = {
-    origin: (origin, callback) => {
-        // Allow requests with no origin (like mobile apps or curl requests)
-        if (!origin) {
-            return callback(null, true);
-        }
-        
-        // Check if origin is allowed
-        if (CORS_CONFIG.allowedOrigins.includes('*') || CORS_CONFIG.allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error(`Origin ${origin} is not allowed by CORS policy`));
-        }
-    },
-    credentials: true, // Allow cookies and authorization headers
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-};
-
-app.use(cors(corsOptions));
-
-// Middleware to log requests
-app.use((req: Request, res: Response, next: NextFunction) => {
-    console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
-    next();
-});
-
-// NOTE: For production use, consider adding:
-// - Rate limiting middleware (e.g., express-rate-limit) to prevent abuse
-// - Authentication middleware to protect endpoints
-// - Configure CORS_ALLOWED_ORIGINS environment variable to restrict origins
-// - Input sanitization and validation middleware
-
-// POST /api/accounts - Register an account
-app.post('/api/accounts', async (req: Request, res: Response) => {
-    const { transactionHash, accountId: providedAccountId } = req.body;
-    
-    // Check if payment verification is disabled (for testing)
-    const paymentRequired = PAYMENT_CONFIG.requiredAmount !== '0';
-    
-    let accountId: string;
-    let verificationResult: PaymentVerificationResult | undefined;
-    
-    // Check if this is an exempt account (can register without payment)
-    const isExemptAccount = providedAccountId && isAccountExempt(providedAccountId);
-    
-    if (paymentRequired && !isExemptAccount) {
-        // Payment verification mode
-        if (!transactionHash || typeof transactionHash !== 'string') {
-            return res.status(400).json({ error: 'transactionHash is required and must be a string' });
-        }
-        
-        try {
-            // Verify the payment transaction
-            verificationResult = await verifyPaymentTransaction(transactionHash);
-            
-            if (!verificationResult.valid) {
-                return res.status(400).json({ 
-                    error: 'Payment verification failed', 
-                    details: verificationResult.error 
-                });
-            }
-            
-            accountId = verificationResult.senderAccountId!;
-        } catch (error) {
-            console.error('Error verifying payment transaction:', error);
-            return res.status(500).json({ 
-                error: 'Failed to verify payment transaction',
-                details: error instanceof Error ? error.message : String(error)
-            });
-        }
-    } else {
-        // No payment required (testing mode) or exempt account - accept accountId directly
-        if (!providedAccountId || typeof providedAccountId !== 'string') {
-            return res.status(400).json({ error: 'accountId is required and must be a string' });
-        }
-        
-        // Validate NEAR account ID format
-        const accountIdRegex = /^[a-z0-9][a-z0-9_-]*[a-z0-9](\.[a-z0-9][a-z0-9_-]*[a-z0-9])*\.near$/;
-        const implicitAccountRegex = /^[a-f0-9]{64}$/;
-        if (!accountIdRegex.test(providedAccountId) && !implicitAccountRegex.test(providedAccountId)) {
-            return res.status(400).json({ error: 'Invalid NEAR account ID format' });
-        }
-        
-        accountId = providedAccountId;
-    }
-    
-    const accountsDb = loadAccounts();
-    
-    // Check if account already exists
-    const existingAccount = accountsDb.accounts[accountId];
-    if (existingAccount) {
-        // If payment verification is required and transaction hash is provided,
-        // allow subscription renewal
-        if (paymentRequired && transactionHash && verificationResult) {
-            // Update payment info for subscription renewal
-            existingAccount.paymentTransactionHash = transactionHash;
-            existingAccount.paymentTransactionDate = verificationResult.transactionTimestamp!;
-            saveAccounts(accountsDb);
-            
-            return res.status(200).json({
-                message: 'Subscription renewed successfully',
-                account: existingAccount
-            });
-        }
-        
-        return res.status(200).json({
-            message: 'Account already registered',
-            account: existingAccount
-        });
-    }
-    
-    // Create new account with payment info if payment was required
-    const newAccount: RegisteredAccount = {
-        accountId,
-        registeredAt: new Date().toISOString()
-    };
-    
-    if (paymentRequired && transactionHash && verificationResult) {
-        newAccount.paymentTransactionHash = transactionHash;
-        newAccount.paymentTransactionDate = verificationResult.transactionTimestamp!;
-    }
-    
-    accountsDb.accounts[accountId] = newAccount;
-    saveAccounts(accountsDb);
-    
-    res.status(201).json({
-        message: 'Account registered successfully',
-        account: accountsDb.accounts[accountId]
-    });
-});
-
-// GET /api/accounts - List registered accounts
-app.get('/api/accounts', (req: Request, res: Response) => {
-    const accountsDb = loadAccounts();
-    res.json({
-        accounts: Object.values(accountsDb.accounts)
-    });
-});
-
-// POST /api/jobs - REMOVED - Jobs are now automatic via continuous sync
-// Kept as explicit 404 for backward compatibility with clients
-app.post('/api/jobs', (req: Request, res: Response) => {
-    return res.status(404).json({ 
-        error: 'POST /api/jobs has been removed. Jobs are now processed automatically for registered accounts with valid payment.' 
-    });
-});
-
-// GET /api/jobs/:jobId - Get job status
-app.get('/api/jobs/:jobId', (req: Request, res: Response) => {
-    const jobId = req.params.jobId;
-    
-    if (!jobId) {
-        return res.status(400).json({ error: 'Job ID is required' });
-    }
-    
-    const jobsDb = loadJobs();
-    const job = jobsDb.jobs[jobId];
-    
-    if (!job) {
-        return res.status(404).json({ error: 'Job not found' });
-    }
-    
-    res.json({ job });
-});
-
-// GET /api/jobs - List all jobs (now using in-memory tracking)
-app.get('/api/jobs', (req: Request, res: Response) => {
-    const { accountId } = req.query;
-
-    // Build jobs list from in-memory running jobs
-    const jobs: any[] = Array.from(runningJobs.keys()).map(accountId => ({
-        accountId,
-        status: 'running',
-        startedAt: new Date().toISOString() // We don't track start time, so use current time as placeholder
-    }));
-
-    // Filter by accountId if provided
-    if (accountId && typeof accountId === 'string') {
-        const filtered = jobs.filter(job => job.accountId === accountId);
-        return res.json({ jobs: filtered });
-    }
-
-    res.json({ jobs });
-});
-
-// GET /api/accounts/:accountId/status - Get account data collection status
-app.get('/api/accounts/:accountId/status', (req: Request, res: Response) => {
-    const accountId = req.params.accountId;
-    
-    if (!accountId) {
-        return res.status(400).json({ error: 'Account ID is required' });
-    }
-    
-    // Check if account is registered
-    const accountsDb = loadAccounts();
-    if (!accountsDb.accounts[accountId]) {
-        return res.status(404).json({ error: 'Account not registered' });
-    }
-    
-    // Check for running job (use in-memory Map, not jobs.json)
-    const isRunning = runningJobs.has(accountId);
-
-    // Check if data file exists and get metadata
-    const outputFile = getAccountOutputFile(accountId);
-    let dataRange = null;
-    let hasData = false;
-    let format: 'v1' | 'v2' | null = null;
-
-    if (fs.existsSync(outputFile)) {
-        try {
-            const fileContent = fs.readFileSync(outputFile, 'utf8');
-            const accountHistory = JSON.parse(fileContent);
-            hasData = true;
-            format = isV2Format(accountHistory) ? 'v2' : 'v1';
-            dataRange = {
-                firstBlock: accountHistory.metadata?.firstBlock || null,
-                lastBlock: accountHistory.metadata?.lastBlock || null,
-                totalTransactions: accountHistory.metadata?.totalTransactions || accountHistory.metadata?.totalRecords || 0,
-                updatedAt: accountHistory.updatedAt || null
-            };
-        } catch (error) {
-            console.error('Error reading account data file:', error);
-        }
-    }
-
-    res.json({
-        accountId,
-        hasData,
-        format,
-        dataRange,
-        isRunning
-    });
-});
-
-// GET /api/accounts/:accountId/download/json - Download account data as JSON
-app.get('/api/accounts/:accountId/download/json', (req: Request, res: Response) => {
-    const accountId = req.params.accountId;
-    
-    if (!accountId) {
-        return res.status(400).json({ error: 'Account ID is required' });
-    }
-    
-    // Check if account is registered
-    const accountsDb = loadAccounts();
-    if (!accountsDb.accounts[accountId]) {
-        return res.status(404).json({ error: 'Account not registered' });
-    }
-    
-    const outputFile = getAccountOutputFile(accountId);
-    
-    if (!fs.existsSync(outputFile)) {
-        return res.status(404).json({ error: 'No data file found for this account yet' });
-    }
-    
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename="${accountId}.json"`);
-    
-    const fileStream = fs.createReadStream(outputFile);
-    fileStream.pipe(res);
-});
-
-// GET /api/accounts/:accountId/download/csv - Download account data as CSV
-app.get('/api/accounts/:accountId/download/csv', async (req: Request, res: Response) => {
-    try {
-        const accountId = req.params.accountId;
-        
-        if (!accountId) {
-            return res.status(400).json({ error: 'Account ID is required' });
-        }
-        
-        // Check if account is registered
-        const accountsDb = loadAccounts();
-        if (!accountsDb.accounts[accountId]) {
-            return res.status(404).json({ error: 'Account not registered' });
-        }
-        
-        const outputFile = getAccountOutputFile(accountId);
-        
-        if (!fs.existsSync(outputFile)) {
-            return res.status(404).json({ error: 'No data file found for this account yet' });
-        }
-        
-        const csvFile = getAccountCsvFile(accountId);
-        
-        // Generate CSV if it doesn't exist or if JSON is newer
-        const jsonStat = fs.statSync(outputFile);
-        const csvExists = fs.existsSync(csvFile);
-        const csvNeedsUpdate = !csvExists || (csvExists && fs.statSync(csvFile).mtime < jsonStat.mtime);
-        
-        if (csvNeedsUpdate) {
-            try {
-                await convertJsonToCsv(outputFile, csvFile);
-            } catch (error) {
-                console.error('Error converting to CSV:', error);
-                return res.status(500).json({ 
-                    error: 'Failed to convert data to CSV',
-                    details: error instanceof Error ? error.message : String(error)
-                });
-            }
-        }
-        
-        res.setHeader('Content-Type', 'text/csv');
-        res.setHeader('Content-Disposition', `attachment; filename="${accountId}.csv"`);
-        
-        const fileStream = fs.createReadStream(csvFile);
-        fileStream.pipe(res);
-    } catch (error) {
-        console.error('Unexpected error in CSV download:', error);
-        res.status(500).json({
-            error: 'Internal server error',
-            message: error instanceof Error ? error.message : String(error)
-        });
-    }
-});
-
-// GET /api/accounts/:accountId/gap-analysis - Get gap analysis report
-app.get('/api/accounts/:accountId/gap-analysis', (req: Request, res: Response) => {
-    try {
-        const accountId = req.params.accountId;
-
-        if (!accountId) {
-            return res.status(400).json({ error: 'Account ID is required' });
-        }
-
-        // Check if account is registered
-        const accountsDb = loadAccounts();
-        if (!accountsDb.accounts[accountId]) {
-            return res.status(404).json({ error: 'Account not registered' });
-        }
-
-        const outputFile = getAccountOutputFile(accountId);
-
-        if (!fs.existsSync(outputFile)) {
-            return res.status(404).json({ error: 'No data file found for this account yet' });
-        }
-
-        // Read and parse the account history file
-        const fileContent = fs.readFileSync(outputFile, 'utf-8');
-        const history = JSON.parse(fileContent);
-
-        if (!history.accountId) {
-            return res.status(500).json({ error: 'Invalid account history file format - missing accountId' });
-        }
-
-        // V2 format only
-        if (!isV2Format(history)) {
-            return res.status(400).json({
-                error: 'Only V2 format is supported. Run migration script to convert.',
-                hint: 'npx tsx scripts/migrate-to-flat-format.ts ' + outputFile
-            });
-        }
-
-        // Run per-token gap detection
-        const gapAnalysis: GapAnalysisV2 = detectGapsV2(history.records);
-
-        const response = {
-            accountId: history.accountId,
-            analyzedAt: new Date().toISOString(),
-            summary: {
-                totalGaps: gapAnalysis.totalGaps,
-                tokensWithGaps: gapAnalysis.tokensWithGaps,
-                isComplete: gapAnalysis.isComplete
-            },
-            metadata: {
-                totalRecords: history.records.length,
-                firstBlock: history.metadata?.firstBlock || null,
-                lastBlock: history.metadata?.lastBlock || null
-            },
-            gaps: gapAnalysis.tokenGaps.map(gap => ({
-                type: 'token_gap',
-                tokenId: gap.token_id,
-                fromBlock: gap.from_block,
-                toBlock: gap.to_block,
-                expectedBalance: gap.expected_balance,
-                actualBalance: gap.actual_balance,
-                diff: gap.diff
-            }))
-        };
-
-        res.json(response);
-    } catch (error) {
-        console.error('Unexpected error in gap analysis:', error);
-        res.status(500).json({
-            error: 'Internal server error',
-            message: error instanceof Error ? error.message : String(error)
-        });
-    }
-});
-
-// Health check endpoint
-app.get('/health', (req: Request, res: Response) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Error handler
-app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
-    console.error('Unhandled error:', err);
-    res.status(500).json({ error: 'Internal server error', message: err.message });
-});
-
-// Only start server when run directly (not when imported for testing)
+// Only start standalone server when run directly (not when imported for testing or by gateway)
 if (import.meta.url === `file://${process.argv[1]}`) {
     const PORT = process.env.PORT || 3000;
+    const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+
+    // Create standalone app with CORS for backward compatibility
+    const app = express();
+
+    // CORS configuration for standalone mode
+    const CORS_CONFIG = {
+        allowedOrigins: process.env.CORS_ALLOWED_ORIGINS
+            ? process.env.CORS_ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
+            : ['*'] // Default to allow all origins if not configured
+    };
+
+    // Apply CORS middleware
+    const cors = await import('cors').then(m => m.default);
+    const corsOptions = {
+        origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+            // Allow requests with no origin (like mobile apps or curl requests)
+            if (!origin) {
+                return callback(null, true);
+            }
+
+            // Check if origin is allowed
+            if (CORS_CONFIG.allowedOrigins.includes('*') || CORS_CONFIG.allowedOrigins.includes(origin)) {
+                callback(null, true);
+            } else {
+                callback(new Error(`Origin ${origin} is not allowed by CORS policy`));
+            }
+        },
+        credentials: true, // Allow cookies and authorization headers
+        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+        allowedHeaders: ['Content-Type', 'Authorization']
+    };
+
+    app.use(cors(corsOptions));
+
+    // For standalone mode, use a simple getAccountId hook that reads from header or query param
+    // This is for backward compatibility with existing clients
+    const router = createRouter({
+        getAccountId: (req: Request): string => {
+            // Try to get account from X-Account-Id header first (for testing)
+            const headerAccountId = req.headers['x-account-id'];
+            if (headerAccountId && typeof headerAccountId === 'string') {
+                return headerAccountId;
+            }
+
+            // Try to extract from URL path (e.g., /api/accounting/:accountId/...)
+            // This supports the old API pattern where accountId was in the path
+            const pathMatch = req.path.match(/^\/([a-z0-9_-]+(?:\.[a-z0-9_-]+)*)/);
+            if (pathMatch && pathMatch[1]) {
+                return pathMatch[1];
+            }
+
+            throw new Error('Account ID not provided. Use X-Account-Id header or include in URL path.');
+        },
+        dataDir: DATA_DIR
+    });
+
+    // Mount router at /api/accounting
+    app.use('/api/accounting', router);
+
+    // Legacy endpoints for backward compatibility
+    // GET /api/accounts - List registered accounts
+    app.get('/api/accounts', (req: Request, res: Response) => {
+        const storage = createStorage(DATA_DIR);
+        const accountsDb = storage.loadAccounts();
+        res.json({
+            accounts: Object.values(accountsDb.accounts)
+        });
+    });
+
+    // Health check endpoint
+    app.get('/health', (req: Request, res: Response) => {
+        res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    });
+
     const server = app.listen(PORT, () => {
         console.log(`API Server running on port ${PORT}`);
         console.log(`Data directory: ${DATA_DIR}`);
@@ -1294,58 +949,29 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         console.log(`CORS allowed origins: ${CORS_CONFIG.allowedOrigins.join(', ')}`);
         console.log('');
         console.log('Available endpoints:');
-        console.log('  POST   /api/accounts - Register an account (or renew subscription)');
         console.log('  GET    /api/accounts - List registered accounts');
-        console.log('  GET    /api/accounts/:accountId/status - Get account status and data range');
-        console.log('  GET    /api/accounts/:accountId/download/json - Download account data as JSON');
-        console.log('  GET    /api/accounts/:accountId/download/csv - Download account data as CSV');
-        console.log('  GET    /api/accounts/:accountId/gap-analysis - Get gap analysis report');
-        console.log('  GET    /api/jobs - List all jobs');
-        console.log('  GET    /api/jobs/:jobId - Get job status');
+        console.log('  GET    /api/accounting/:accountId/status - Get account status and data range');
+        console.log('  GET    /api/accounting/:accountId/download/json - Download account data as JSON');
+        console.log('  GET    /api/accounting/:accountId/download/csv - Download account data as CSV');
+        console.log('  GET    /api/accounting/:accountId/gap-analysis - Get gap analysis report');
         console.log('  GET    /health - Health check');
         console.log('');
-        console.log('Note: POST /api/jobs has been removed. Jobs run automatically.');
-
-        // Migrate any V1 format files before starting sync
-        migrateAllV1Files();
-
-        // Run startup repairs
-        (async () => {
-            await forEachV2AccountFile('Staking balance_before repair', repairStakingBalanceBefore);
-            await forEachV2AccountFile('Missing staking transfer repair',
-                (accountId, data, filePath) => repairMissingStakingRecordsV2(accountId, data as any, filePath));
-            await forEachV2AccountFile('Invalid staking rewards repair',
-                (_accountId, data, filePath) => repairInvalidStakingRewards(data as any, filePath));
-            await forEachV2AccountFile('Staking deposits without tx_hash repair',
-                (accountId, data, filePath) => repairStakingDepositsWithoutTxHash(accountId, data as any, filePath));
-            await forEachV2AccountFile('Null timestamp repair',
-                (_accountId, data, filePath) => repairNullTimestamps(data as any, filePath));
-        })().catch(err => {
-            console.error('Error during startup repairs:', err);
-        });
-
-        // Start continuous sync loop
-        startContinuousLoop();
+        console.log('Note: Accounts are auto-registered on first request (lazy enrollment)');
     });
+
+    // Start worker
+    const worker = await startWorker({ dataDir: DATA_DIR });
 
     // Graceful shutdown
-    process.on('SIGTERM', () => {
-        console.log('SIGTERM received, shutting down gracefully...');
-        stopContinuousLoop();
-        server.close(() => {
+    const shutdown = () => {
+        console.log('Shutdown signal received, shutting down gracefully...');
+        server.close(async () => {
+            await worker.stop();
             console.log('Server closed');
             process.exit(0);
         });
-    });
+    };
 
-    process.on('SIGINT', () => {
-        console.log('SIGINT received, shutting down gracefully...');
-        stopContinuousLoop();
-        server.close(() => {
-            console.log('Server closed');
-            process.exit(0);
-        });
-    });
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
 }
-
-export { app };
