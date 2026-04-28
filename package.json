@@ -9,8 +9,8 @@
   },
   "exports": {
     ".": {
-      "import": "./dist/scripts/api-server.js",
-      "types": "./dist/scripts/api-server.d.ts"
+      "import": "./dist/scripts/index.js",
+      "types": "./dist/scripts/index.d.ts"
     }
   },
   "scripts": {

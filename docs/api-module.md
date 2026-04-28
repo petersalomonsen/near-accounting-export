@@ -224,6 +224,8 @@ const server = app.listen(PORT, async () => {
 
 ## Standalone Mode
 
+⚠️ **Security Warning:** Standalone mode trusts the `X-Account-Id` header and URL-path account ID — both are unauthenticated. Do not expose standalone mode to the public internet. It's intended for local development or for running behind a trusted gateway (like ariz-gateway) that authenticates the request and injects the account ID.
+
 The package can also run as a standalone server:
 
 ```bash
