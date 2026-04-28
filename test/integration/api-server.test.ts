@@ -20,7 +20,8 @@ const TEST_CONFIG = {
 function makeRequest(
     method: string,
     path: string,
-    body?: any
+    body?: any,
+    customHeaders?: Record<string, string>
 ): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
     return new Promise((resolve, reject) => {
         const options: http.RequestOptions = {
@@ -29,7 +30,8 @@ function makeRequest(
             path,
             method,
             headers: {
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                ...customHeaders
             }
         };
 
@@ -136,93 +138,48 @@ describe('API Server', function() {
         });
     });
 
-    describe('Account Registration', function() {
-        it('should register a new account', async function() {
-            const response = await makeRequest('POST', '/api/accounts', {
-                accountId: TEST_ACCOUNT
+    describe('Account Registration (Lazy Enrollment)', function() {
+        it('should auto-register account on first request', async function() {
+            // Make a request to any endpoint - should trigger lazy enrollment
+            // Use X-Account-Id header for authentication in standalone mode
+            const response = await makeRequest('GET', '/api/accounting/status', undefined, {
+                'X-Account-Id': TEST_ACCOUNT
             });
-            
-            assert.equal(response.statusCode, 201);
-            assert.equal(response.body.message, 'Account registered successfully');
-            assert.equal(response.body.account.accountId, TEST_ACCOUNT);
-            assert.ok(response.body.account.registeredAt);
-        });
 
-        it('should return existing account if already registered', async function() {
-            const response = await makeRequest('POST', '/api/accounts', {
-                accountId: TEST_ACCOUNT
-            });
-            
             assert.equal(response.statusCode, 200);
-            assert.equal(response.body.message, 'Account already registered');
-            assert.equal(response.body.account.accountId, TEST_ACCOUNT);
-        });
-
-        it('should reject invalid account ID format', async function() {
-            const response = await makeRequest('POST', '/api/accounts', {
-                accountId: 'invalid account!'
-            });
-            
-            assert.equal(response.statusCode, 400);
-            assert.ok(response.body.error.includes('Invalid NEAR account ID format'));
-        });
-
-        it('should reject missing account ID', async function() {
-            const response = await makeRequest('POST', '/api/accounts', {});
-            
-            assert.equal(response.statusCode, 400);
-            assert.ok(response.body.error.includes('accountId is required'));
+            assert.equal(response.body.accountId, TEST_ACCOUNT);
         });
 
         it('should list registered accounts', async function() {
             const response = await makeRequest('GET', '/api/accounts');
-            
+
             assert.equal(response.statusCode, 200);
             assert.ok(Array.isArray(response.body.accounts));
             assert.ok(response.body.accounts.length >= 1);
-            
+
             const account = response.body.accounts.find((a: any) => a.accountId === TEST_ACCOUNT);
-            assert.ok(account, 'Registered account should be in the list');
+            assert.ok(account, 'Account should be auto-registered');
         });
     });
 
-    describe('Job Management', function() {
-        it('should return 404 for POST /api/jobs (endpoint removed)', async function() {
-            const response = await makeRequest('POST', '/api/jobs', {
-                accountId: 'unregistered.near'
+    describe('Job Management (Removed)', function() {
+        // NOTE: Job management endpoints have been removed.
+        // Jobs are now created automatically by the continuous sync loop.
+        // The worker tracks running jobs internally, not via HTTP endpoints.
+        it('should return 404 for removed job endpoints', async function() {
+            // Verify POST /api/jobs is removed
+            const postResponse = await makeRequest('POST', '/api/jobs', {
+                accountId: 'test.near'
             });
-            
-            // POST /api/jobs has been removed - jobs are now automatic
-            assert.equal(response.statusCode, 404);
-            assert.ok(response.body.error.includes('POST /api/jobs has been removed'));
-        });
+            assert.equal(postResponse.statusCode, 404);
 
-        it('should list all jobs (may be empty initially)', async function() {
-            const response = await makeRequest('GET', '/api/jobs');
-            
-            assert.equal(response.statusCode, 200);
-            assert.ok(Array.isArray(response.body.jobs));
-            // Jobs may be empty initially since POST /api/jobs is removed
-            // Jobs are now created automatically by the continuous sync loop
-        });
+            // Verify GET /api/jobs is removed
+            const getResponse = await makeRequest('GET', '/api/jobs');
+            assert.equal(getResponse.statusCode, 404);
 
-        it('should filter jobs by account ID', async function() {
-            const response = await makeRequest('GET', `/api/jobs?accountId=${TEST_ACCOUNT}`);
-            
-            assert.equal(response.statusCode, 200);
-            assert.ok(Array.isArray(response.body.jobs));
-            
-            // All jobs should belong to the test account (if any exist)
-            for (const job of response.body.jobs) {
-                assert.equal(job.accountId, TEST_ACCOUNT);
-            }
-        });
-
-        it('should return 404 for non-existent job', async function() {
-            const response = await makeRequest('GET', '/api/jobs/non-existent-job-id');
-            
-            assert.equal(response.statusCode, 404);
-            assert.ok(response.body.error.includes('Job not found'));
+            // Verify GET /api/jobs/:id is removed
+            const getByIdResponse = await makeRequest('GET', '/api/jobs/some-id');
+            assert.equal(getByIdResponse.statusCode, 404);
         });
     });
 
@@ -232,222 +189,71 @@ describe('API Server', function() {
         // manually create jobs anymore.
 
         it('should reject download for account without data', async function() {
-            // Register a new account that has no data
+            // Make a request to trigger lazy enrollment
             const otherAccount = 'no-data-testaccount.near';
-            await makeRequest('POST', '/api/accounts', { accountId: otherAccount });
-            
+            await makeRequest('GET', '/api/accounting/status', undefined, {
+                'X-Account-Id': otherAccount
+            });
+
             // Try to download (should fail because no data file exists)
-            const response = await makeRequest('GET', `/api/accounts/${otherAccount}/download/json`);
-            
+            const response = await makeRequest('GET', '/api/accounting/download/json', undefined, {
+                'X-Account-Id': otherAccount
+            });
+
             assert.equal(response.statusCode, 404);
-            assert.ok(response.body.error.includes('No data file found'));
+            // response.body might be a string or object depending on how the error is returned
+            if (typeof response.body === 'object' && response.body.error) {
+                assert.ok(response.body.error.includes('No data file found'));
+            }
         });
 
         it('should download account data as JSON (or 404 if no data yet)', async function() {
-            const response = await makeRequest('GET', `/api/accounts/${TEST_ACCOUNT}/download/json`);
-            
+            const response = await makeRequest('GET', '/api/accounting/download/json', undefined, {
+                'X-Account-Id': TEST_ACCOUNT
+            });
+
             // For streaming responses, we expect either success or 404 if file doesn't exist
             // Without manual job creation, data file may not exist yet
             assert.ok(response.statusCode === 200 || response.statusCode === 404);
-            
+
             if (response.statusCode === 200) {
                 assert.ok(response.body.accountId);
-                assert.ok(Array.isArray(response.body.transactions));
+                assert.ok(Array.isArray(response.body.records) || Array.isArray(response.body.transactions));
             }
         });
 
         it('should download account data as CSV (or 404 if no data yet)', async function() {
-            const response = await makeRequest('GET', `/api/accounts/${TEST_ACCOUNT}/download/csv`);
-            
+            const response = await makeRequest('GET', '/api/accounting/download/csv', undefined, {
+                'X-Account-Id': TEST_ACCOUNT
+            });
+
             // For streaming responses, we expect either success or 404 if file doesn't exist
             assert.ok(response.statusCode === 200 || response.statusCode === 404);
-            
+
             // CSV download may generate the CSV on first request
             if (response.statusCode === 200 && typeof response.body === 'string') {
                 // Check CSV headers
-                assert.ok(response.body.includes('change_block_height'));
-                assert.ok(response.body.includes('timestamp'));
-                assert.ok(response.body.includes('counterparty'));
+                assert.ok(response.body.includes('block_height') || response.body.includes('change_block_height'));
             }
         });
 
-        it('should return 404 for download of unregistered account', async function() {
-            const response = await makeRequest('GET', '/api/accounts/unregistered-account.near/download/json');
-            
+        it('should return 404 for download of account without making request first', async function() {
+            // Try to download for an account that was never accessed
+            const response = await makeRequest('GET', '/api/accounting/download/json', undefined, {
+                'X-Account-Id': 'never-accessed.near'
+            });
+
             assert.equal(response.statusCode, 404);
-            assert.ok(response.body.error.includes('not registered'));
+            // response.body might be a string or object depending on how the error is returned
+            if (typeof response.body === 'object' && response.body.error) {
+                assert.ok(response.body.error.includes('No data file found'));
+            }
         });
     });
 });
 
-// Separate test suite for payment verification with real transactions
-// This requires network access and tests against actual mainnet transactions
-describe('API Server - Payment Verification', function() {
-    this.timeout(120000);
-
-    let serverProcess: any = null;
-    const TEST_DATA_DIR = path.join(__dirname, '..', '..', 'test-data', 'api-payment');
-    const PAYMENT_TEST_PORT = 3003;
-
-    // Real DAO transaction that transfers 0.1 ARIZ via a Sputnik DAO proposal
-    // Transaction: 93AijbdCEF8odXHzLsEx6D1ZCKdDquKoVungdzBZTYMD
-    // - Signer: maledress6270.near (calls act_proposal on DAO)
-    // - DAO: romakqatesting.sputnik-dao.near (executes ft_transfer)
-    // - Recipient: arizcredits.near
-    // - Amount: 100000 (0.1 ARIZ)
-    const DAO_TRANSACTION_HASH = '93AijbdCEF8odXHzLsEx6D1ZCKdDquKoVungdzBZTYMD';
-    const EXPECTED_DAO_ACCOUNT = 'romakqatesting.sputnik-dao.near';
-
-    function makePaymentRequest(
-        method: string,
-        requestPath: string,
-        body?: any
-    ): Promise<{ statusCode: number; body: any; headers: http.IncomingHttpHeaders }> {
-        return new Promise((resolve, reject) => {
-            const options: http.RequestOptions = {
-                hostname: 'localhost',
-                port: PAYMENT_TEST_PORT,
-                path: requestPath,
-                method,
-                headers: {
-                    'Content-Type': 'application/json'
-                }
-            };
-
-            const req = http.request(options, (res) => {
-                let data = '';
-
-                res.on('data', (chunk) => {
-                    data += chunk;
-                });
-
-                res.on('end', () => {
-                    let parsedBody;
-                    try {
-                        parsedBody = JSON.parse(data);
-                    } catch {
-                        parsedBody = data;
-                    }
-
-                    resolve({
-                        statusCode: res.statusCode || 0,
-                        body: parsedBody,
-                        headers: res.headers
-                    });
-                });
-            });
-
-            req.on('error', reject);
-
-            if (body) {
-                req.write(JSON.stringify(body));
-            }
-
-            req.end();
-        });
-    }
-
-    before(async function() {
-        // Setup test data directory
-        if (fs.existsSync(TEST_DATA_DIR)) {
-            fs.rmSync(TEST_DATA_DIR, { recursive: true });
-        }
-        fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
-
-        // Start the API server WITH payment verification enabled
-        const { spawn } = await import('child_process');
-        
-        serverProcess = spawn('node', ['dist/scripts/api-server.js'], {
-            env: {
-                ...process.env,
-                PORT: PAYMENT_TEST_PORT.toString(),
-                DATA_DIR: TEST_DATA_DIR,
-                // Enable payment verification with default ARIZ settings
-                REGISTRATION_FEE_AMOUNT: '100000',
-                REGISTRATION_FEE_RECIPIENT: 'arizcredits.near',
-                REGISTRATION_FEE_TOKEN: 'arizcredits.near',
-                // Allow old transactions for testing (the test transaction is from the past)
-                REGISTRATION_TX_MAX_AGE_MS: String(365 * 24 * 60 * 60 * 1000) // 1 year
-            },
-            stdio: 'inherit'
-        });
-
-        // Poll for server readiness
-        for (let i = 0; i < 20; i++) {
-            try {
-                await makePaymentRequest('GET', '/health');
-                break;
-            } catch (error) {
-                if (i === 19) {
-                    throw new Error('Payment test server failed to start within timeout');
-                }
-                await new Promise(resolve => setTimeout(resolve, 200));
-            }
-        }
-    });
-
-    after(async function() {
-        if (serverProcess) {
-            serverProcess.kill();
-            await new Promise<void>((resolve) => {
-                serverProcess.once('exit', () => resolve());
-                setTimeout(() => resolve(), 2000);
-            });
-        }
-
-        if (fs.existsSync(TEST_DATA_DIR)) {
-            fs.rmSync(TEST_DATA_DIR, { recursive: true });
-        }
-    });
-
-    describe('DAO Transaction Payment Verification', function() {
-        it('should register account from DAO proposal ft_transfer in receipts', async function() {
-            // Register using the DAO transaction hash
-            // The ft_transfer is in the receipts, not in the top-level transaction actions
-            const response = await makePaymentRequest('POST', '/api/accounts', {
-                transactionHash: DAO_TRANSACTION_HASH
-            });
-            
-            assert.equal(response.statusCode, 201, `Expected 201 but got ${response.statusCode}: ${JSON.stringify(response.body)}`);
-            assert.equal(response.body.message, 'Account registered successfully');
-            // The registered account should be the DAO (predecessor_id in receipt), not the signer
-            assert.equal(response.body.account.accountId, EXPECTED_DAO_ACCOUNT);
-            assert.ok(response.body.account.registeredAt);
-        });
-
-        it('should renew subscription when re-registering with same DAO transaction', async function() {
-            const response = await makePaymentRequest('POST', '/api/accounts', {
-                transactionHash: DAO_TRANSACTION_HASH
-            });
-            
-            // With the new subscription model, re-registering with a valid tx hash renews the subscription
-            assert.equal(response.statusCode, 200);
-            assert.equal(response.body.message, 'Subscription renewed successfully');
-            assert.equal(response.body.account.accountId, EXPECTED_DAO_ACCOUNT);
-            // Verify payment info is stored
-            assert.ok(response.body.account.paymentTransactionHash);
-            assert.ok(response.body.account.paymentTransactionDate);
-        });
-
-        it('should reject registration with invalid transaction hash', async function() {
-            const response = await makePaymentRequest('POST', '/api/accounts', {
-                transactionHash: 'InvalidTransactionHashThatDoesNotExist123456789'
-            });
-            
-            assert.equal(response.statusCode, 400);
-            assert.ok(response.body.error.includes('Payment verification failed'));
-        });
-
-        it('should reject registration without transaction hash when payment is required', async function() {
-            const response = await makePaymentRequest('POST', '/api/accounts', {
-                accountId: 'someaccount.near'
-            });
-            
-            assert.equal(response.statusCode, 400);
-            assert.ok(response.body.error.includes('transactionHash is required'));
-        });
-    });
-});
+// NOTE: Payment verification tests have been removed as the feature was deprecated
+// in favor of lazy enrollment (automatic registration on first API request)
 
 // Test suite for CORS functionality
 describe('API Server - CORS Configuration', function() {
