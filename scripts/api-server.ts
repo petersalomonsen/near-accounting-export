@@ -16,6 +16,7 @@ import { callViewFunction } from './rpc.js';
 import { detectGapsV2 } from './gap-detection.js';
 import { migrateToV2 } from './migrate-to-flat-format.js';
 import { isStakingPool } from './balance-tracker.js';
+import { syncFtTransfersForAccount } from './transfers-sync.js';
 import type { GapAnalysisV2 } from './gap-detection.js';
 import type { BalanceChangeRecord } from './balance-tracker.js';
 
@@ -676,6 +677,20 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
                     });
                 } catch (error) {
                     console.error(`[${accountId}] Forward search failed:`, error);
+                }
+
+                // Authoritative FT records from the FastNear Transfers API.
+                // Runs every cycle: it reports each FT transfer at its real
+                // settlement block with start/end-of-block balances, capturing
+                // multi-hop claims the block-sampling path misses (see
+                // transfers-sync.ts). Incremental after the latest stored FT block.
+                try {
+                    const ftSync = await syncFtTransfersForAccount(accountId, outputFile);
+                    if (ftSync.changed) {
+                        console.log(`[${accountId}] FT transfers sync: +${ftSync.fetched} fetched, ${ftSync.gaps.length} gap(s), ${ftSync.filled} reconciled`);
+                    }
+                } catch (error) {
+                    console.error(`[${accountId}] FT transfers sync failed:`, error);
                 }
 
                 // Skip backward search if shutting down
