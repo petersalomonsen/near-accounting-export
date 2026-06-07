@@ -64,6 +64,16 @@ function ftKey(r: BalanceChangeRecord): string {
 }
 
 /**
+ * A record this module previously synthesized to bridge a gap: it has no tx,
+ * receipt, or timestamp. Used to purge such records on re-backfill. (Owned FT/
+ * intents records from the API always carry a tx hash and timestamp, so this
+ * never matches real transfer records.)
+ */
+function isSynthetic(r: BalanceChangeRecord): boolean {
+    return r.block_timestamp == null && r.receipt_id == null && r.tx_hash == null;
+}
+
+/**
  * Default gap reconciler. The transfers API balances already tell us the true
  * balance on both sides of a discontinuity, so we synthesize a single record
  * that reconnects them (amount = the diff). No RPC sampling required; a richer
@@ -99,7 +109,11 @@ export interface MergeOptions {
      * incremental (additive, existing-wins).
      */
     backfill?: boolean;
-    /** Reconcile per-token balance discontinuities. Defaults to syntheticGapSampler. */
+    /**
+     * Optional gap reconciler. If provided, per-token balance discontinuities are
+     * filled by this sampler. Off by default — production does not synthesize
+     * records (see syntheticGapSampler, kept for experiments/tests).
+     */
     sampler?: GapSampler;
 }
 
@@ -149,10 +163,17 @@ export async function mergeFtTransferRecords(
     fetched: BalanceChangeRecord[],
     opts: MergeOptions = {}
 ): Promise<MergeResult> {
-    const sampler = opts.sampler ?? syntheticGapSampler;
+    // Gap reconciliation is opt-in. By default we do NOT synthesize records:
+    // the per-token backfill already keeps each token on a single coherent
+    // source, and synthetic records (no tx/receipt/timestamp) are low value and
+    // caused downstream issues (null block_timestamp). Pass opts.sampler to
+    // re-enable, e.g. for experiments.
+    const sampler = opts.sampler;
 
     const ownedFetched = fetched.filter(r => isTransfersOwned(r.token_id));
-    const ownedExisting = existing.filter(r => isTransfersOwned(r.token_id));
+    // Drop previously-synthesized records (null timestamp marker) so a re-backfill
+    // cleans them out instead of carrying them forward.
+    const ownedExisting = existing.filter(r => isTransfersOwned(r.token_id) && !isSynthetic(r));
     const nonOwned = existing.filter(r => !isTransfersOwned(r.token_id));
 
     let merged: BalanceChangeRecord[];
@@ -171,7 +192,7 @@ export async function mergeFtTransferRecords(
             } else if (ex.length > 0) {
                 merged.push(...ex);            // API incomplete -> keep existing (no regression)
             } else {
-                merged.push(...cand);          // new token, best effort (sampler fills residual)
+                merged.push(...cand);          // new token, best effort
             }
         }
     } else {
@@ -184,7 +205,7 @@ export async function mergeFtTransferRecords(
 
     const gaps = detectTokenGaps(merged);
     let filled = 0;
-    if (gaps.length > 0) {
+    if (gaps.length > 0 && sampler) {
         const byKey = new Map<string, BalanceChangeRecord>();
         for (const r of merged) byKey.set(ftKey(r), r);
         for (const gap of gaps) {
@@ -214,7 +235,8 @@ export function latestOwnedBlock(records: BalanceChangeRecord[]): number {
 // full re-fetch to backfill/correct existing files.
 //   1: initial FT (NEP-141) ingestion (N+2 claim fix)
 //   2: + NEAR Intents balances (NEP-245 "Mt"), normalized to canonical nep141:X
-export const FT_BACKFILL_VERSION = 2;
+//   3: purge synthetic gap records (null timestamp); gap reconciliation now opt-in
+export const FT_BACKFILL_VERSION = 3;
 
 export interface SyncOptions extends MergeOptions {
     /** Injectable fetcher for tests; defaults to the live transfers API. */
