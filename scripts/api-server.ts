@@ -679,18 +679,19 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
                     console.error(`[${accountId}] Forward search failed:`, error);
                 }
 
-                // Authoritative FT records from the FastNear Transfers API.
-                // Runs every cycle: it reports each FT transfer at its real
-                // settlement block with start/end-of-block balances, capturing
-                // multi-hop claims the block-sampling path misses (see
-                // transfers-sync.ts). Incremental after the latest stored FT block.
+                // Authoritative FT + NEAR Intents records from the FastNear
+                // Transfers API. Runs every cycle: it reports each transfer at its
+                // real settlement block with start/end-of-block balances, capturing
+                // multi-hop transfers the block-sampling path misses — FT claims
+                // and intents deposits (see transfers-sync.ts). Incremental after
+                // the latest stored owned block.
                 try {
-                    const ftSync = await syncFtTransfersForAccount(accountId, outputFile);
-                    if (ftSync.changed) {
-                        console.log(`[${accountId}] FT transfers sync: +${ftSync.fetched} fetched, ${ftSync.gaps.length} gap(s), ${ftSync.filled} reconciled`);
+                    const txSync = await syncFtTransfersForAccount(accountId, outputFile);
+                    if (txSync.changed) {
+                        console.log(`[${accountId}] Transfers sync: +${txSync.fetched} fetched, ${txSync.gaps.length} gap(s), ${txSync.filled} reconciled${txSync.backfilled ? ' (backfill)' : ''}`);
                     }
                 } catch (error) {
-                    console.error(`[${accountId}] FT transfers sync failed:`, error);
+                    console.error(`[${accountId}] Transfers sync failed:`, error);
                 }
 
                 // Skip backward search if shutting down
