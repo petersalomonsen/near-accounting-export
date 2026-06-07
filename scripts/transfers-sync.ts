@@ -1,18 +1,19 @@
-// FT transfer sync — makes the FastNear Transfers API the authoritative source
-// for fungible-token (NEP-141) balance-change records.
+// Transfers sync — makes the FastNear Transfers API the authoritative source for
+// fungible-token (NEP-141) AND NEAR Intents (NEP-245) balance-change records.
 //
 // Background: the legacy pipeline discovers a *transaction* block N and samples
-// ft_balance_of at N and N+1. Multi-hop claims (e.g. distribution.nearmobile.near
-// → npro.nearmobile.near) settle the credit at N+2, outside that window, so the
-// transfer is dropped and the claim is invisible. The transfers API reports each
-// transfer at its real receipt block with authoritative start/end-of-block
-// balances, eliminating the guesswork.
+// balances at N and N+1. Multi-hop transfers settle a couple blocks later, outside
+// that window, so they're dropped — e.g. NPRO claims (distribution.nearmobile.near
+// → npro.nearmobile.near, credited at N+2) and intents deposits (ft_transfer_call
+// → intents.near, credited via ft_on_transfer at N+2). The transfers API reports
+// every transfer at its real receipt block with authoritative start/end-of-block
+// balances, eliminating the guesswork — FT as asset_type "Ft", intents as "Mt".
 //
-// Scope: this module owns FT records only. NEAR (token_id "near") stays on the
-// existing path (the transfers API does not surface gas/implicit balance
-// movements, so switching NEAR wholesale would lose data). Intents internal
-// tokens ("nep141:*") and staking pools ("*.poolv1.near", ...) keep their
-// dedicated discovery paths.
+// Scope: this module owns FT records (bare contract ids) and intents records
+// (canonical "nep141:<contract>"). NEAR (token_id "near") stays on the existing
+// path — the transfers API doesn't surface gas/implicit movements, so switching
+// NEAR wholesale would lose data. Staking pools ("*.poolv1.near", ...) keep their
+// dedicated discovery path.
 
 import fs from 'fs';
 import {
@@ -28,20 +29,33 @@ import {
 } from './fastnear-transfers-api.js';
 
 /**
- * Does this token_id belong to the transfers-API-owned FT space?
- *
- * Owns only bare NEP-141 contract ids (e.g. "npro.nearmobile.near"). Excludes:
- *  - NEAR ("near")
- *  - intents / multi-token ids, which are scheme-prefixed and therefore contain
- *    a colon ("nep141:...", "nep245:intents.near:nep141:..."). A real NEAR
- *    account id never contains ":", so this one check covers every intents form.
- *  - staking pools ("*.poolv1.near", ...)
+ * A bare on-chain NEP-141 fungible token (e.g. "npro.nearmobile.near").
+ * Excludes NEAR, scheme-prefixed intents ids (they contain ":"), and staking pools.
  */
 export function isFtToken(tokenId: string): boolean {
     if (tokenId === 'near') return false;
     if (tokenId.includes(':')) return false; // intents / scheme-prefixed multi-token
     if (isStakingPool(tokenId)) return false;
     return true;
+}
+
+/**
+ * A NEAR Intents internal balance. Canonical form is "nep141:<contract>"; older
+ * records may use the longer "nep245:intents.near:nep141:<contract>" form, which
+ * the backfill rewrites to the canonical id.
+ */
+export function isIntentsToken(tokenId: string): boolean {
+    return tokenId.startsWith('nep141:') || tokenId.startsWith('nep245:intents.near:');
+}
+
+/**
+ * Tokens owned by the transfers-API sync: bare FT contracts AND NEAR Intents
+ * balances. Both have a complete, authoritative ledger in the transfers API
+ * (FT as asset_type "Ft", intents as "Mt"). NEAR and staking pools are NOT owned
+ * and keep their existing discovery paths.
+ */
+export function isTransfersOwned(tokenId: string): boolean {
+    return isFtToken(tokenId) || isIntentsToken(tokenId);
 }
 
 /** Stable identity for an FT record so the authoritative version replaces a stale one. */
@@ -75,16 +89,24 @@ export const syntheticGapSampler: GapSampler = async (gap: TokenGap) => {
 };
 
 export interface MergeOptions {
-    /** Replace ALL existing FT records instead of appending after the latest. */
-    fullResync?: boolean;
+    /**
+     * Backfill mode: the `fetched` set is the FULL history, so decide per token
+     * whether the API ledger is authoritative. A token whose API ledger is
+     * internally continuous replaces the existing records for that token; a token
+     * whose API ledger has gaps (swap-heavy intents tokens settle several
+     * transfers per block, so the API's per-transfer balances don't chain) is
+     * left as-is to avoid regressing it. Without this flag the merge is
+     * incremental (additive, existing-wins).
+     */
+    backfill?: boolean;
     /** Reconcile per-token balance discontinuities. Defaults to syntheticGapSampler. */
     sampler?: GapSampler;
 }
 
 export interface MergeResult {
-    /** Full merged record set across all tokens (FT replaced, others untouched). */
+    /** Full merged record set across all tokens (owned merged, others untouched). */
     records: BalanceChangeRecord[];
-    /** Number of FT records fetched from the transfers API. */
+    /** Number of owned (FT + intents) records fetched from the transfers API. */
     fetched: number;
     /** Discontinuities detected after merging. */
     gaps: TokenGap[];
@@ -92,14 +114,35 @@ export interface MergeResult {
     filled: number;
 }
 
+function groupByToken(records: BalanceChangeRecord[]): Map<string, BalanceChangeRecord[]> {
+    const m = new Map<string, BalanceChangeRecord[]>();
+    for (const r of records) {
+        const list = m.get(r.token_id) || [];
+        list.push(r);
+        m.set(r.token_id, list);
+    }
+    return m;
+}
+
 /**
  * Pure merge: combine existing records with freshly fetched transfer records.
  *
- * - Non-FT records (NEAR, intents, staking) pass through untouched.
- * - FT records: in incremental mode the existing set is kept and new records are
- *   added (authoritative version wins on key collision). In fullResync mode the
- *   existing FT set is discarded and rebuilt from the fetched records.
- * - After merging, per-token continuity is checked and any gap is reconciled.
+ * Non-owned records (NEAR, staking) always pass through untouched. For owned
+ * tokens (FT + intents):
+ *
+ *  - Incremental (default): keep every existing record and ADD only genuinely
+ *    new transfers (existing wins on key collision). The legacy balance-change
+ *    tracker records single-block settlements (incl. wNEAR/bridge mint & burn,
+ *    which aren't transfers); this preserves them and just adds the multi-hop
+ *    transfers it drops (FT claims, intents deposits).
+ *
+ *  - Backfill: per token, if the API's full ledger is internally continuous it
+ *    is authoritative and replaces the existing records for that token; if it has
+ *    gaps (swap-heavy intents tokens), the existing records are kept so we never
+ *    regress a token. New tokens (no existing records) take the API ledger.
+ *
+ * After merging, per-token continuity is checked and any residual gap is
+ * reconciled by the sampler.
  */
 export async function mergeFtTransferRecords(
     existing: BalanceChangeRecord[],
@@ -108,53 +151,70 @@ export async function mergeFtTransferRecords(
 ): Promise<MergeResult> {
     const sampler = opts.sampler ?? syntheticGapSampler;
 
-    const ftFetched = fetched.filter(r => isFtToken(r.token_id));
-    const ftExisting = existing.filter(r => isFtToken(r.token_id));
-    const nonFt = existing.filter(r => !isFtToken(r.token_id));
+    const ownedFetched = fetched.filter(r => isTransfersOwned(r.token_id));
+    const ownedExisting = existing.filter(r => isTransfersOwned(r.token_id));
+    const nonOwned = existing.filter(r => !isTransfersOwned(r.token_id));
 
-    const base = opts.fullResync ? [] : ftExisting;
+    let merged: BalanceChangeRecord[];
 
-    // Build the FT set, existing-wins. The legacy balance-change tracker's FT
-    // records are correct but INCOMPLETE: it captures single-block settlements
-    // (incl. wNEAR/bridge mint & burn, which aren't transfers) but drops 2+ hop
-    // claims that settle outside its sampling window. So we keep every existing
-    // record and let the transfers API ADD only the genuinely-missing transfers
-    // (matched by receipt id). Existing is inserted last so it wins collisions —
-    // this preserves mint/burn context instead of overwriting it.
-    const dedup = new Map<string, BalanceChangeRecord>();
-    for (const r of ftFetched) dedup.set(ftKey(r), r);
-    for (const r of base) dedup.set(ftKey(r), r);
-    let merged = [...dedup.values()];
+    if (opts.backfill) {
+        // Per-token: adopt the API ledger only when it is internally continuous.
+        const fByTok = groupByToken(ownedFetched);
+        const eByTok = groupByToken(ownedExisting);
+        const tokens = new Set<string>([...fByTok.keys(), ...eByTok.keys()]);
+        merged = [];
+        for (const tok of tokens) {
+            const cand = (fByTok.get(tok) || []).slice().sort((a, b) => a.block_height - b.block_height);
+            const ex = eByTok.get(tok) || [];
+            if (cand.length > 0 && detectTokenGaps(cand).length === 0) {
+                merged.push(...cand);          // API ledger complete -> authoritative
+            } else if (ex.length > 0) {
+                merged.push(...ex);            // API incomplete -> keep existing (no regression)
+            } else {
+                merged.push(...cand);          // new token, best effort (sampler fills residual)
+            }
+        }
+    } else {
+        // Incremental, existing-wins: add only genuinely-missing transfers.
+        const dedup = new Map<string, BalanceChangeRecord>();
+        for (const r of ownedFetched) dedup.set(ftKey(r), r);
+        for (const r of ownedExisting) dedup.set(ftKey(r), r);
+        merged = [...dedup.values()];
+    }
 
     const gaps = detectTokenGaps(merged);
     let filled = 0;
     if (gaps.length > 0) {
+        const byKey = new Map<string, BalanceChangeRecord>();
+        for (const r of merged) byKey.set(ftKey(r), r);
         for (const gap of gaps) {
             const recovered = await sampler(gap);
             for (const r of recovered) {
-                dedup.set(ftKey(r), r);
+                byKey.set(ftKey(r), r);
                 filled++;
             }
         }
-        merged = [...dedup.values()];
+        merged = [...byKey.values()];
     }
 
-    const records = [...nonFt, ...merged].sort((a, b) => b.block_height - a.block_height);
-    return { records, fetched: ftFetched.length, gaps, filled };
+    const records = [...nonOwned, ...merged].sort((a, b) => b.block_height - a.block_height);
+    return { records, fetched: ownedFetched.length, gaps, filled };
 }
 
-/** Highest FT-record block currently stored (0 if none). */
-export function latestFtBlock(records: BalanceChangeRecord[]): number {
+/** Highest block among transfers-API-owned records (FT + intents); 0 if none. */
+export function latestOwnedBlock(records: BalanceChangeRecord[]): number {
     let max = 0;
     for (const r of records) {
-        if (isFtToken(r.token_id) && r.block_height > max) max = r.block_height;
+        if (isTransfersOwned(r.token_id) && r.block_height > max) max = r.block_height;
     }
     return max;
 }
 
-// Bumped when the FT-record semantics change in a way that requires a one-time
-// full re-fetch to backfill/correct existing files (e.g. the N+2 claim fix).
-export const FT_BACKFILL_VERSION = 1;
+// Bumped when the owned-record semantics change in a way that requires a one-time
+// full re-fetch to backfill/correct existing files.
+//   1: initial FT (NEP-141) ingestion (N+2 claim fix)
+//   2: + NEAR Intents balances (NEP-245 "Mt"), normalized to canonical nep141:X
+export const FT_BACKFILL_VERSION = 2;
 
 export interface SyncOptions extends MergeOptions {
     /** Injectable fetcher for tests; defaults to the live transfers API. */
@@ -176,11 +236,12 @@ export interface SyncResult extends MergeResult {
 }
 
 /**
- * Sync FT transfer records for one account into its V2 history file.
+ * Sync transfers-API records (FT + NEAR Intents) for one account into its V2
+ * history file.
  *
- * Reads the file, fetches FT transfers from the transfers API (incrementally
- * after the latest stored FT block, or the full history on fullResync), merges,
- * reconciles gaps, and writes back. Non-V2 files are skipped.
+ * Reads the file, fetches transfers from the API (incrementally after the latest
+ * stored owned block, or the full history on backfill), merges, reconciles gaps,
+ * and writes back. Non-V2 files are skipped.
  */
 export async function syncFtTransfersForAccount(
     accountId: string,
@@ -195,35 +256,34 @@ export async function syncFtTransfersForAccount(
 
     const data = JSON.parse(fs.readFileSync(outputFile, 'utf-8'));
     if (data.version !== 2 || !Array.isArray(data.records)) {
-        // FT sync operates on the flat V2 format only.
+        // Sync operates on the flat V2 format only.
         return { records: data.records ?? [], fetched: 0, gaps: [], filled: 0, afterBlock: 0, changed: false, backfilled: false };
     }
 
     const existing: BalanceChangeRecord[] = data.records;
     data.metadata = data.metadata || {};
 
-    // Two-phase sync:
+    // Two-phase sync (applies to owned tokens: FT + NEAR Intents balances):
     //
-    //  - One-time backfill (file predates FT_BACKFILL_VERSION): rebuild the FT
-    //    set cleanly from the authoritative transfers API (full fetch + discard).
-    //    The legacy FT records and the transfers API keep balances on different
-    //    bases, so blanket-merging the two produces spurious discontinuities;
-    //    a clean rebuild avoids that. The only records lost are historical
-    //    mint/burn (wNEAR/bridge), which aren't transfers — the continuity check
-    //    re-creates them synthetically with correct amounts/balances.
+    //  - One-time backfill (file predates FT_BACKFILL_VERSION): fetch the FULL
+    //    history and, per token, adopt the API ledger where it is internally
+    //    continuous (authoritative, normalized to canonical ids) while leaving
+    //    tokens the API can't represent cleanly (swap-heavy intents) as-is. This
+    //    recovers the dropped transfers without regressing any token.
     //
-    //  - Steady state (incremental): fetch after the latest stored FT block and
+    //  - Steady state (incremental): fetch after the latest stored owned block and
     //    merge ADDITIVELY (existing-wins). The balance-change tracker runs first
     //    each cycle and records new mint/burn with full tx context; this keeps
-    //    them and only adds the multi-hop claims the tracker still misses.
+    //    them and only adds the multi-hop transfers the tracker misses (FT claims,
+    //    intents deposits).
     //
-    // Non-FT records (NEAR, intents, staking) are never touched.
+    // NEAR and staking records are never touched.
     const needsBackfill = data.metadata.ftBackfillVersion !== FT_BACKFILL_VERSION;
-    const fullResync = opts.fullResync || needsBackfill;
-    const afterBlock = fullResync ? 0 : latestFtBlock(existing);
+    const backfill = needsBackfill || opts.backfill === true;
+    const afterBlock = backfill ? 0 : latestOwnedBlock(existing);
 
     const fetched = await fetchRecords(accountId, { afterBlock: afterBlock || undefined });
-    const result = await mergeFtTransferRecords(existing, fetched, { ...opts, fullResync });
+    const result = await mergeFtTransferRecords(existing, fetched, { ...opts, backfill });
 
     const changed =
         result.records.length !== existing.length ||

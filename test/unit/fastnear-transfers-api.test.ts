@@ -50,6 +50,17 @@ describe('assetIdToTokenId', function () {
             'usdt.tether-token.near'
         );
     });
+
+    it('maps intents (Mt) multi-token ids to the canonical nep141: form', () => {
+        assert.equal(
+            assetIdToTokenId('nep245:intents.near:nep141:npro.nearmobile.near', 'Mt'),
+            'nep141:npro.nearmobile.near'
+        );
+        assert.equal(
+            assetIdToTokenId('nep245:intents.near:nep141:wrap.near', 'Mt'),
+            'nep141:wrap.near'
+        );
+    });
 });
 
 describe('mapTransferToRecord', function () {

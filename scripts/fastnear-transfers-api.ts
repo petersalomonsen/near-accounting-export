@@ -248,13 +248,22 @@ export async function getAllAccountTransfers(
 
 /**
  * Map a transfers-API asset_id to the V2 BalanceChangeRecord token_id convention:
- *   - "native:near"            -> "near"
- *   - "nep141:<contract>" (Ft) -> "<contract>"   (bare FT contract id)
- * The bare-contract form matches how FT records are stored today; the "nep141:"
- * prefix is reserved for intents internal tokens, which this API does not emit.
+ *   - "native:near"                                  -> "near"
+ *   - "nep141:<contract>"                      (Ft)  -> "<contract>"        (bare FT contract)
+ *   - "nep245:intents.near:nep141:<contract>"  (Mt)  -> "nep141:<contract>" (intents balance)
+ *
+ * Bare-contract ids are how on-chain FT balances are stored; the "nep141:"-
+ * prefixed form is the canonical id for NEAR Intents internal balances (the one
+ * the app/frontend resolves metadata for). For intents multi-tokens the API uses
+ * the longer "nep245:intents.near:<inner>" id, so we strip the intents-contract
+ * prefix down to that inner id.
  */
 export function assetIdToTokenId(assetId: string, assetType?: string): string {
     if (assetId === 'native:near' || assetType === 'Native') return 'near';
+    // NEAR Intents multi-token: nep245:intents.near:nep141:X -> nep141:X
+    const intentsPrefix = 'nep245:intents.near:';
+    if (assetId.startsWith(intentsPrefix)) return assetId.slice(intentsPrefix.length);
+    // Bare NEP-141 fungible token: nep141:X -> X
     if (assetId.startsWith('nep141:')) return assetId.slice('nep141:'.length);
     return assetId;
 }

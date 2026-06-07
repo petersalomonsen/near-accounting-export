@@ -5,7 +5,9 @@ import os from 'os';
 import path from 'path';
 import {
     isFtToken,
-    latestFtBlock,
+    isIntentsToken,
+    isTransfersOwned,
+    latestOwnedBlock,
     mergeFtTransferRecords,
     syntheticGapSampler,
     syncFtTransfersForAccount,
@@ -29,36 +31,50 @@ function rec(partial: Partial<BalanceChangeRecord> & { token_id: string; block_h
     };
 }
 
-describe('isFtToken', function () {
-    it('owns plain FT contracts, not NEAR / intents / staking', () => {
+describe('token classification', function () {
+    it('isFtToken: plain FT contracts only', () => {
         assert.equal(isFtToken('npro.nearmobile.near'), true);
         assert.equal(isFtToken('usdt.tether-token.near'), true);
         assert.equal(isFtToken('near'), false);
-        assert.equal(isFtToken('nep141:npro.nearmobile.near'), false); // intents internal
+        assert.equal(isFtToken('nep141:npro.nearmobile.near'), false); // intents
         assert.equal(isFtToken('npro.poolv1.near'), false);            // staking pool
-        assert.equal(isFtToken('binancenode1.poolv1.near'), false);
+    });
+
+    it('isIntentsToken: nep141:/nep245:intents.near: ids', () => {
+        assert.equal(isIntentsToken('nep141:npro.nearmobile.near'), true);
+        assert.equal(isIntentsToken('nep245:intents.near:nep141:wrap.near'), true);
+        assert.equal(isIntentsToken('npro.nearmobile.near'), false);
+        assert.equal(isIntentsToken('near'), false);
+    });
+
+    it('isTransfersOwned: FT + intents, not NEAR / staking', () => {
+        assert.equal(isTransfersOwned('npro.nearmobile.near'), true);       // FT
+        assert.equal(isTransfersOwned('nep141:npro.nearmobile.near'), true); // intents
+        assert.equal(isTransfersOwned('nep245:intents.near:nep141:wrap.near'), true);
+        assert.equal(isTransfersOwned('near'), false);
+        assert.equal(isTransfersOwned('binancenode1.poolv1.near'), false);
     });
 });
 
-describe('latestFtBlock', function () {
-    it('returns the max block among FT records only', () => {
+describe('latestOwnedBlock', function () {
+    it('returns the max block among owned (FT + intents) records', () => {
         const records = [
             rec({ token_id: 'npro.nearmobile.near', block_height: 100 }),
             rec({ token_id: 'near', block_height: 999 }),               // ignored
-            rec({ token_id: 'npro.poolv1.near', block_height: 888 }),   // ignored
-            rec({ token_id: 'npro.nearmobile.near', block_height: 200 }),
+            rec({ token_id: 'npro.poolv1.near', block_height: 888 }),   // ignored (staking)
+            rec({ token_id: 'nep141:npro.nearmobile.near', block_height: 300 }), // intents counted
         ];
-        assert.equal(latestFtBlock(records), 200);
-        assert.equal(latestFtBlock([]), 0);
+        assert.equal(latestOwnedBlock(records), 300);
+        assert.equal(latestOwnedBlock([]), 0);
     });
 });
 
 describe('mergeFtTransferRecords', function () {
-    it('appends new FT records and leaves NEAR/intents/staking untouched', async () => {
+    it('appends new owned records and leaves NEAR/staking untouched', async () => {
         const existing = [
             rec({ token_id: 'near', block_height: 50, amount: '-1' }),
-            rec({ token_id: 'nep141:npro.nearmobile.near', block_height: 60 }),
-            rec({ token_id: 'binancenode1.poolv1.near', block_height: 70 }),
+            rec({ token_id: 'nep141:npro.nearmobile.near', block_height: 60 }), // intents (owned)
+            rec({ token_id: 'binancenode1.poolv1.near', block_height: 70 }),    // staking (not owned)
             rec({ token_id: 'npro.nearmobile.near', block_height: 100, receipt_id: 'A', amount: '10', balance_before: '0', balance_after: '10' }),
         ];
         const fetched = [
@@ -67,13 +83,29 @@ describe('mergeFtTransferRecords', function () {
         const result = await mergeFtTransferRecords(existing, fetched);
         assert.equal(result.fetched, 1);
         assert.equal(result.gaps.length, 0);
-        // All non-FT preserved, plus both FT records.
         assert.equal(result.records.length, 5);
-        assert.ok(result.records.some(r => r.token_id === 'near'));
-        assert.ok(result.records.some(r => r.token_id === 'nep141:npro.nearmobile.near'));
-        assert.ok(result.records.some(r => r.token_id === 'binancenode1.poolv1.near'));
-        // Sorted newest-first.
+        assert.ok(result.records.some(r => r.token_id === 'near'));                       // NEAR untouched
+        assert.ok(result.records.some(r => r.token_id === 'nep141:npro.nearmobile.near')); // intents preserved
+        assert.ok(result.records.some(r => r.token_id === 'binancenode1.poolv1.near'));   // staking untouched
         assert.deepEqual(result.records.map(r => r.block_height), [200, 100, 70, 60, 50]);
+    });
+
+    it('adds a missing INTENTS deposit (the user-reported gap)', async () => {
+        // Production shape: the intents withdrawal/swap was recorded (balance
+        // jumps to a full amount from dust) but the deposit that funded it was
+        // dropped — a per-token discontinuity. The transfers API supplies the
+        // missing ft_on_transfer deposit, restoring continuity.
+        const existing = [
+            rec({ token_id: 'nep141:npro.nearmobile.near', block_height: 500, receipt_id: 'SWAP', amount: '-24', balance_before: '24', balance_after: '0' }),
+        ];
+        const fetched = [
+            rec({ token_id: 'nep141:npro.nearmobile.near', block_height: 480, receipt_id: 'DEPOSIT', amount: '24', balance_before: '0', balance_after: '24' }),
+        ];
+        const result = await mergeFtTransferRecords(existing, fetched);
+        const intents = result.records.filter(r => r.token_id === 'nep141:npro.nearmobile.near');
+        assert.equal(result.fetched, 1, 'intents transfer is owned and ingested');
+        assert.equal(intents.length, 2, 'deposit added alongside the existing swap');
+        assert.equal(result.gaps.length, 0, 'deposit restores intents continuity');
     });
 
     it('keeps the existing record on a receipt collision (existing-wins, no duplicate)', async () => {
@@ -124,18 +156,37 @@ describe('mergeFtTransferRecords', function () {
         assert.equal(synthetic!.balance_after, '50');
     });
 
-    it('fullResync discards the existing FT set and rebuilds from fetched', async () => {
+    it('backfill: adopts a clean API ledger per token, keeps NEAR untouched', async () => {
         const existing = [
-            rec({ token_id: 'old.near', block_height: 1, receipt_id: 'X', amount: '1', balance_after: '1' }),
+            // stale/incomplete existing FT records for tkn.near (will be replaced)
+            rec({ token_id: 'tkn.near', block_height: 1, receipt_id: 'OLD', amount: '1', balance_before: '0', balance_after: '1' }),
             rec({ token_id: 'near', block_height: 2, amount: '-1' }),
         ];
         const fetched = [
-            rec({ token_id: 'new.near', block_height: 300, receipt_id: 'Y', amount: '7', balance_after: '7' }),
+            rec({ token_id: 'tkn.near', block_height: 100, receipt_id: 'A', amount: '10', balance_before: '0', balance_after: '10' }),
+            rec({ token_id: 'tkn.near', block_height: 200, receipt_id: 'B', amount: '5', balance_before: '10', balance_after: '15' }),
         ];
-        const result = await mergeFtTransferRecords(existing, fetched, { fullResync: true });
-        assert.ok(!result.records.some(r => r.token_id === 'old.near'), 'old FT record dropped on full resync');
-        assert.ok(result.records.some(r => r.token_id === 'near'), 'NEAR record preserved even on full resync');
-        assert.ok(result.records.some(r => r.token_id === 'new.near'));
+        const result = await mergeFtTransferRecords(existing, fetched, { backfill: true });
+        const tkn = result.records.filter(r => r.token_id === 'tkn.near');
+        assert.equal(tkn.length, 2, 'clean API ledger replaces the stale existing records');
+        assert.ok(!result.records.some(r => r.receipt_id === 'OLD'), 'stale record dropped');
+        assert.ok(result.records.some(r => r.token_id === 'near'), 'NEAR untouched');
+        assert.equal(result.gaps.length, 0);
+    });
+
+    it('backfill: keeps existing records for a token whose API ledger is gappy (no regression)', async () => {
+        const existing = [
+            rec({ token_id: 'swap.near', block_height: 10, receipt_id: 'E1', amount: '5', balance_before: '0', balance_after: '5' }),
+            rec({ token_id: 'swap.near', block_height: 20, receipt_id: 'E2', amount: '5', balance_before: '5', balance_after: '10' }),
+        ];
+        // API ledger for swap.near is internally discontinuous (5 -> 99).
+        const fetched = [
+            rec({ token_id: 'swap.near', block_height: 11, receipt_id: 'F1', amount: '5', balance_before: '0', balance_after: '5' }),
+            rec({ token_id: 'swap.near', block_height: 21, receipt_id: 'F2', amount: '5', balance_before: '99', balance_after: '104' }),
+        ];
+        const result = await mergeFtTransferRecords(existing, fetched, { backfill: true });
+        const swap = result.records.filter(r => r.token_id === 'swap.near');
+        assert.deepEqual(swap.map(r => r.receipt_id).sort(), ['E1', 'E2'], 'kept existing, did not adopt gappy API ledger');
     });
 });
 
@@ -186,7 +237,7 @@ describe('syncFtTransfersForAccount', function () {
         assert.ok(!written.records.some((r: any) => r.receipt_id === 'STALE'), 'stale FT record dropped');
         assert.ok(written.records.some((r: any) => r.receipt_id === 'REAL'));
         assert.ok(written.records.some((r: any) => r.token_id === 'near'));
-        assert.equal(written.metadata.ftBackfillVersion, 1);
+        assert.equal(written.metadata.ftBackfillVersion, 2);
 
         fs.rmSync(dir, { recursive: true, force: true });
     });
@@ -200,7 +251,7 @@ describe('syncFtTransfersForAccount', function () {
             records: [
                 rec({ token_id: 'npro.nearmobile.near', block_height: 100, receipt_id: 'A', amount: '10', balance_after: '10' }),
             ],
-            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 1, ftBackfillVersion: 1 },
+            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 1, ftBackfillVersion: 2 },
         }, null, 2));
 
         let calledAfter: number | undefined = -1;

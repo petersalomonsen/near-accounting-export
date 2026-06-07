@@ -93,4 +93,27 @@ describe('FastNear Transfers API (live)', function () {
             `Expected no balance discontinuities in transfers-derived NPRO records, got: ${JSON.stringify(gaps)}`
         );
     });
+
+    it('captures NEAR Intents NPRO deposits as a continuous nep141: ledger', async function () {
+        // The intents side (asset_type "Mt") carries the deposits into NEAR
+        // Intents that the legacy path dropped. They must map to the canonical
+        // nep141:<contract> token_id and form a continuous, deposit-bearing ledger.
+        const records = await getAccountTransferRecords(ACCOUNT, {
+            assetId: 'nep245:intents.near:nep141:npro.nearmobile.near',
+            fromTimestampMs: FROM_MS,
+            toTimestampMs: TO_MS,
+        });
+
+        const intents = records.filter(r => r.token_id === 'nep141:npro.nearmobile.near');
+        assert.ok(intents.length >= 2, 'Expected intents NPRO records mapped to nep141: form');
+
+        const deposits = intents.filter(r => BigInt(r.amount) > 0n);
+        assert.ok(deposits.length > 0, 'Expected at least one intents NPRO deposit');
+
+        assert.deepEqual(
+            detectTokenGaps(intents),
+            [],
+            'Intents NPRO ledger from the API should be internally continuous'
+        );
+    });
 });
