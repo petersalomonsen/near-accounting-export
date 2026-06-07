@@ -139,24 +139,75 @@ function groupByToken(records: BalanceChangeRecord[]): Map<string, BalanceChange
 }
 
 /**
+ * The transfers API reports BLOCK-level balances, so per-token continuity is
+ * checked at block granularity: block N's end balance must equal block N+1's
+ * start balance. A mismatch means a NON-transfer balance change happened in
+ * between (mint/burn, unwrap, bridge withdrawal) — the API can't represent it,
+ * but the legacy balance-change tracker sampled it.
+ *
+ * Returns the existing records that fall inside such API gaps (and before the
+ * first API block when it starts from a non-zero balance), so they can be added
+ * to complete the ledger. Records that merely duplicate an API transfer are NOT
+ * returned, because they don't fall inside a gap.
+ */
+function fillBlockGapsFromExisting(
+    apiRecords: BalanceChangeRecord[],
+    existing: BalanceChangeRecord[]
+): BalanceChangeRecord[] {
+    const apiByTok = groupByToken(apiRecords);
+    const exByTok = groupByToken(existing);
+    const fills: BalanceChangeRecord[] = [];
+
+    for (const [token, recs] of apiByTok) {
+        const ex = exByTok.get(token);
+        if (!ex || ex.length === 0) continue;
+
+        // Block-level balances (consistent within a block); sorted unique blocks.
+        const blockBal = new Map<number, { start: string; end: string }>();
+        for (const r of recs) {
+            if (!blockBal.has(r.block_height)) {
+                blockBal.set(r.block_height, { start: r.balance_before, end: r.balance_after });
+            }
+        }
+        const blocks = [...blockBal.keys()].sort((a, b) => a - b);
+
+        const addInRange = (lo: number, hi: number) => {
+            for (const r of ex) if (r.block_height > lo && r.block_height < hi) fills.push(r);
+        };
+
+        // Leading gap: API history starts above zero -> earlier records are missing.
+        if (blockBal.get(blocks[0]!)!.start !== '0') addInRange(-1, blocks[0]!);
+
+        // Internal gaps: end of one block != start of the next.
+        for (let i = 0; i < blocks.length - 1; i++) {
+            if (blockBal.get(blocks[i]!)!.end !== blockBal.get(blocks[i + 1]!)!.start) {
+                addInRange(blocks[i]!, blocks[i + 1]!);
+            }
+        }
+    }
+    return fills;
+}
+
+/**
  * Pure merge: combine existing records with freshly fetched transfer records.
  *
  * Non-owned records (NEAR, staking) always pass through untouched. For owned
  * tokens (FT + intents):
  *
+ *  - Backfill: ADOPT the API's full ledger as the single authoritative source
+ *    (the existing owned records are discarded). The transfers API is the
+ *    comprehensive transfer index, so this gives the most complete event history
+ *    without double-counting across two sources. Some tokens keep balance-
+ *    continuity gaps — swap-heavy intents tokens settle several transfers per
+ *    block (block-level balance snapshots), and a few balance moves aren't
+ *    transfers (wNEAR/bridge mint & burn) — but those are accepted: complete,
+ *    non-duplicated events matter more than a perfectly chained running balance.
+ *
  *  - Incremental (default): keep every existing record and ADD only genuinely
- *    new transfers (existing wins on key collision). The legacy balance-change
- *    tracker records single-block settlements (incl. wNEAR/bridge mint & burn,
- *    which aren't transfers); this preserves them and just adds the multi-hop
- *    transfers it drops (FT claims, intents deposits).
+ *    new transfers (existing wins on key collision), so the balance-change
+ *    tracker's between-backfill records aren't duplicated.
  *
- *  - Backfill: per token, if the API's full ledger is internally continuous it
- *    is authoritative and replaces the existing records for that token; if it has
- *    gaps (swap-heavy intents tokens), the existing records are kept so we never
- *    regress a token. New tokens (no existing records) take the API ledger.
- *
- * After merging, per-token continuity is checked and any residual gap is
- * reconciled by the sampler.
+ * After merging, per-token continuity is reported; gap reconciliation is opt-in.
  */
 export async function mergeFtTransferRecords(
     existing: BalanceChangeRecord[],
@@ -179,22 +230,13 @@ export async function mergeFtTransferRecords(
     let merged: BalanceChangeRecord[];
 
     if (opts.backfill) {
-        // Per-token: adopt the API ledger only when it is internally continuous.
-        const fByTok = groupByToken(ownedFetched);
-        const eByTok = groupByToken(ownedExisting);
-        const tokens = new Set<string>([...fByTok.keys(), ...eByTok.keys()]);
-        merged = [];
-        for (const tok of tokens) {
-            const cand = (fByTok.get(tok) || []).slice().sort((a, b) => a.block_height - b.block_height);
-            const ex = eByTok.get(tok) || [];
-            if (cand.length > 0 && detectTokenGaps(cand).length === 0) {
-                merged.push(...cand);          // API ledger complete -> authoritative
-            } else if (ex.length > 0) {
-                merged.push(...ex);            // API incomplete -> keep existing (no regression)
-            } else {
-                merged.push(...cand);          // new token, best effort
-            }
-        }
+        // Adopt the authoritative API transfer ledger for all owned tokens, then
+        // fill the API's block-level gaps with the existing balance-tracker
+        // records that bridge them. The API misses NON-transfer balance changes
+        // (wNEAR/bridge mint & burn, unwraps); the balance-tracker sampled those.
+        // We only add existing records that fall inside a genuine API gap, so
+        // transfers are never double-counted.
+        merged = [...ownedFetched, ...fillBlockGapsFromExisting(ownedFetched, ownedExisting)];
     } else {
         // Incremental, existing-wins: add only genuinely-missing transfers.
         const dedup = new Map<string, BalanceChangeRecord>();
@@ -236,7 +278,11 @@ export function latestOwnedBlock(records: BalanceChangeRecord[]): number {
 //   1: initial FT (NEP-141) ingestion (N+2 claim fix)
 //   2: + NEAR Intents balances (NEP-245 "Mt"), normalized to canonical nep141:X
 //   3: purge synthetic gap records (null timestamp); gap reconciliation now opt-in
-export const FT_BACKFILL_VERSION = 3;
+//   4: backfill adopts the full API ledger for all owned tokens (complete events
+//      over balance continuity) — recovers swap-heavy intents history (wNEAR etc.)
+//   5: backfill also fills the API's block-level gaps with existing balance-tracker
+//      records (captures non-transfer mint/burn the API can't represent)
+export const FT_BACKFILL_VERSION = 5;
 
 export interface SyncOptions extends MergeOptions {
     /** Injectable fetcher for tests; defaults to the live transfers API. */
@@ -288,10 +334,11 @@ export async function syncFtTransfersForAccount(
     // Two-phase sync (applies to owned tokens: FT + NEAR Intents balances):
     //
     //  - One-time backfill (file predates FT_BACKFILL_VERSION): fetch the FULL
-    //    history and, per token, adopt the API ledger where it is internally
-    //    continuous (authoritative, normalized to canonical ids) while leaving
-    //    tokens the API can't represent cleanly (swap-heavy intents) as-is. This
-    //    recovers the dropped transfers without regressing any token.
+    //    history and adopt the API transfer ledger for all owned tokens
+    //    (normalized to canonical ids), then fill the API's block-level gaps with
+    //    the existing balance-tracker records that bridge them (non-transfer
+    //    mint/burn the API can't see). Recovers every balance-changing event,
+    //    including swap-heavy intents history (wNEAR etc.) the old path missed.
     //
     //  - Steady state (incremental): fetch after the latest stored owned block and
     //    merge ADDITIVELY (existing-wins). The balance-change tracker runs first
