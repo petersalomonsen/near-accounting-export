@@ -16,8 +16,9 @@ import type { BalanceChangeRecord } from '../../scripts/balance-tracker.js';
 
 function rec(partial: Partial<BalanceChangeRecord> & { token_id: string; block_height: number }): BalanceChangeRecord {
     return {
-        block_timestamp: null,
-        tx_hash: null,
+        // Real records carry a timestamp; tests that want a synthetic record set it null.
+        block_timestamp: '2026-01-01T00:00:00.000Z',
+        tx_hash: 'tx',
         tx_block: null,
         signer_id: null,
         receiver_id: null,
@@ -140,14 +141,19 @@ describe('mergeFtTransferRecords', function () {
         assert.equal(result.gaps.length, 0, 'added claim restores continuity');
     });
 
-    it('reconciles a real discontinuity with the synthetic sampler', async () => {
+    it('reconciles a real discontinuity when a sampler is provided (opt-in)', async () => {
         const existing: BalanceChangeRecord[] = [];
         const fetched = [
             rec({ token_id: 'tkn.near', block_height: 100, receipt_id: 'A', amount: '10', balance_before: '0', balance_after: '10' }),
             // jump: balance_before 50 != previous balance_after 10 -> missing transfer
             rec({ token_id: 'tkn.near', block_height: 200, receipt_id: 'B', amount: '5', balance_before: '50', balance_after: '55' }),
         ];
-        const result = await mergeFtTransferRecords(existing, fetched);
+        // Without a sampler, gaps are reported but not filled.
+        const noFill = await mergeFtTransferRecords(existing, fetched);
+        assert.equal(noFill.gaps.length, 1);
+        assert.equal(noFill.filled, 0);
+        // Opt in to the synthetic sampler.
+        const result = await mergeFtTransferRecords(existing, fetched, { sampler: syntheticGapSampler });
         assert.equal(result.gaps.length, 1);
         assert.equal(result.filled, 1);
         const synthetic = result.records.find(r => r.amount === '40');
@@ -237,7 +243,7 @@ describe('syncFtTransfersForAccount', function () {
         assert.ok(!written.records.some((r: any) => r.receipt_id === 'STALE'), 'stale FT record dropped');
         assert.ok(written.records.some((r: any) => r.receipt_id === 'REAL'));
         assert.ok(written.records.some((r: any) => r.token_id === 'near'));
-        assert.equal(written.metadata.ftBackfillVersion, 2);
+        assert.equal(written.metadata.ftBackfillVersion, 3);
 
         fs.rmSync(dir, { recursive: true, force: true });
     });
@@ -251,7 +257,7 @@ describe('syncFtTransfersForAccount', function () {
             records: [
                 rec({ token_id: 'npro.nearmobile.near', block_height: 100, receipt_id: 'A', amount: '10', balance_after: '10' }),
             ],
-            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 1, ftBackfillVersion: 2 },
+            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 1, ftBackfillVersion: 3 },
         }, null, 2));
 
         let calledAfter: number | undefined = -1;
