@@ -180,19 +180,36 @@ describe('mergeFtTransferRecords', function () {
         assert.equal(result.gaps.length, 0);
     });
 
-    it('backfill: keeps existing records for a token whose API ledger is gappy (no regression)', async () => {
+    it('backfill: adopts API transfers and fills a block-level gap from existing (mint/burn)', async () => {
+        // API has two transfers but its block-level balance jumps 10 -> 50 between
+        // them: a non-transfer mint the API can't represent. The balance-tracker
+        // sampled it (MINT at block 200); backfill keeps that record to bridge the
+        // gap, while a stale pre-history record (OLD) is dropped.
         const existing = [
-            rec({ token_id: 'swap.near', block_height: 10, receipt_id: 'E1', amount: '5', balance_before: '0', balance_after: '5' }),
-            rec({ token_id: 'swap.near', block_height: 20, receipt_id: 'E2', amount: '5', balance_before: '5', balance_after: '10' }),
+            rec({ token_id: 'tkn.near', block_height: 1, receipt_id: 'OLD', amount: '1', balance_before: '0', balance_after: '1' }),
+            rec({ token_id: 'tkn.near', block_height: 200, receipt_id: null, tx_hash: 'mintTx', amount: '40', balance_before: '10', balance_after: '50' }),
         ];
-        // API ledger for swap.near is internally discontinuous (5 -> 99).
         const fetched = [
-            rec({ token_id: 'swap.near', block_height: 11, receipt_id: 'F1', amount: '5', balance_before: '0', balance_after: '5' }),
-            rec({ token_id: 'swap.near', block_height: 21, receipt_id: 'F2', amount: '5', balance_before: '99', balance_after: '104' }),
+            rec({ token_id: 'tkn.near', block_height: 100, receipt_id: 'A', amount: '10', balance_before: '0', balance_after: '10' }),
+            rec({ token_id: 'tkn.near', block_height: 300, receipt_id: 'B', amount: '-50', balance_before: '50', balance_after: '0' }),
         ];
         const result = await mergeFtTransferRecords(existing, fetched, { backfill: true });
-        const swap = result.records.filter(r => r.token_id === 'swap.near');
-        assert.deepEqual(swap.map(r => r.receipt_id).sort(), ['E1', 'E2'], 'kept existing, did not adopt gappy API ledger');
+        const tkn = result.records.filter(r => r.token_id === 'tkn.near').sort((a, b) => a.block_height - b.block_height);
+        assert.deepEqual(tkn.map(r => r.block_height), [100, 200, 300], 'API transfers + the bridging mint, no stale OLD record');
+        assert.equal(result.gaps.length, 0, 'block gap filled from the existing mint record');
+    });
+
+    it('backfill: a clean API token does not pull in stale existing records', async () => {
+        const existing = [
+            rec({ token_id: 'tkn.near', block_height: 1, receipt_id: 'STALE', amount: '1', balance_before: '0', balance_after: '1' }),
+        ];
+        const fetched = [
+            rec({ token_id: 'tkn.near', block_height: 100, receipt_id: 'A', amount: '10', balance_before: '0', balance_after: '10' }),
+            rec({ token_id: 'tkn.near', block_height: 200, receipt_id: 'B', amount: '5', balance_before: '10', balance_after: '15' }),
+        ];
+        const result = await mergeFtTransferRecords(existing, fetched, { backfill: true });
+        assert.ok(!result.records.some(r => r.receipt_id === 'STALE'), 'no gap -> stale record not re-added');
+        assert.equal(result.gaps.length, 0);
     });
 });
 
@@ -243,7 +260,7 @@ describe('syncFtTransfersForAccount', function () {
         assert.ok(!written.records.some((r: any) => r.receipt_id === 'STALE'), 'stale FT record dropped');
         assert.ok(written.records.some((r: any) => r.receipt_id === 'REAL'));
         assert.ok(written.records.some((r: any) => r.token_id === 'near'));
-        assert.equal(written.metadata.ftBackfillVersion, 3);
+        assert.equal(written.metadata.ftBackfillVersion, 5);
 
         fs.rmSync(dir, { recursive: true, force: true });
     });
@@ -257,7 +274,7 @@ describe('syncFtTransfersForAccount', function () {
             records: [
                 rec({ token_id: 'npro.nearmobile.near', block_height: 100, receipt_id: 'A', amount: '10', balance_after: '10' }),
             ],
-            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 1, ftBackfillVersion: 3 },
+            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 1, ftBackfillVersion: 5 },
         }, null, 2));
 
         let calledAfter: number | undefined = -1;
