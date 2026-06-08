@@ -7,9 +7,9 @@ on:
     branches: [main]
 
 jobs:
+  # Deterministic unit tests — the reliable signal that gates merges.
   test:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,8 +26,35 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Run tests
+      - name: Run unit tests
+        run: npm run test:unit
+
+  # Integration tests hit live external APIs (FastNear / NearBlocks / RPC) and are
+  # inherently flaky — they must NOT gate merges. Kept visible (and retried to cut
+  # transient noise) so genuine regressions are still surfaced.
+  integration:
+    runs-on: ubuntu-latest
+    # Informational: a failure here (e.g. an upstream API timeout) does not fail
+    # the workflow or block merging.
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run integration tests
         env:
           FASTNEAR_API_KEY: ${{ secrets.FASTNEAR_API_KEY }}
           NEARBLOCKS_API_KEY: ${{ secrets.NEARBLOCKS_API_KEY }}
-        run: npm test
+        run: npm run test:integration
