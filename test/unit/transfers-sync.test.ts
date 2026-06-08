@@ -91,6 +91,36 @@ describe('mergeFtTransferRecords', function () {
         assert.deepEqual(result.records.map(r => r.block_height), [200, 100, 70, 60, 50]);
     });
 
+    it('fills a NEAR gap with an API native:near transfer the tracker dropped', async () => {
+        // The balance-tracker's NEAR ledger jumps 100 -> 300 between two records:
+        // a cross-contract NEAR transfer (DAO/treasury) it missed. The API has it;
+        // keep the tracker's NEAR records and add the missing transfer in the gap.
+        const existing = [
+            rec({ token_id: 'near', block_height: 100, amount: '-1', balance_before: '101', balance_after: '100' }),
+            rec({ token_id: 'near', block_height: 300, amount: '-1', balance_before: '300', balance_after: '299' }),
+        ];
+        const fetched = [
+            rec({ token_id: 'near', block_height: 200, receipt_id: 'DAO', amount: '200', balance_before: '100', balance_after: '300', counterparty: 'treasury.sputnik-dao.near' }),
+        ];
+        const result = await mergeFtTransferRecords(existing, fetched, { backfill: true });
+        const near = result.records.filter(r => r.token_id === 'near').sort((a, b) => a.block_height - b.block_height);
+        assert.equal(near.length, 3, 'missing NEAR transfer added between the tracker records');
+        assert.equal(near[1]!.receipt_id, 'DAO');
+        assert.equal(result.fetched, 0, 'NEAR is not counted as an owned fetch');
+    });
+
+    it('does not add an API NEAR transfer where the tracker has no gap', async () => {
+        const existing = [
+            rec({ token_id: 'near', block_height: 100, amount: '-1', balance_before: '101', balance_after: '100' }),
+            rec({ token_id: 'near', block_height: 300, amount: '-1', balance_before: '100', balance_after: '99' }),
+        ];
+        const fetched = [
+            rec({ token_id: 'near', block_height: 200, receipt_id: 'DUP', amount: '0', balance_before: '100', balance_after: '100' }),
+        ];
+        const result = await mergeFtTransferRecords(existing, fetched, { backfill: true });
+        assert.ok(!result.records.some(r => r.receipt_id === 'DUP'), 'no gap -> no NEAR fill (no double-count)');
+    });
+
     it('adds a missing INTENTS deposit (the user-reported gap)', async () => {
         // Production shape: the intents withdrawal/swap was recorded (balance
         // jumps to a full amount from dust) but the deposit that funded it was
@@ -260,7 +290,7 @@ describe('syncFtTransfersForAccount', function () {
         assert.ok(!written.records.some((r: any) => r.receipt_id === 'STALE'), 'stale FT record dropped');
         assert.ok(written.records.some((r: any) => r.receipt_id === 'REAL'));
         assert.ok(written.records.some((r: any) => r.token_id === 'near'));
-        assert.equal(written.metadata.ftBackfillVersion, 5);
+        assert.equal(written.metadata.ftBackfillVersion, 6);
 
         fs.rmSync(dir, { recursive: true, force: true });
     });
@@ -274,7 +304,7 @@ describe('syncFtTransfersForAccount', function () {
             records: [
                 rec({ token_id: 'npro.nearmobile.near', block_height: 100, receipt_id: 'A', amount: '10', balance_after: '10' }),
             ],
-            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 1, ftBackfillVersion: 5 },
+            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 1, ftBackfillVersion: 6 },
         }, null, 2));
 
         let calledAfter: number | undefined = -1;

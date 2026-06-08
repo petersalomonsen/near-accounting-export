@@ -207,6 +207,11 @@ function fillBlockGapsFromExisting(
  *    new transfers (existing wins on key collision), so the balance-change
  *    tracker's between-backfill records aren't duplicated.
  *
+ * NEAR is handled separately (not "owned"): the balance-tracker stays primary
+ * (it sees gas/staking), and the API's native:near transfers only fill the
+ * tracker's block-level gaps — capturing cross-contract moves it dropped without
+ * displacing the gas/staking records.
+ *
  * After merging, per-token continuity is reported; gap reconciliation is opt-in.
  */
 export async function mergeFtTransferRecords(
@@ -225,7 +230,22 @@ export async function mergeFtTransferRecords(
     // Drop previously-synthesized records (null timestamp marker) so a re-backfill
     // cleans them out instead of carrying them forward.
     const ownedExisting = existing.filter(r => isTransfersOwned(r.token_id) && !isSynthetic(r));
-    const nonOwned = existing.filter(r => !isTransfersOwned(r.token_id));
+
+    // NEAR is NOT owned (the API can't see gas/staking balance moves, so the
+    // balance-tracker stays primary). But the API DOES index explicit native:near
+    // transfers the tracker drops (cross-contract DAO/treasury moves that settle a
+    // couple blocks late). So keep the tracker's NEAR records and fill THEIR
+    // block-level gaps with the API's NEAR transfers — the inverse of owned
+    // tokens. Balances are RPC-verified, and only records inside a real gap are
+    // added, so nothing is double-counted. Residual gas gaps are left as-is.
+    const nearExisting = existing.filter(r => r.token_id === 'near' && !isSynthetic(r));
+    const nearFetched = fetched.filter(r => r.token_id === 'near');
+    const nearFills = fillBlockGapsFromExisting(nearExisting, nearFetched);
+    const nonOwned = [
+        ...existing.filter(r => !isTransfersOwned(r.token_id) && r.token_id !== 'near'),
+        ...nearExisting,
+        ...nearFills,
+    ];
 
     let merged: BalanceChangeRecord[];
 
@@ -282,7 +302,9 @@ export function latestOwnedBlock(records: BalanceChangeRecord[]): number {
 //      over balance continuity) — recovers swap-heavy intents history (wNEAR etc.)
 //   5: backfill also fills the API's block-level gaps with existing balance-tracker
 //      records (captures non-transfer mint/burn the API can't represent)
-export const FT_BACKFILL_VERSION = 5;
+//   6: fill the balance-tracker's NEAR gaps with the API's native:near transfers
+//      (captures cross-contract DAO/treasury moves the tracker drops)
+export const FT_BACKFILL_VERSION = 6;
 
 export interface SyncOptions extends MergeOptions {
     /** Injectable fetcher for tests; defaults to the live transfers API. */
