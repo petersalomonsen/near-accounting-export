@@ -128,6 +128,10 @@ interface AccountHistoryV2 {
         lastBlock: number | null;
         totalRecords: number;
         historyComplete?: boolean;
+        // Owned by the transfers-API sync (transfers-sync.ts). Must round-trip
+        // through load/save here, or it gets wiped each cycle and the account
+        // re-runs a full transfers backfill forever.
+        ftBackfillVersion?: number;
     };
 }
 
@@ -146,6 +150,7 @@ interface AccountHistory {
         totalTransactions: number;
         totalRecords?: number;
         historyComplete?: boolean;
+        ftBackfillVersion?: number;  // preserved for transfers-sync (see V2 type)
     };
 }
 
@@ -258,6 +263,7 @@ function loadExistingHistory(filePath: string): AccountHistory | null {
                     stakingPools: parsed.stakingPools,
                     discoveredFtContracts: parsed.discoveredFtContracts,
                     metadata: {
+                        ftBackfillVersion: parsed.metadata.ftBackfillVersion,
                         firstBlock: parsed.metadata.firstBlock,
                         lastBlock: parsed.metadata.lastBlock,
                         totalTransactions: 0,
@@ -317,7 +323,10 @@ function saveHistory(filePath: string, history: AccountHistory): void {
             firstBlock,
             lastBlock,
             totalRecords: allRecords.length,
-            historyComplete: history.metadata.historyComplete
+            historyComplete: history.metadata.historyComplete,
+            // Preserve the transfers-sync marker so the balance-tracker's saves
+            // don't wipe it (which would trigger a full re-backfill every cycle).
+            ftBackfillVersion: history.metadata.ftBackfillVersion
         }
     };
 
