@@ -284,11 +284,19 @@ export async function mergeFtTransferRecords(
     return { records, fetched: ownedFetched.length, gaps, filled };
 }
 
-/** Highest block among transfers-API-owned records (FT + intents); 0 if none. */
-export function latestOwnedBlock(records: BalanceChangeRecord[]): number {
+/**
+ * Highest block among records the transfers API supplies — FT + intents (owned)
+ * AND NEAR. Used as the incremental fetch boundary. Must include NEAR: otherwise
+ * NEAR-only accounts (no FT/intents) get a boundary of 0 and re-fetch their whole
+ * transfer history every cycle. Safe after a full backfill, since everything up
+ * to this block has already been fetched. 0 if none.
+ */
+export function latestSyncedBlock(records: BalanceChangeRecord[]): number {
     let max = 0;
     for (const r of records) {
-        if (isTransfersOwned(r.token_id) && r.block_height > max) max = r.block_height;
+        if ((isTransfersOwned(r.token_id) || r.token_id === 'near') && r.block_height > max) {
+            max = r.block_height;
+        }
     }
     return max;
 }
@@ -371,7 +379,7 @@ export async function syncFtTransfersForAccount(
     // NEAR and staking records are never touched.
     const needsBackfill = data.metadata.ftBackfillVersion !== FT_BACKFILL_VERSION;
     const backfill = needsBackfill || opts.backfill === true;
-    const afterBlock = backfill ? 0 : latestOwnedBlock(existing);
+    const afterBlock = backfill ? 0 : latestSyncedBlock(existing);
 
     const fetched = await fetchRecords(accountId, { afterBlock: afterBlock || undefined });
     const result = await mergeFtTransferRecords(existing, fetched, { ...opts, backfill });
