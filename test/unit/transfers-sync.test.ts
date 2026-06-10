@@ -7,7 +7,7 @@ import {
     isFtToken,
     isIntentsToken,
     isTransfersOwned,
-    latestOwnedBlock,
+    latestSyncedBlock,
     mergeFtTransferRecords,
     syntheticGapSampler,
     syncFtTransfersForAccount,
@@ -57,16 +57,21 @@ describe('token classification', function () {
     });
 });
 
-describe('latestOwnedBlock', function () {
-    it('returns the max block among owned (FT + intents) records', () => {
+describe('latestSyncedBlock', function () {
+    it('returns the max block among FT + intents + NEAR (not staking)', () => {
         const records = [
-            rec({ token_id: 'npro.nearmobile.near', block_height: 100 }),
-            rec({ token_id: 'near', block_height: 999 }),               // ignored
-            rec({ token_id: 'npro.poolv1.near', block_height: 888 }),   // ignored (staking)
-            rec({ token_id: 'nep141:npro.nearmobile.near', block_height: 300 }), // intents counted
+            rec({ token_id: 'npro.nearmobile.near', block_height: 100 }),       // FT
+            rec({ token_id: 'nep141:npro.nearmobile.near', block_height: 300 }), // intents
+            rec({ token_id: 'near', block_height: 500 }),                       // NEAR counted now
+            rec({ token_id: 'npro.poolv1.near', block_height: 888 }),           // staking ignored
         ];
-        assert.equal(latestOwnedBlock(records), 300);
-        assert.equal(latestOwnedBlock([]), 0);
+        assert.equal(latestSyncedBlock(records), 500);
+        assert.equal(latestSyncedBlock([]), 0);
+    });
+
+    it('uses NEAR when there are no owned tokens (avoids full re-fetch each cycle)', () => {
+        const records = [rec({ token_id: 'near', block_height: 777 })];
+        assert.equal(latestSyncedBlock(records), 777);
     });
 });
 
