@@ -17,6 +17,7 @@ import { detectGapsV2 } from './gap-detection.js';
 import { migrateToV2 } from './migrate-to-flat-format.js';
 import { isStakingPool } from './balance-tracker.js';
 import { syncFtTransfersForAccount } from './transfers-sync.js';
+import { instrumentFetch, snapshotAndReset, formatCounts } from './request-metrics.js';
 import type { GapAnalysisV2 } from './gap-detection.js';
 import type { BalanceChangeRecord } from './balance-tracker.js';
 
@@ -624,6 +625,7 @@ export function createRouter(config: RouterConfig): Router {
  * await worker.stop();
  */
 export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHandle> {
+    instrumentFetch(); // count outbound requests by host (per-cycle diagnostic)
     const dataDir = config.dataDir || process.env.DATA_DIR || path.join(process.cwd(), 'data');
     const storage = createStorage(dataDir);
 
@@ -820,7 +822,7 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
                 }
 
                 if (processedCount > 0 || skippedCount > 0) {
-                    console.log(`=== Sync cycle: ${processedCount} processed, ${skippedCount} skipped, ${deferredCount} deferred (not due yet) ===\n`);
+                    console.log(`=== Sync cycle: ${processedCount} processed, ${skippedCount} skipped, ${deferredCount} deferred (not due yet) === ${formatCounts(snapshotAndReset())}\n`);
                 }
 
                 // Wait before next cycle (unless shutting down)
