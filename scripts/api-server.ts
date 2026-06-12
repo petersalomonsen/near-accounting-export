@@ -17,6 +17,7 @@ import { detectGapsV2 } from './gap-detection.js';
 import { migrateToV2 } from './migrate-to-flat-format.js';
 import { isStakingPool } from './balance-tracker.js';
 import { syncFtTransfersForAccount } from './transfers-sync.js';
+import { syncNearLedgerForAccount } from './near-tx-ledger.js';
 import { instrumentFetch, snapshotAndReset, formatCounts } from './request-metrics.js';
 import type { GapAnalysisV2 } from './gap-detection.js';
 import type { BalanceChangeRecord } from './balance-tracker.js';
@@ -701,8 +702,25 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
                     return;
                 }
 
-                // Then do incremental backward search if history is not complete
+                // For incomplete accounts, rebuild the NEAR ledger from the tx index
+                // (one bounded, on-chain-accurate pass) and mark complete. This both
+                // recovers missing history and STOPS the recurring backward binary
+                // search — the steady-state RPC hotspot.
+                let nowComplete = historyComplete;
                 if (!historyComplete) {
+                    try {
+                        const nearSync = await syncNearLedgerForAccount(accountId, outputFile);
+                        if (nearSync.changed) {
+                            nowComplete = true;
+                            console.log(`[${accountId}] NEAR ledger rebuilt from tx index: ${nearSync.nearRecords} records, ${nearSync.rpcReads} reads — marked complete`);
+                        }
+                    } catch (error) {
+                        console.error(`[${accountId}] NEAR ledger sync failed:`, error);
+                    }
+                }
+
+                // Then do incremental backward search if history is still not complete
+                if (!nowComplete) {
                     console.log(`[${accountId}] Searching backward (incremental - history incomplete)`);
                     result.backward = true;
 

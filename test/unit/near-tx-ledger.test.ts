@@ -1,6 +1,9 @@
 import { describe, it } from 'mocha';
 import assert from 'assert';
-import { groupTxBlocks, buildNearLedger, SETTLE_BUFFER } from '../../scripts/near-tx-ledger.js';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { groupTxBlocks, buildNearLedger, syncNearLedgerForAccount, SETTLE_BUFFER } from '../../scripts/near-tx-ledger.js';
 
 describe('groupTxBlocks', function () {
     it('merges tx blocks that settle within SETTLE_BUFFER, splits the rest', () => {
@@ -70,5 +73,55 @@ describe('buildNearLedger', function () {
             blockTimestamp: async () => 1_700_000_000_000_000_000,
         });
         assert.deepEqual(records, []);
+    });
+});
+
+describe('syncNearLedgerForAccount', function () {
+    const writeFile = (meta: any, records: any[]) => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'near-'));
+        const file = path.join(dir, 'a.json');
+        fs.writeFileSync(file, JSON.stringify({ version: 2, accountId: 'a.near', records, metadata: meta }));
+        return { dir, file };
+    };
+
+    it('rebuilds NEAR, preserves other tokens, and marks complete (incomplete account)', async () => {
+        const { dir, file } = writeFile(
+            { historyComplete: false, firstBlock: 100, lastBlock: 100, totalRecords: 2 },
+            [
+                { token_id: 'near', block_height: 100, balance_before: '0', balance_after: '5', amount: '5' },
+                { token_id: 'npro.nearmobile.near', block_height: 100, balance_before: '0', balance_after: '9', amount: '9' },
+            ]
+        );
+        const res = await syncNearLedgerForAccount('a.near', file, {
+            currentBlock: 1000,
+            fetchTxBlocks: async () => [300],
+            nearBalanceAt: async (b) => (b < 300 ? '5' : '7'),
+            blockTimestamp: async () => 1_700_000_000_000_000_000,
+        });
+        assert.equal(res.changed, true);
+        const d = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        assert.equal(d.metadata.historyComplete, true, 'marked complete -> backward search will be skipped');
+        const near = d.records.filter((r: any) => r.token_id === 'near');
+        assert.equal(near.length, 1, 'NEAR rebuilt from tx index');
+        assert.equal(near[0].block_height, 300);
+        assert.ok(d.records.some((r: any) => r.token_id === 'npro.nearmobile.near'), 'other tokens preserved');
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('skips already-complete accounts (no rebuild, no RPC)', async () => {
+        const { dir, file } = writeFile(
+            { historyComplete: true, firstBlock: 1, lastBlock: 1, totalRecords: 1 },
+            [{ token_id: 'near', block_height: 1, balance_before: '0', balance_after: '1', amount: '1' }]
+        );
+        let fetched = false;
+        const res = await syncNearLedgerForAccount('a.near', file, {
+            currentBlock: 1000,
+            fetchTxBlocks: async () => { fetched = true; return [5]; },
+            nearBalanceAt: async () => '1',
+        });
+        assert.equal(res.changed, false);
+        assert.equal(res.reason, 'already-complete');
+        assert.equal(fetched, false, 'no tx-index fetch for complete accounts');
+        fs.rmSync(dir, { recursive: true, force: true });
     });
 });
