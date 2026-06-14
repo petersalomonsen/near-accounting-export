@@ -18,7 +18,7 @@ import { migrateToV2 } from './migrate-to-flat-format.js';
 import { isStakingPool } from './balance-tracker.js';
 import { syncFtTransfersForAccount } from './transfers-sync.js';
 import { syncNearLedgerForAccount } from './near-tx-ledger.js';
-import { instrumentFetch, snapshotAndReset, formatCounts } from './request-metrics.js';
+import { instrumentFetch, snapshotAndReset, formatCounts, runWithRequestAttribution } from './request-metrics.js';
 import type { GapAnalysisV2 } from './gap-detection.js';
 import type { BalanceChangeRecord } from './balance-tracker.js';
 
@@ -92,12 +92,39 @@ export interface RouterConfig {
 }
 
 // Worker configuration options
+/**
+ * Per-account FastNear request metrics emitted after each sync cycle. Pure
+ * observability: it reports how many requests the worker made to the FastNear
+ * APIs on behalf of an account. It carries no billing semantics — the consumer
+ * (the gateway) decides which hosts are billable and what they cost.
+ */
+export interface AccountSyncMetrics {
+    accountId: string;
+    /** FastNear requests made for this account during this sync cycle, by host. */
+    cycleByHost: Record<string, number>;
+    /** Cumulative FastNear requests for this account, by host (monotonic). */
+    cumulativeByHost: Record<string, number>;
+}
+
+interface FastNearMetricsDb {
+    accounts: Record<string, { byHost: Record<string, number>; updatedAt: string }>;
+}
+
 export interface WorkerConfig {
     /**
      * Data directory path for storing account data and metadata.
      * Defaults to process.env.DATA_DIR || './data'
      */
     dataDir?: string;
+
+    /**
+     * Optional hook invoked after each account sync with that account's FastNear
+     * request metrics (cycle delta + cumulative). Pure observability — billing
+     * lives in the consumer. Cumulative counts are also persisted to
+     * `fastnear-metrics.json` in the data dir and readable via
+     * {@link readFastNearMetrics}.
+     */
+    onAccountSynced?: (metrics: AccountSyncMetrics) => void;
 }
 
 // Worker control handle
@@ -113,9 +140,26 @@ function isV2Format(data: any): data is AccountHistoryFile {
 /**
  * Create storage access functions for a specific data directory
  */
+/**
+ * Read the worker's cumulative per-account FastNear request metrics
+ * (`fastnear-metrics.json`). Consumers (e.g. a billing layer) use this to
+ * compute usage deltas; it contains no billing state of its own.
+ */
+export function readFastNearMetrics(dataDir: string): Record<string, Record<string, number>> {
+    const file = path.join(dataDir, 'fastnear-metrics.json');
+    if (!fs.existsSync(file)) return {};
+    const db = JSON.parse(fs.readFileSync(file, 'utf8')) as FastNearMetricsDb;
+    const out: Record<string, Record<string, number>> = {};
+    for (const [accountId, entry] of Object.entries(db.accounts || {})) {
+        out[accountId] = { ...entry.byHost };
+    }
+    return out;
+}
+
 function createStorage(dataDir: string) {
     const ACCOUNTS_FILE = path.join(dataDir, 'accounts.json');
     const JOBS_FILE = path.join(dataDir, 'jobs.json');
+    const METRICS_FILE = path.join(dataDir, 'fastnear-metrics.json');
 
     // Ensure data directory exists
     if (!fs.existsSync(dataDir)) {
@@ -144,6 +188,17 @@ function createStorage(dataDir: string) {
         fs.writeFileSync(JOBS_FILE, JSON.stringify(db, null, 2));
     }
 
+    function loadMetrics(): FastNearMetricsDb {
+        if (!fs.existsSync(METRICS_FILE)) {
+            return { accounts: {} };
+        }
+        return JSON.parse(fs.readFileSync(METRICS_FILE, 'utf8'));
+    }
+
+    function saveMetrics(db: FastNearMetricsDb): void {
+        fs.writeFileSync(METRICS_FILE, JSON.stringify(db, null, 2));
+    }
+
     function getAccountOutputFile(accountId: string): string {
         return path.join(dataDir, `${accountId}.json`);
     }
@@ -157,6 +212,8 @@ function createStorage(dataDir: string) {
         saveAccounts,
         loadJobs,
         saveJobs,
+        loadMetrics,
+        saveMetrics,
         getAccountOutputFile,
         getAccountCsvFile
     };
@@ -641,6 +698,33 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
     const lastSyncTime = new Map<string, number>();
 
     /**
+     * Record this cycle's FastNear request counts into the cumulative per-account
+     * metrics file and emit the onAccountSynced hook. Pure observability: it only
+     * keeps FastNear hosts and carries no billing semantics — the consumer decides
+     * which hosts are billable and what they cost.
+     */
+    function recordFastNearMetrics(accountId: string, byHost: Record<string, number>): void {
+        const cycleByHost: Record<string, number> = {};
+        for (const [host, n] of Object.entries(byHost)) {
+            if (host.includes('fastnear')) cycleByHost[host] = n;
+        }
+        if (Object.keys(cycleByHost).length === 0) return; // no FastNear traffic this cycle
+        try {
+            const db = storage.loadMetrics();
+            const entry = db.accounts[accountId] || { byHost: {}, updatedAt: '' };
+            for (const [host, n] of Object.entries(cycleByHost)) {
+                entry.byHost[host] = (entry.byHost[host] || 0) + n;
+            }
+            entry.updatedAt = new Date().toISOString();
+            db.accounts[accountId] = entry;
+            storage.saveMetrics(db);
+            config.onAccountSynced?.({ accountId, cycleByHost, cumulativeByHost: { ...entry.byHost } });
+        } catch (error) {
+            console.error(`[${accountId}] Failed to record FastNear metrics:`, error);
+        }
+    }
+
+    /**
      * Process a single account in the continuous sync loop
      */
     async function processAccountCycle(accountId: string): Promise<{ backward: boolean; forward: boolean }> {
@@ -663,8 +747,12 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
         // Check if history is complete (backward search done)
         const historyComplete = historyFile?.metadata?.historyComplete === true;
 
-        // Wrap entire sync operation in a single promise that stays in runningJobs
+        // Wrap entire sync operation in a single promise that stays in runningJobs.
+        // runWithRequestAttribution tallies the outbound requests made while
+        // syncing THIS account (via AsyncLocalStorage, so concurrent accounts are
+        // not mixed in) so we can emit per-account FastNear usage metrics.
         const syncPromise = (async () => {
+            const { byHost } = await runWithRequestAttribution(async () => {
             try {
                 // ALWAYS search forward FIRST to get latest data (priority: freshness over completeness)
                 console.log(`[${accountId}] Searching forward (checking for new transactions)`);
@@ -756,6 +844,10 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
                 // Only remove from runningJobs after ALL phases complete (including staking sync)
                 runningJobs.delete(accountId);
             }
+            });
+            // Pure metric: record the FastNear requests made for this account this
+            // cycle. No billing here — the consumer (gateway) owns that.
+            recordFastNearMetrics(accountId, byHost);
         })();
 
         runningJobs.set(accountId, syncPromise);
