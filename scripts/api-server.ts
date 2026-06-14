@@ -32,6 +32,10 @@ const SYNC_CONFIG = {
     incompleteAccountIntervalMs: parseInt(process.env.INCOMPLETE_ACCOUNT_INTERVAL_MS || '300000', 10),  // 5 min for accounts with gaps
 };
 
+// How soon a gated (policy-excluded) account is re-evaluated, regardless of its
+// normal sync interval — so authorising resumes syncing within minutes.
+const GATE_RECHECK_MS = 10 * 60 * 1000;
+
 // Types
 interface RegisteredAccount {
     accountId: string;
@@ -89,6 +93,15 @@ export interface RouterConfig {
      * Defaults to process.env.DATA_DIR || './data'
      */
     dataDir?: string;
+
+    /**
+     * Optional enrollment policy. Called before lazily enrolling a NOT-yet-known
+     * account; if it resolves false the account is not enrolled (and the request
+     * gets a 402). Already-registered accounts are served regardless, so reads
+     * stay open. The consumer (gateway) uses this to require e.g. an active
+     * authorisation + ARIZ balance before an account starts being synced.
+     */
+    canEnroll?: (accountId: string) => Promise<boolean>;
 }
 
 // Worker configuration options
@@ -125,6 +138,14 @@ export interface WorkerConfig {
      * {@link readFastNearMetrics}.
      */
     onAccountSynced?: (metrics: AccountSyncMetrics) => void;
+
+    /**
+     * Optional sync policy. Called each time an enrolled account is due to sync;
+     * if it resolves false the account is skipped this round (and re-checked
+     * sooner than its normal interval). The consumer uses this to stop syncing
+     * accounts that no longer qualify (e.g. authorisation revoked / out of ARIZ).
+     */
+    shouldSyncAccount?: (accountId: string) => Promise<boolean>;
 }
 
 // Worker control handle
@@ -474,7 +495,7 @@ export function createRouter(config: RouterConfig): Router {
     });
 
     // Middleware to extract and validate accountId, plus lazy enrollment
-    router.use((req: Request, res: Response, next: NextFunction) => {
+    router.use(async (req: Request, res: Response, next: NextFunction) => {
         try {
             const accountId = config.getAccountId(req);
 
@@ -484,6 +505,22 @@ export function createRouter(config: RouterConfig): Router {
 
             if (!isValidNearAccountId(accountId)) {
                 return res.status(400).json({ error: 'Invalid NEAR account ID format' });
+            }
+
+            // Enrollment gate: a not-yet-registered account is only enrolled (and
+            // thus synced) if the consumer's policy allows it. Already-registered
+            // accounts are served regardless, so reads stay open.
+            const alreadyRegistered = !!storage.loadAccounts().accounts[accountId];
+            if (!alreadyRegistered && config.canEnroll) {
+                let allowed = false;
+                try { allowed = await config.canEnroll(accountId); } catch { allowed = false; }
+                if (!allowed) {
+                    return res.status(402).json({
+                        error: 'authorization_required',
+                        accountId,
+                        message: 'Authorize the Ariz gateway (authorize_deduction on arizcredits.near) and hold ARIZ to enable syncing for this account.',
+                    });
+                }
             }
 
             // Lazy enrollment: register account on first sight
@@ -885,6 +922,7 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
                 let processedCount = 0;
                 let skippedCount = 0;
                 let deferredCount = 0;
+                let gatedCount = 0;
 
                 for (const account of accounts) {
                     if (continuousSyncShuttingDown) {
@@ -903,6 +941,19 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
                     if (now - lastSync < interval) {
                         deferredCount++;
                         continue;
+                    }
+
+                    // Sync gate: skip accounts the consumer's policy excludes (e.g.
+                    // no active authorisation / no ARIZ balance). Re-checked sooner
+                    // than the normal interval so authorising resumes promptly.
+                    if (config.shouldSyncAccount) {
+                        let allowed = false;
+                        try { allowed = await config.shouldSyncAccount(account.accountId); } catch { allowed = false; }
+                        if (!allowed) {
+                            lastSyncTime.set(account.accountId, now - Math.max(0, interval - GATE_RECHECK_MS));
+                            gatedCount++;
+                            continue;
+                        }
                     }
 
                     console.log(`[${account.accountId}] Syncing (${historyComplete ? 'complete, checking for new' : 'incomplete, filling gaps'})`);
@@ -931,8 +982,8 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
                     lastSyncTime.set(account.accountId, Date.now());
                 }
 
-                if (processedCount > 0 || skippedCount > 0) {
-                    console.log(`=== Sync cycle: ${processedCount} processed, ${skippedCount} skipped, ${deferredCount} deferred (not due yet) === ${formatCounts(snapshotAndReset())}\n`);
+                if (processedCount > 0 || skippedCount > 0 || gatedCount > 0) {
+                    console.log(`=== Sync cycle: ${processedCount} processed, ${skippedCount} skipped, ${gatedCount} gated (unauthorised), ${deferredCount} deferred (not due yet) === ${formatCounts(snapshotAndReset())}\n`);
                 }
 
                 // Wait before next cycle (unless shutting down)
