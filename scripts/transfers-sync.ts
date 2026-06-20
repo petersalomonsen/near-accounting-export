@@ -58,6 +58,24 @@ export function isTransfersOwned(tokenId: string): boolean {
     return isFtToken(tokenId) || isIntentsToken(tokenId);
 }
 
+/**
+ * Inverse of assetIdToTokenId: map a V2 token_id back to the transfers-API
+ * asset_id, so we can re-query the API for a single token (server-side filter).
+ *   - bare FT contract "X"        -> "nep141:X"
+ *   - intents balance "nep141:X"  -> "nep245:intents.near:nep141:X"
+ * Returns null for tokens the transfers API doesn't own (NEAR, staking).
+ */
+export function tokenIdToAssetId(tokenId: string): string | null {
+    if (!isTransfersOwned(tokenId)) return null;
+    if (isIntentsToken(tokenId)) {
+        const inner = tokenId.startsWith('nep245:intents.near:')
+            ? tokenId.slice('nep245:intents.near:'.length)
+            : tokenId;
+        return `nep245:intents.near:${inner}`;
+    }
+    return `nep141:${tokenId}`;
+}
+
 /** Stable identity for an FT record so the authoritative version replaces a stale one. */
 function ftKey(r: BalanceChangeRecord): string {
     return `${r.token_id}|${r.receipt_id ?? r.block_height}|${r.amount}`;
@@ -284,6 +302,76 @@ export async function mergeFtTransferRecords(
     return { records, fetched: ownedFetched.length, gaps, filled };
 }
 
+export interface FillGapsResult {
+    /** Full record set with gapped owned tokens repaired from the API ledger. */
+    records: BalanceChangeRecord[];
+    /** Owned-token discontinuities remaining after the repair. */
+    gaps: TokenGap[];
+    /** Net owned records added while repairing. */
+    filled: number;
+}
+
+/**
+ * Repair per-token balance discontinuities using the transfers API itself.
+ *
+ * The incremental fetch boundary (latestSyncedBlock) is a single watermark across
+ * ALL tokens incl. NEAR. The NEAR balance-tracker advances it every cycle, so an
+ * FT claim / intents deposit that settles a couple blocks below the watermark is
+ * never fetched — it surfaces only later as a discontinuity (the next transfer of
+ * that token starts from a balance that "appears from nowhere"). detectTokenGaps
+ * catches that; this closes it.
+ *
+ * For each owned token that has a gap, re-fetch its FULL authoritative ledger
+ * (server-side asset_id filter — cheap, one token) and adopt it, bridging any
+ * non-transfer balance moves (mint/burn) with the existing records. The transfers
+ * API reports every transfer with start/end-of-block balances, so the recovered
+ * records carry the real amount, balances and tx hash — i.e. the missing credit
+ * lands on the same transaction that previously showed only its NEAR gas cost.
+ *
+ * Remaining gaps after a full re-fetch are irreducible from the transfers API
+ * (e.g. swap-heavy intents tokens that settle several transfers per block, so the
+ * per-transfer block snapshots don't chain) and are returned for the caller to
+ * report — they do not indicate genuinely-missing data.
+ */
+export async function fillOwnedGapsFromApi(
+    accountId: string,
+    records: BalanceChangeRecord[],
+    fetchRecords: (
+        accountId: string,
+        options: GetAllTransfersOptions
+    ) => Promise<BalanceChangeRecord[]>
+): Promise<FillGapsResult> {
+    const gaps = detectTokenGaps(records.filter(r => isTransfersOwned(r.token_id)));
+    if (gaps.length === 0) return { records, gaps, filled: 0 };
+
+    const gappedTokens = [...new Set(gaps.map(g => g.token_id))].filter(isTransfersOwned);
+    const byToken = groupByToken(records);
+    let filled = 0;
+
+    for (const token of gappedTokens) {
+        const assetId = tokenIdToAssetId(token);
+        if (!assetId) continue;
+        let ledger: BalanceChangeRecord[];
+        try {
+            ledger = (await fetchRecords(accountId, { assetId })).filter(r => r.token_id === token);
+        } catch {
+            // Transient API error: leave this token's gap for a later cycle.
+            continue;
+        }
+        if (ledger.length === 0) continue;
+        const existingForToken = byToken.get(token) ?? [];
+        // Adopt the authoritative ledger, then bridge non-transfer moves the API
+        // can't represent with the existing balance-tracker records.
+        const adopted = [...ledger, ...fillBlockGapsFromExisting(ledger, existingForToken)];
+        filled += Math.max(0, adopted.length - existingForToken.length);
+        byToken.set(token, adopted);
+    }
+
+    const merged = [...byToken.values()].flat().sort((a, b) => b.block_height - a.block_height);
+    const remaining = detectTokenGaps(merged.filter(r => isTransfersOwned(r.token_id)));
+    return { records: merged, gaps: remaining, filled };
+}
+
 /**
  * Highest block among records the transfers API supplies — FT + intents (owned)
  * AND NEAR. Used as the incremental fetch boundary. Must include NEAR: otherwise
@@ -382,13 +470,34 @@ export async function syncFtTransfersForAccount(
     const afterBlock = backfill ? 0 : latestSyncedBlock(existing);
 
     const fetched = await fetchRecords(accountId, { afterBlock: afterBlock || undefined });
-    const result = await mergeFtTransferRecords(existing, fetched, { ...opts, backfill });
+    let result = await mergeFtTransferRecords(existing, fetched, { ...opts, backfill });
+
+    // Safety net: if any owned token has a balance discontinuity (the incremental
+    // watermark skipped an FT claim / intents deposit), repair it directly from
+    // the transfers API — re-fetch the gapped token's full ledger and adopt it.
+    if (result.gaps.length > 0) {
+        const repaired = await fillOwnedGapsFromApi(accountId, result.records, fetchRecords);
+        result = {
+            records: repaired.records,
+            fetched: result.fetched,
+            gaps: repaired.gaps,
+            filled: result.filled + repaired.filled,
+        };
+    }
+
+    // Genuinely-missing FT data keeps the account "incomplete" so the sync loop
+    // re-visits it frequently until the transfers API has indexed the credit.
+    // (Intents block-level gaps are expected — several settlements per block — and
+    // don't flip the flag, otherwise swap-heavy accounts would never be complete.)
+    const unfilledFtGaps = result.gaps.filter(g => isFtToken(g.token_id));
+    const flipIncomplete = unfilledFtGaps.length > 0 && data.metadata.historyComplete === true;
 
     const changed =
         result.records.length !== existing.length ||
         result.fetched > 0 ||
         result.filled > 0 ||
-        needsBackfill;
+        needsBackfill ||
+        flipIncomplete;
 
     if (changed) {
         const blocks = result.records.map(r => r.block_height);
@@ -400,6 +509,9 @@ export async function syncFtTransfersForAccount(
         data.metadata.totalRecords = result.records.length;
         // Only mark backfilled once the full re-fetch actually succeeded.
         data.metadata.ftBackfillVersion = FT_BACKFILL_VERSION;
+        if (flipIncomplete) {
+            data.metadata.historyComplete = false;
+        }
         data.updatedAt = opts.now ?? new Date().toISOString();
         fs.writeFileSync(outputFile, JSON.stringify(data, null, 2));
     }
