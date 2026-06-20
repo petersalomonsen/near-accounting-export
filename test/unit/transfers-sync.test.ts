@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import {
+    fillOwnedGapsFromApi,
     isFtToken,
     isIntentsToken,
     isTransfersOwned,
@@ -11,6 +12,7 @@ import {
     mergeFtTransferRecords,
     syntheticGapSampler,
     syncFtTransfersForAccount,
+    tokenIdToAssetId,
 } from '../../scripts/transfers-sync.js';
 import type { BalanceChangeRecord } from '../../scripts/balance-tracker.js';
 
@@ -341,6 +343,120 @@ describe('syncFtTransfersForAccount', function () {
         fs.writeFileSync(file, JSON.stringify({ accountId: 'a', transactions: [] }));
         const result = await syncFtTransfersForAccount('a', file, { fetchRecords: async () => { throw new Error('should not fetch'); } });
         assert.equal(result.changed, false);
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+});
+
+describe('tokenIdToAssetId', function () {
+    it('inverts assetIdToTokenId for FT, intents, and rejects non-owned', () => {
+        assert.equal(tokenIdToAssetId('npro.nearmobile.near'), 'nep141:npro.nearmobile.near');
+        assert.equal(tokenIdToAssetId('nep141:npro.nearmobile.near'), 'nep245:intents.near:nep141:npro.nearmobile.near');
+        assert.equal(tokenIdToAssetId('near'), null);
+        assert.equal(tokenIdToAssetId('binancenode1.poolv1.near'), null);
+    });
+});
+
+describe('fillOwnedGapsFromApi', function () {
+    it('repairs a dropped FT claim by re-adopting the token ledger from the API', async () => {
+        // A claim credit (block 200, +20) was skipped by the incremental watermark;
+        // only the later withdrawal (block 250) was recorded, so its balance "20"
+        // appears from nowhere -> a gap between block 150 and 250.
+        const gapped = [
+            rec({ token_id: 'near', block_height: 300, amount: '-1' }),
+            rec({ token_id: 'npro.nearmobile.near', block_height: 100, receipt_id: 'c1', amount: '10', balance_before: '0', balance_after: '10' }),
+            rec({ token_id: 'npro.nearmobile.near', block_height: 150, receipt_id: 'w1', amount: '-10', balance_before: '10', balance_after: '0' }),
+            rec({ token_id: 'npro.nearmobile.near', block_height: 250, receipt_id: 'w2', amount: '-20', balance_before: '20', balance_after: '0' }),
+        ];
+
+        let askedAsset: string | undefined;
+        const result = await fillOwnedGapsFromApi('acct.near', gapped, async (_acct, options) => {
+            askedAsset = options.assetId;
+            // Authoritative ledger from the transfers API: includes the missing claim.
+            return [
+                rec({ token_id: 'npro.nearmobile.near', block_height: 100, receipt_id: 'c1', amount: '10', balance_before: '0', balance_after: '10' }),
+                rec({ token_id: 'npro.nearmobile.near', block_height: 150, receipt_id: 'w1', amount: '-10', balance_before: '10', balance_after: '0' }),
+                rec({ token_id: 'npro.nearmobile.near', block_height: 200, receipt_id: 'CLAIM', amount: '20', balance_before: '0', balance_after: '20', tx_hash: 'claimtx' }),
+                rec({ token_id: 'npro.nearmobile.near', block_height: 250, receipt_id: 'w2', amount: '-20', balance_before: '20', balance_after: '0' }),
+            ];
+        });
+
+        assert.equal(askedAsset, 'nep141:npro.nearmobile.near', 'should re-query the gapped token by asset_id');
+        assert.equal(result.gaps.length, 0, 'gap closed after adopting the ledger');
+        assert.ok(result.records.some(r => r.receipt_id === 'CLAIM' && r.amount === '20'), 'missing claim credit recovered');
+        assert.ok(result.records.some(r => r.token_id === 'near'), 'NEAR records untouched');
+        assert.ok(result.filled >= 1);
+    });
+
+    it('is a no-op when there are no gaps', async () => {
+        const clean = [
+            rec({ token_id: 'npro.nearmobile.near', block_height: 100, amount: '10', balance_before: '0', balance_after: '10' }),
+        ];
+        const result = await fillOwnedGapsFromApi('a', clean, async () => { throw new Error('should not fetch'); });
+        assert.equal(result.gaps.length, 0);
+        assert.equal(result.filled, 0);
+    });
+});
+
+describe('syncFtTransfersForAccount — gap repair + historyComplete', function () {
+    const gappedFile = (extraMeta: Record<string, unknown> = {}) => ({
+        version: 2,
+        accountId: 'acct.near',
+        records: [
+            rec({ token_id: 'near', block_height: 300, amount: '-1' }),
+            rec({ token_id: 'npro.nearmobile.near', block_height: 100, receipt_id: 'c1', amount: '10', balance_before: '0', balance_after: '10' }),
+            rec({ token_id: 'npro.nearmobile.near', block_height: 150, receipt_id: 'w1', amount: '-10', balance_before: '10', balance_after: '0' }),
+            rec({ token_id: 'npro.nearmobile.near', block_height: 250, receipt_id: 'w2', amount: '-20', balance_before: '20', balance_after: '0' }),
+        ],
+        metadata: { firstBlock: 100, lastBlock: 300, totalRecords: 4, ftBackfillVersion: 6, historyComplete: true, ...extraMeta },
+    });
+
+    const fullLedger = () => [
+        rec({ token_id: 'npro.nearmobile.near', block_height: 100, receipt_id: 'c1', amount: '10', balance_before: '0', balance_after: '10' }),
+        rec({ token_id: 'npro.nearmobile.near', block_height: 150, receipt_id: 'w1', amount: '-10', balance_before: '10', balance_after: '0' }),
+        rec({ token_id: 'npro.nearmobile.near', block_height: 200, receipt_id: 'CLAIM', amount: '20', balance_before: '0', balance_after: '20', tx_hash: 'claimtx' }),
+        rec({ token_id: 'npro.nearmobile.near', block_height: 250, receipt_id: 'w2', amount: '-20', balance_before: '20', balance_after: '0' }),
+    ];
+
+    it('fills the gap from the API and keeps historyComplete true', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-gap-'));
+        const file = path.join(dir, 'acct.json');
+        fs.writeFileSync(file, JSON.stringify(gappedFile(), null, 2));
+
+        const result = await syncFtTransfersForAccount('acct.near', file, {
+            now: '2026-06-20T00:00:00.000Z',
+            fetchRecords: async (_acct, options) => {
+                if (options.assetId === 'nep141:npro.nearmobile.near') return fullLedger();
+                return []; // incremental fetch finds nothing new
+            },
+        });
+
+        assert.ok(result.filled >= 1);
+        assert.equal(result.gaps.length, 0);
+        const written = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        assert.ok(written.records.some((r: any) => r.receipt_id === 'CLAIM'), 'claim credit written');
+        assert.equal(written.metadata.historyComplete, true, 'stays complete once the gap is filled');
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('flips historyComplete to false when the API still lacks the credit', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-gap2-'));
+        const file = path.join(dir, 'acct.json');
+        fs.writeFileSync(file, JSON.stringify(gappedFile(), null, 2));
+
+        const result = await syncFtTransfersForAccount('acct.near', file, {
+            now: '2026-06-20T00:00:00.000Z',
+            // API hasn't indexed the claim yet: returns the same gapped ledger.
+            fetchRecords: async (_acct, options) => {
+                if (options.assetId === 'nep141:npro.nearmobile.near') {
+                    return fullLedger().filter(r => r.receipt_id !== 'CLAIM');
+                }
+                return [];
+            },
+        });
+
+        assert.ok(result.gaps.some(g => g.token_id === 'npro.nearmobile.near'), 'gap still open');
+        const written = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        assert.equal(written.metadata.historyComplete, false, 'genuinely-missing FT data marks the account incomplete');
         fs.rmSync(dir, { recursive: true, force: true });
     });
 });
