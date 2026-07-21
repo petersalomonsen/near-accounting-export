@@ -302,6 +302,279 @@ export async function mergeFtTransferRecords(
     return { records, fetched: ownedFetched.length, gaps, filled };
 }
 
+/**
+ * Probe the live on-chain balance of an owned FT token for `accountId` at `block`.
+ * Returns the raw balance string, or null if it can't be read (treated as "skip
+ * this token this cycle"). Injected so the module stays RPC-free and testable.
+ */
+export type BalanceProbe = (
+    tokenId: string,
+    accountId: string,
+    block: number
+) => Promise<string | null>;
+
+export interface ReconcileOptions {
+    probe: BalanceProbe;
+    /** Block to probe at — the current chain head. */
+    block: number;
+    /** ISO timestamp of `block`, stamped onto synthesized records (may be null). */
+    timestamp: string | null;
+    /**
+     * When provided, a NEW discrepancy is DATED by binary-searching `probe` over
+     * (lastRealBlock, block] for the block(s) where the balance actually moved,
+     * instead of stamping the correction at the probe head. Requires an archival-
+     * capable RPC behind the probe (old blocks). Without it, corrections are
+     * booked at detection time — right balance, wrong date, which skews the
+     * realization's price date (and potentially its fiscal year) in reports.
+     * Runs only when a discrepancy is first detected, not on reuse cycles
+     * (~log2(range) probes per change-point).
+     */
+    locate?: {
+        /** Resolve a block's ISO timestamp for the dated record (may return null). */
+        timestampOf: (block: number) => Promise<string | null>;
+        /** Change-points to date before lumping the remainder at the head (default 4). */
+        maxTransitions?: number;
+    };
+}
+
+export interface ReconcileResult {
+    /** Records with stale reconciliations dropped and fresh ones appended. */
+    records: BalanceChangeRecord[];
+    /** Number of tokens carrying reconciliation records after this pass. */
+    reconciled: number;
+    /** Whether the record set actually changed (drives the file write). */
+    modified: boolean;
+    /**
+     * Tokens whose head probe failed or returned null — their tail was NOT
+     * verified this pass (any prior correction was kept). Non-empty output must
+     * be surfaced, not swallowed: a silent skip reads as "reconciled" when it
+     * wasn't. Self-heals on the next cycle if the failure was transient.
+     */
+    probeFailures: string[];
+    /** Tokens whose correction was head-stamped because dating (bisection) failed. */
+    datingFallbacks: string[];
+}
+
+/**
+ * Reconcile each owned FT token's TAIL balance against the live chain.
+ *
+ * `detectTokenGaps` only checks continuity BETWEEN consecutive records, so a
+ * non-transfer balance move that happens AFTER the last transfer — with no later
+ * transfer to expose the discontinuity — is invisible. The canonical case is a
+ * liquid-staking redemption/unstake (e.g. meta-pool.near stNEAR) that BURNS the
+ * token: no ft_transfer, so the transfers-API ledger simply ends at the stale
+ * pre-burn balance and every consumer keeps showing it.
+ *
+ * For each bare FT contract (isFtToken — intents balances have no per-account
+ * ft_balance_of; NEAR and staking pools aren't owned) we take the latest real
+ * record's balance_after and compare it to ft_balance_of at the chain head. On a
+ * mismatch we synthesize a correcting record (amount = on-chain − tail) so the
+ * running balance reconciles to chain.
+ *
+ * Idempotent and self-healing: prior reconciliation records are stripped and
+ * recomputed from the latest REAL tail each cycle, so a late-indexed transfer
+ * (settlement lag) transparently supersedes a reconciliation instead of leaving a
+ * gap. A reconciliation whose (tail, on-chain) pair is unchanged is reused as-is,
+ * so a steady state doesn't churn the file.
+ */
+export async function reconcileFtTailBalances(
+    accountId: string,
+    records: BalanceChangeRecord[],
+    opts: ReconcileOptions
+): Promise<ReconcileResult> {
+    const oldRecon = records.filter(r => r.reconciled);
+    const real = records.filter(r => !r.reconciled);
+
+    // Prior reconciliations grouped per token: a dated correction can span
+    // several change-points, so a token may carry more than one record.
+    const oldReconByToken = new Map<string, BalanceChangeRecord[]>();
+    for (const r of oldRecon) {
+        const list = oldReconByToken.get(r.token_id) || [];
+        list.push(r);
+        oldReconByToken.set(r.token_id, list);
+    }
+    for (const list of oldReconByToken.values()) {
+        list.sort((a, b) => a.block_height - b.block_height);
+    }
+
+    const realByToken = groupByToken(real.filter(r => isFtToken(r.token_id)));
+    const newRecon: BalanceChangeRecord[] = [];
+    let reconciledTokens = 0;
+    let modified = false;
+    const visited = new Set<string>();
+    const probeFailures: string[] = [];
+    const datingFallbacks: string[] = [];
+
+    // Keep a token's prior reconciliation untouched (probe unavailable, or the
+    // tail hasn't moved past it) — reused by reference, so not a modification.
+    const keepPrior = (token: string) => {
+        const prior = oldReconByToken.get(token);
+        if (prior) {
+            newRecon.push(...prior);
+            reconciledTokens++;
+        }
+    };
+
+    for (const [token, recs] of realByToken) {
+        visited.add(token);
+        const latest = recs.reduce((a, b) => (b.block_height > a.block_height ? b : a));
+        // The probe block must be strictly ahead of everything we already know, or
+        // we'd be asserting a balance for a block a real record already covers.
+        if (latest.block_height >= opts.block) {
+            keepPrior(token);
+            continue;
+        }
+
+        let onChain: string | null;
+        try {
+            onChain = await opts.probe(token, accountId, opts.block);
+        } catch {
+            // Transient RPC failure: keep any prior reconciliation for this token
+            // (don't regress it to stale-but-unflagged) and move on.
+            probeFailures.push(token);
+            keepPrior(token);
+            continue;
+        }
+        if (onChain == null) {
+            probeFailures.push(token);
+            keepPrior(token);
+            continue;
+        }
+
+        const known = BigInt(latest.balance_after);
+        const actual = BigInt(onChain);
+        const prior = oldReconByToken.get(token);
+
+        if (actual === known) {
+            // Tail matches chain: any prior correction is now redundant (a real
+            // transfer superseded it, or the balance round-tripped back).
+            if (prior) modified = true;
+            continue;
+        }
+
+        // Reuse the prior correction set as-is if it already bridges this exact
+        // (tail → on-chain) span, so a steady state doesn't churn the file or
+        // re-run the (archival-probing) dating search every cycle.
+        if (
+            prior &&
+            prior[0]!.balance_before === known.toString() &&
+            prior[prior.length - 1]!.balance_after === actual.toString()
+        ) {
+            newRecon.push(...prior);
+            reconciledTokens++;
+            continue;
+        }
+
+        modified = true;
+        reconciledTokens++;
+        const synth = await synthesizeCorrections(accountId, token, latest.block_height, known, actual, opts);
+        if (!synth.datedOk) datingFallbacks.push(token);
+        newRecon.push(...synth.records);
+    }
+
+    // Prior reconciliations for tokens that no longer have a real base record are
+    // dropped (a backfill replaced the token's history) — that's a modification.
+    for (const token of oldReconByToken.keys()) {
+        if (!visited.has(token)) modified = true;
+    }
+
+    if (!modified) {
+        return { records, reconciled: reconciledTokens, modified: false, probeFailures, datingFallbacks };
+    }
+
+    const merged = [...real, ...newRecon].sort((a, b) => b.block_height - a.block_height);
+    return { records: merged, reconciled: reconciledTokens, modified: true, probeFailures, datingFallbacks };
+}
+
+/**
+ * Build the correcting record(s) for one token whose tail balance (`known`, at
+ * `tailBlock`) differs from the on-chain balance (`actual`, at `opts.block`).
+ *
+ * Without opts.locate: a single record stamped at the probe head — the running
+ * balance becomes correct, but the disposal is booked at DETECTION time.
+ *
+ * With opts.locate: binary-search the probe over (tailBlock, opts.block] for the
+ * block where the balance actually moved, so the correction lands on the real
+ * change date (the right price date for accounting). A bisection finds one
+ * transition, so multiple change-points are dated iteratively — each search
+ * resumes from the previous find — up to maxTransitions, after which the
+ * remainder is lumped into a final head-stamped record. Balances that changed
+ * and changed back between probes cancel out and are invisible, which is fine:
+ * the net ledger is what's being reconciled. Any probe failure during the search
+ * falls back to the single head-stamped record — the balance correction must not
+ * be lost just because dating it failed.
+ */
+async function synthesizeCorrections(
+    accountId: string,
+    token: string,
+    tailBlock: number,
+    known: bigint,
+    actual: bigint,
+    opts: ReconcileOptions
+): Promise<{ records: BalanceChangeRecord[]; datedOk: boolean }> {
+    const mkRecord = (
+        block: number,
+        timestamp: string | null,
+        before: bigint,
+        after: bigint
+    ): BalanceChangeRecord => ({
+        block_height: block,
+        block_timestamp: timestamp,
+        tx_hash: null,
+        tx_block: null,
+        signer_id: null,
+        receiver_id: null,
+        predecessor_id: null,
+        token_id: token,
+        receipt_id: null,
+        counterparty: null,
+        amount: (after - before).toString(),
+        balance_before: before.toString(),
+        balance_after: after.toString(),
+        reconciled: true,
+    });
+
+    if (!opts.locate) {
+        // Dating not requested — head-stamping is the expected outcome, not a fallback.
+        return { records: [mkRecord(opts.block, opts.timestamp, known, actual)], datedOk: true };
+    }
+
+    try {
+        const maxTransitions = opts.locate.maxTransitions ?? 4;
+        const fixes: BalanceChangeRecord[] = [];
+        let curBlock = tailBlock;
+        let curBal = known;
+        for (let t = 0; t < maxTransitions && curBal !== actual; t++) {
+            // Invariant: balance(curBlock) === curBal, balance(opts.block) === actual ≠ curBal.
+            let lo = curBlock;
+            let hi = opts.block;
+            let hiBal = actual;
+            while (hi - lo > 1) {
+                const mid = lo + Math.floor((hi - lo) / 2);
+                const midRaw = await opts.probe(token, accountId, mid);
+                if (midRaw == null) throw new Error(`probe returned null at block ${mid}`);
+                const midBal = BigInt(midRaw);
+                if (midBal === curBal) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                    hiBal = midBal;
+                }
+            }
+            fixes.push(mkRecord(hi, await opts.locate.timestampOf(hi), curBal, hiBal));
+            curBlock = hi;
+            curBal = hiBal;
+        }
+        // More change-points than we're willing to date: lump the rest at the head.
+        if (curBal !== actual) {
+            fixes.push(mkRecord(opts.block, opts.timestamp, curBal, actual));
+        }
+        return { records: fixes, datedOk: true };
+    } catch {
+        return { records: [mkRecord(opts.block, opts.timestamp, known, actual)], datedOk: false };
+    }
+}
+
 export interface FillGapsResult {
     /** Full record set with gapped owned tokens repaired from the API ledger. */
     records: BalanceChangeRecord[];
@@ -378,10 +651,15 @@ export async function fillOwnedGapsFromApi(
  * NEAR-only accounts (no FT/intents) get a boundary of 0 and re-fetch their whole
  * transfer history every cycle. Safe after a full backfill, since everything up
  * to this block has already been fetched. 0 if none.
+ *
+ * Reconciliation records are excluded: they carry the probe block (chain head at
+ * sync time), not a fetched transfer — counting them would advance the boundary
+ * past real transfers the API indexes with lag, so they'd never be fetched.
  */
 export function latestSyncedBlock(records: BalanceChangeRecord[]): number {
     let max = 0;
     for (const r of records) {
+        if (r.reconciled) continue;
         if ((isTransfersOwned(r.token_id) || r.token_id === 'near') && r.block_height > max) {
             max = r.block_height;
         }
@@ -410,6 +688,14 @@ export interface SyncOptions extends MergeOptions {
     ) => Promise<BalanceChangeRecord[]>;
     /** Timestamp for updatedAt (ISO string). */
     now?: string;
+    /**
+     * Opt-in tail reconciliation against live ft_balance_of. When provided, after
+     * the transfer merge each owned FT token's tail is compared to on-chain and a
+     * correcting record is synthesized on mismatch (see reconcileFtTailBalances) —
+     * this is what catches burn-style disposals (e.g. stNEAR redemptions) the
+     * transfers API can't represent. Omit to keep sync purely transfer-driven.
+     */
+    reconcile?: ReconcileOptions;
 }
 
 export interface SyncResult extends MergeResult {
@@ -419,6 +705,12 @@ export interface SyncResult extends MergeResult {
     changed: boolean;
     /** Whether this run performed the one-time full backfill. */
     backfilled: boolean;
+    /** Tokens carrying a tail-reconciliation record after this run. */
+    reconciled: number;
+    /** Tokens whose tail could NOT be verified this run (probe failed). */
+    reconcileProbeFailures: string[];
+    /** Tokens corrected with a head-stamped record because dating failed. */
+    reconcileDatingFallbacks: string[];
 }
 
 /**
@@ -437,17 +729,28 @@ export async function syncFtTransfersForAccount(
     const fetchRecords = opts.fetchRecords ?? getAccountTransferRecords;
 
     if (!fs.existsSync(outputFile)) {
-        return { records: [], fetched: 0, gaps: [], filled: 0, afterBlock: 0, changed: false, backfilled: false };
+        return { records: [], fetched: 0, gaps: [], filled: 0, afterBlock: 0, changed: false, backfilled: false, reconciled: 0, reconcileProbeFailures: [], reconcileDatingFallbacks: [] };
     }
 
     const data = JSON.parse(fs.readFileSync(outputFile, 'utf-8'));
     if (data.version !== 2 || !Array.isArray(data.records)) {
         // Sync operates on the flat V2 format only.
-        return { records: data.records ?? [], fetched: 0, gaps: [], filled: 0, afterBlock: 0, changed: false, backfilled: false };
+        return { records: data.records ?? [], fetched: 0, gaps: [], filled: 0, afterBlock: 0, changed: false, backfilled: false, reconciled: 0, reconcileProbeFailures: [], reconcileDatingFallbacks: [] };
     }
 
-    const existing: BalanceChangeRecord[] = data.records;
+    const allExisting: BalanceChangeRecord[] = data.records;
     data.metadata = data.metadata || {};
+
+    // Reconciliation records (reconcileFtTailBalances) are EPHEMERAL: they are
+    // recomputed from the real tail every cycle. Strip them before merging so they
+    // never advance the incremental watermark, shadow a real fetched transfer in
+    // the merge dedup (their ftKey can collide), or bridge — and thereby mask —
+    // the very balance gap that fillOwnedGapsFromApi needs to see to recover a
+    // late-indexed real transfer. They are re-derived (or reused unchanged) after
+    // the merge. Without opts.reconcile they pass through untouched, so turning
+    // the feature off does not silently delete prior corrections.
+    const oldRecon = opts.reconcile ? allExisting.filter(r => r.reconciled) : [];
+    const existing = opts.reconcile ? allExisting.filter(r => !r.reconciled) : allExisting;
 
     // Two-phase sync (applies to owned tokens: FT + NEAR Intents balances):
     //
@@ -485,6 +788,25 @@ export async function syncFtTransfersForAccount(
         };
     }
 
+    // Tail reconciliation (opt-in): catch non-transfer disposals (burns/
+    // redemptions) that land after the last transfer, which detectTokenGaps can't
+    // see. Runs on the merged+repaired ledger so it reconciles against the real
+    // latest tail, not a stale one.
+    let reconciled = 0;
+    let reconcileModified = false;
+    let reconcileProbeFailures: string[] = [];
+    let reconcileDatingFallbacks: string[] = [];
+    if (opts.reconcile) {
+        // Old reconciliations ride along only for the unchanged-reuse check; the
+        // merged result itself is recon-free (purged on read above).
+        const rec = await reconcileFtTailBalances(accountId, [...result.records, ...oldRecon], opts.reconcile);
+        reconciled = rec.reconciled;
+        reconcileModified = rec.modified;
+        reconcileProbeFailures = rec.probeFailures;
+        reconcileDatingFallbacks = rec.datingFallbacks;
+        result = { ...result, records: rec.records };
+    }
+
     // Genuinely-missing FT data keeps the account "incomplete" so the sync loop
     // re-visits it frequently until the transfers API has indexed the credit.
     // (Intents block-level gaps are expected — several settlements per block — and
@@ -493,14 +815,18 @@ export async function syncFtTransfersForAccount(
     const flipIncomplete = unfilledFtGaps.length > 0 && data.metadata.historyComplete === true;
 
     const changed =
-        result.records.length !== existing.length ||
+        result.records.length !== allExisting.length ||
         result.fetched > 0 ||
         result.filled > 0 ||
         needsBackfill ||
-        flipIncomplete;
+        flipIncomplete ||
+        reconcileModified;
 
     if (changed) {
-        const blocks = result.records.map(r => r.block_height);
+        // Block-range metadata reflects real history only: a reconciliation record
+        // carries the probe block (the chain head at sync time), which would drag
+        // lastBlock to "now" on every correction.
+        const blocks = result.records.filter(r => !r.reconciled).map(r => r.block_height);
         data.records = result.records;
         if (blocks.length > 0) {
             data.metadata.firstBlock = Math.min(...blocks);
@@ -516,5 +842,8 @@ export async function syncFtTransfersForAccount(
         fs.writeFileSync(outputFile, JSON.stringify(data, null, 2));
     }
 
-    return { ...result, afterBlock, changed, backfilled: needsBackfill };
+    return {
+        ...result, afterBlock, changed, backfilled: needsBackfill,
+        reconciled, reconcileProbeFailures, reconcileDatingFallbacks,
+    };
 }
