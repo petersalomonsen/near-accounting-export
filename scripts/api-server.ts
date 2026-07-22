@@ -12,7 +12,7 @@ dotenv.config();
 
 import { getAccountHistory, reEnrichFTBalances, repairMissingStakingRecordsV2, repairInvalidStakingRewards, repairStakingDepositsWithoutTxHash, repairNullTimestamps } from './get-account-history.js';
 import { convertJsonToCsv } from './json-to-csv.js';
-import { callViewFunction } from './rpc.js';
+import { callViewFunction, getCurrentBlockHeight, getBlockTimestamp } from './rpc.js';
 import { detectGapsV2 } from './gap-detection.js';
 import { migrateToV2 } from './migrate-to-flat-format.js';
 import { isStakingPool } from './balance-tracker.js';
@@ -777,9 +777,54 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
                 // and intents deposits (see transfers-sync.ts). Incremental after
                 // the latest stored owned block.
                 try {
-                    const txSync = await syncFtTransfersForAccount(accountId, outputFile);
+                    // Tail reconciliation against live ft_balance_of catches
+                    // non-transfer disposals (burns/redemptions, e.g. stNEAR
+                    // unstake via meta-pool) that leave no ft_transfer and so end
+                    // the ledger at a stale balance. Only for complete accounts:
+                    // incomplete ones are still being backfilled (probing would
+                    // fight the in-progress ledger and waste RPC). One head-block
+                    // lookup per account per cycle; one ft_balance_of per owned FT
+                    // token whose tail differs from chain.
+                    let reconcile;
+                    if (historyComplete) {
+                        try {
+                            const head = await getCurrentBlockHeight();
+                            const headTs = await getBlockTimestamp(head);
+                            reconcile = {
+                                probe: (tokenId: string, acct: string, block: number) =>
+                                    callViewFunction(tokenId, 'ft_balance_of', { account_id: acct }, block),
+                                block: head,
+                                timestamp: headTs ? new Date(Math.floor(headTs / 1_000_000)).toISOString() : null,
+                                // Date corrections at the block where the balance
+                                // actually moved (bisection over archival
+                                // ft_balance_of — the default RPC endpoint is
+                                // archival) so realizations land on the right day,
+                                // not the detection day. Falls back to head-
+                                // stamping inside the reconciler if archival
+                                // probes fail.
+                                locate: {
+                                    timestampOf: async (block: number) => {
+                                        const ts = await getBlockTimestamp(block);
+                                        return ts ? new Date(Math.floor(ts / 1_000_000)).toISOString() : null;
+                                    },
+                                },
+                            };
+                        } catch (e) {
+                            console.error(`[${accountId}] Reconcile head lookup failed:`, e);
+                        }
+                    }
+                    const txSync = await syncFtTransfersForAccount(accountId, outputFile, { reconcile });
                     if (txSync.changed) {
-                        console.log(`[${accountId}] Transfers sync: +${txSync.fetched} fetched, ${txSync.gaps.length} gap(s), ${txSync.filled} reconciled${txSync.backfilled ? ' (backfill)' : ''}`);
+                        console.log(`[${accountId}] Transfers sync: +${txSync.fetched} fetched, ${txSync.gaps.length} gap(s), ${txSync.filled} filled, ${txSync.reconciled} tail-reconciled${txSync.backfilled ? ' (backfill)' : ''}`);
+                    }
+                    // Never let these fail silently: an unprobed tail reads as
+                    // "reconciled" when it wasn't (retries next cycle), and a
+                    // dating fallback books the disposal at detection time.
+                    if (txSync.reconcileProbeFailures.length > 0) {
+                        console.warn(`[${accountId}] Tail probe failed (tail NOT verified, retrying next cycle): ${txSync.reconcileProbeFailures.join(', ')}`);
+                    }
+                    if (txSync.reconcileDatingFallbacks.length > 0) {
+                        console.warn(`[${accountId}] Correction dating failed (head-stamped instead): ${txSync.reconcileDatingFallbacks.join(', ')}`);
                     }
                 } catch (error) {
                     console.error(`[${accountId}] Transfers sync failed:`, error);

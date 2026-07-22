@@ -102,6 +102,12 @@ export interface BalanceChangeRecord {
     amount: string;                   // Change amount (positive = in, negative = out)
     balance_before: string;           // Token balance before this block
     balance_after: string;            // Token balance after this block
+
+    // Set on records synthesized by tail reconciliation (see transfers-sync.ts):
+    // a non-transfer balance move (burn/redemption/mint) that happened after the
+    // last transfer, detected by comparing the tail against a live ft_balance_of.
+    // Recomputed every sync cycle, so consumers may treat these as replaceable.
+    reconciled?: boolean;
 }
 
 // Mainnet epoch length in blocks (roughly 12 hours)

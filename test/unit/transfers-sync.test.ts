@@ -10,9 +10,11 @@ import {
     isTransfersOwned,
     latestSyncedBlock,
     mergeFtTransferRecords,
+    reconcileFtTailBalances,
     syntheticGapSampler,
     syncFtTransfersForAccount,
     tokenIdToAssetId,
+    type BalanceProbe,
 } from '../../scripts/transfers-sync.js';
 import type { BalanceChangeRecord } from '../../scripts/balance-tracker.js';
 
@@ -60,6 +62,14 @@ describe('token classification', function () {
 });
 
 describe('latestSyncedBlock', function () {
+    it('ignores reconciliation records (they carry the probe block, not a fetched transfer)', () => {
+        const records = [
+            rec({ token_id: 'token.near', block_height: 100 }),
+            { ...rec({ token_id: 'token.near', block_height: 999 }), reconciled: true },
+        ];
+        assert.equal(latestSyncedBlock(records), 100);
+    });
+
     it('returns the max block among FT + intents + NEAR (not staking)', () => {
         const records = [
             rec({ token_id: 'npro.nearmobile.near', block_height: 100 }),       // FT
@@ -343,6 +353,374 @@ describe('syncFtTransfersForAccount', function () {
         fs.writeFileSync(file, JSON.stringify({ accountId: 'a', transactions: [] }));
         const result = await syncFtTransfersForAccount('a', file, { fetchRecords: async () => { throw new Error('should not fetch'); } });
         assert.equal(result.changed, false);
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+});
+
+describe('reconcileFtTailBalances', function () {
+    // Probe that returns a fixed on-chain balance per token; records the calls.
+    const probeOf = (balances: Record<string, string | null>, calls?: string[]): BalanceProbe =>
+        async (tokenId) => { calls?.push(tokenId); return balances[tokenId] ?? null; };
+
+    it('synthesizes a correcting record for a burned tail (the stNEAR case)', async () => {
+        // Last transfer left 287 stNEAR; on-chain it's now 0 (redeemed via meta-pool
+        // — a burn, no ft_transfer, so no later record and detectTokenGaps is blind).
+        const records = [
+            rec({ token_id: 'meta-pool.near', block_height: 100, amount: '287', balance_before: '0', balance_after: '287' }),
+        ];
+        const res = await reconcileFtTailBalances('acct.near', records, {
+            probe: probeOf({ 'meta-pool.near': '0' }),
+            block: 500,
+            timestamp: '2026-07-21T00:00:00.000Z',
+        });
+        assert.equal(res.modified, true);
+        assert.equal(res.reconciled, 1);
+        const fix = res.records.find(r => r.reconciled);
+        assert.ok(fix, 'a reconciliation record was added');
+        assert.equal(fix!.token_id, 'meta-pool.near');
+        assert.equal(fix!.balance_before, '287');
+        assert.equal(fix!.balance_after, '0');
+        assert.equal(fix!.amount, '-287');
+        assert.equal(fix!.block_height, 500);
+        assert.equal(fix!.tx_hash, null);
+        assert.equal(fix!.block_timestamp, '2026-07-21T00:00:00.000Z');
+    });
+
+    it('does nothing when the tail already matches chain', async () => {
+        const records = [
+            rec({ token_id: 'npro.nearmobile.near', block_height: 100, amount: '10', balance_after: '10' }),
+        ];
+        const res = await reconcileFtTailBalances('acct.near', records, {
+            probe: probeOf({ 'npro.nearmobile.near': '10' }),
+            block: 500, timestamp: 't',
+        });
+        assert.equal(res.modified, false);
+        assert.equal(res.reconciled, 0);
+        assert.ok(!res.records.some(r => r.reconciled));
+    });
+
+    it('is idempotent: re-running with the same chain balance does not churn', async () => {
+        const records = [
+            rec({ token_id: 'meta-pool.near', block_height: 100, amount: '287', balance_after: '287' }),
+        ];
+        const first = await reconcileFtTailBalances('acct.near', records, {
+            probe: probeOf({ 'meta-pool.near': '0' }), block: 500, timestamp: 't',
+        });
+        assert.equal(first.modified, true);
+        // Feed the reconciled set back in at a later head; nothing changed on-chain.
+        const second = await reconcileFtTailBalances('acct.near', first.records, {
+            probe: probeOf({ 'meta-pool.near': '0' }), block: 600, timestamp: 't2',
+        });
+        assert.equal(second.modified, false, 'unchanged on-chain -> no rewrite');
+        assert.equal(second.records.filter(r => r.reconciled).length, 1);
+    });
+
+    it('a late-indexed real transfer supersedes the reconciliation', async () => {
+        // Cycle 1: burn reconciled to 0.
+        const c1 = await reconcileFtTailBalances('acct.near', [
+            rec({ token_id: 'meta-pool.near', block_height: 100, amount: '287', balance_after: '287' }),
+        ], { probe: probeOf({ 'meta-pool.near': '0' }), block: 500, timestamp: 't' });
+        assert.equal(c1.records.filter(r => r.reconciled).length, 1);
+
+        // Cycle 2: the transfers API finally indexed the real out-transfer (287 -> 0)
+        // at block 300. The persisted file still carries cycle 1's reconciliation,
+        // so it's part of the input and must be dropped now the real tail matches.
+        const withRealTransfer = [
+            ...c1.records,
+            rec({ token_id: 'meta-pool.near', block_height: 300, amount: '-287', balance_before: '287', balance_after: '0', receipt_id: 'REAL' }),
+        ];
+        const c2 = await reconcileFtTailBalances('acct.near', withRealTransfer, {
+            probe: probeOf({ 'meta-pool.near': '0' }), block: 600, timestamp: 't2',
+        });
+        assert.equal(c2.modified, true, 'stale reconciliation dropped');
+        assert.ok(!c2.records.some(r => r.reconciled), 'no reconciliation once real tail matches chain');
+    });
+
+    it('does not probe intents, NEAR, or staking-pool tokens', async () => {
+        const calls: string[] = [];
+        const records = [
+            rec({ token_id: 'nep141:usdc.near', block_height: 100, balance_after: '50' }),
+            rec({ token_id: 'near', block_height: 100, balance_after: '9' }),
+            rec({ token_id: 'astro.poolv1.near', block_height: 100, balance_after: '7' }),
+        ];
+        const res = await reconcileFtTailBalances('acct.near', records, {
+            probe: probeOf({}, calls), block: 500, timestamp: 't',
+        });
+        assert.deepEqual(calls, [], 'no ft_balance_of calls for non-owned/unprobeable tokens');
+        assert.equal(res.modified, false);
+    });
+
+    it('keeps a prior reconciliation when the probe fails transiently', async () => {
+        const seeded = await reconcileFtTailBalances('acct.near', [
+            rec({ token_id: 'meta-pool.near', block_height: 100, amount: '287', balance_after: '287' }),
+        ], { probe: probeOf({ 'meta-pool.near': '0' }), block: 500, timestamp: 't' });
+
+        const failing: BalanceProbe = async () => { throw new Error('rpc down'); };
+        const res = await reconcileFtTailBalances('acct.near', seeded.records, {
+            probe: failing, block: 600, timestamp: 't2',
+        });
+        assert.equal(res.records.filter(r => r.reconciled).length, 1, 'prior reconciliation retained');
+        assert.equal(res.modified, false);
+        assert.deepEqual(res.probeFailures, ['meta-pool.near'], 'unverified tail is reported, not silent');
+    });
+
+    // Probe backed by a balance timeline: fn(block) -> raw balance at that block.
+    const timelineProbe = (fn: (block: number) => string): BalanceProbe =>
+        async (_token, _acct, block) => fn(block);
+    const tsOf = async (block: number) => `ts-${block}`;
+
+    it('locate: dates the correction at the actual change block via bisection', async () => {
+        // Balance was 287 through block 450, 0 from 451 on (the burn block).
+        const records = [
+            rec({ token_id: 'meta-pool.near', block_height: 100, amount: '287', balance_before: '0', balance_after: '287' }),
+        ];
+        const res = await reconcileFtTailBalances('acct.near', records, {
+            probe: timelineProbe(b => (b <= 450 ? '287' : '0')),
+            block: 1000,
+            timestamp: 't-head',
+            locate: { timestampOf: tsOf },
+        });
+        const fix = res.records.find(r => r.reconciled);
+        assert.ok(fix);
+        assert.equal(fix!.block_height, 451, 'dated at the actual burn block, not the probe head');
+        assert.equal(fix!.block_timestamp, 'ts-451');
+        assert.equal(fix!.amount, '-287');
+        assert.equal(fix!.balance_before, '287');
+        assert.equal(fix!.balance_after, '0');
+    });
+
+    it('locate: dates multiple change-points as separate chained records', async () => {
+        // 10 through 300, 5 through 600, 0 after — two distinct disposals.
+        const records = [
+            rec({ token_id: 'token.near', block_height: 100, amount: '10', balance_before: '0', balance_after: '10' }),
+        ];
+        const res = await reconcileFtTailBalances('acct.near', records, {
+            probe: timelineProbe(b => (b <= 300 ? '10' : b <= 600 ? '5' : '0')),
+            block: 1000,
+            timestamp: 't-head',
+            locate: { timestampOf: tsOf },
+        });
+        const fixes = res.records.filter(r => r.reconciled).sort((a, b) => a.block_height - b.block_height);
+        assert.equal(fixes.length, 2);
+        assert.deepEqual(
+            fixes.map(f => [f.block_height, f.amount, f.balance_before, f.balance_after, f.block_timestamp]),
+            [
+                [301, '-5', '10', '5', 'ts-301'],
+                [601, '-5', '5', '0', 'ts-601'],
+            ]
+        );
+    });
+
+    it('locate: lumps the remainder at the head after maxTransitions', async () => {
+        const records = [
+            rec({ token_id: 'token.near', block_height: 100, amount: '10', balance_before: '0', balance_after: '10' }),
+        ];
+        const res = await reconcileFtTailBalances('acct.near', records, {
+            probe: timelineProbe(b => (b <= 300 ? '10' : b <= 600 ? '5' : '0')),
+            block: 1000,
+            timestamp: 't-head',
+            locate: { timestampOf: tsOf, maxTransitions: 1 },
+        });
+        const fixes = res.records.filter(r => r.reconciled).sort((a, b) => a.block_height - b.block_height);
+        assert.equal(fixes.length, 2);
+        // First change-point dated; the rest lumped into a head-stamped record.
+        assert.deepEqual(fixes.map(f => [f.block_height, f.balance_before, f.balance_after, f.block_timestamp]), [
+            [301, '10', '5', 'ts-301'],
+            [1000, '5', '0', 't-head'],
+        ]);
+    });
+
+    it('locate: falls back to a head-stamped correction when archival probes fail', async () => {
+        // Head probe works; any historical (bisect) probe throws.
+        const probe: BalanceProbe = async (_t, _a, block) => {
+            if (block === 1000) return '0';
+            throw new Error('archival unavailable');
+        };
+        const records = [
+            rec({ token_id: 'meta-pool.near', block_height: 100, amount: '287', balance_before: '0', balance_after: '287' }),
+        ];
+        const res = await reconcileFtTailBalances('acct.near', records, {
+            probe, block: 1000, timestamp: 't-head',
+            locate: { timestampOf: tsOf },
+        });
+        const fix = res.records.find(r => r.reconciled);
+        assert.ok(fix, 'the balance correction survives a dating failure');
+        assert.equal(fix!.block_height, 1000);
+        assert.equal(fix!.block_timestamp, 't-head');
+        assert.equal(fix!.balance_after, '0');
+        assert.deepEqual(res.datingFallbacks, ['meta-pool.near'], 'fallback is reported, not silent');
+        assert.deepEqual(res.probeFailures, []);
+    });
+
+    it('locate: reuses an unchanged multi-record correction set without re-bisecting', async () => {
+        // Prior cycle produced a two-record dated correction (10 -> 5 -> 0).
+        const records = [
+            rec({ token_id: 'token.near', block_height: 100, amount: '10', balance_before: '0', balance_after: '10' }),
+            { ...rec({ token_id: 'token.near', block_height: 301, amount: '-5', balance_before: '10', balance_after: '5' }), tx_hash: null, reconciled: true },
+            { ...rec({ token_id: 'token.near', block_height: 601, amount: '-5', balance_before: '5', balance_after: '0' }), tx_hash: null, reconciled: true },
+        ];
+        // Probe only tolerates the head query — a bisect probe would throw.
+        const probe: BalanceProbe = async (_t, _a, block) => {
+            if (block === 2000) return '0';
+            throw new Error('unexpected historical probe on a reuse cycle');
+        };
+        const res = await reconcileFtTailBalances('acct.near', records, {
+            probe, block: 2000, timestamp: 't-head2',
+            locate: { timestampOf: async () => { throw new Error('should not be called'); } },
+        });
+        assert.equal(res.modified, false, 'unchanged span -> reuse, no churn');
+        assert.equal(res.records.filter(r => r.reconciled).length, 2);
+    });
+
+    it('does not probe a tail at or beyond the probe block', async () => {
+        const calls: string[] = [];
+        const records = [
+            rec({ token_id: 'meta-pool.near', block_height: 500, amount: '287', balance_after: '287' }),
+        ];
+        const res = await reconcileFtTailBalances('acct.near', records, {
+            probe: probeOf({ 'meta-pool.near': '0' }, calls), block: 500, timestamp: 't',
+        });
+        assert.deepEqual(calls, [], 'no probe when a real record already covers the head block');
+        assert.equal(res.modified, false);
+    });
+});
+
+describe('syncFtTransfersForAccount — tail reconciliation', function () {
+    it('reconciles a burned FT tail end-to-end and writes the correcting record', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-recon-'));
+        const file = path.join(dir, 'acct.json');
+        fs.writeFileSync(file, JSON.stringify({
+            version: 2,
+            accountId: 'acct.near',
+            records: [
+                rec({ token_id: 'meta-pool.near', block_height: 100, receipt_id: 'ACQ', amount: '287', balance_before: '0', balance_after: '287' }),
+            ],
+            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 1, ftBackfillVersion: 6, historyComplete: true },
+        }, null, 2));
+
+        const result = await syncFtTransfersForAccount('acct.near', file, {
+            now: '2026-07-21T00:00:00.000Z',
+            fetchRecords: async () => [], // no new transfers
+            reconcile: {
+                probe: async () => '0', // on-chain stNEAR now 0
+                block: 999,
+                timestamp: '2026-07-21T00:00:00.000Z',
+            },
+        });
+
+        assert.equal(result.reconciled, 1);
+        assert.equal(result.changed, true);
+        const written = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        const fix = written.records.find((r: any) => r.reconciled);
+        assert.ok(fix, 'correcting record persisted');
+        assert.equal(fix.balance_after, '0');
+        assert.equal(fix.amount, '-287');
+        // Block-range metadata must reflect real history, not the probe block.
+        assert.equal(written.metadata.lastBlock, 100);
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('purges the old reconciliation on read: it never advances the watermark, and a late-indexed real transfer is fetched and supersedes it', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-recon2-'));
+        const file = path.join(dir, 'acct.json');
+        // Cycle N left: real tail 10 @100, plus a reconciliation 10 -> 5 stamped at
+        // the then-head block 500 (the API hadn't indexed the real out-transfer yet).
+        fs.writeFileSync(file, JSON.stringify({
+            version: 2,
+            accountId: 'acct.near',
+            records: [
+                rec({ token_id: 'token.near', block_height: 100, receipt_id: 'ACQ', amount: '10', balance_before: '0', balance_after: '10' }),
+                { ...rec({ token_id: 'token.near', block_height: 500, amount: '-5', balance_before: '10', balance_after: '5' }), tx_hash: null, reconciled: true },
+            ],
+            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 2, ftBackfillVersion: 6, historyComplete: true },
+        }, null, 2));
+
+        let calledAfter: number | undefined;
+        const result = await syncFtTransfersForAccount('acct.near', file, {
+            now: '2026-07-21T00:00:00.000Z',
+            fetchRecords: async (_acct, options) => {
+                calledAfter = options.afterBlock;
+                // The API has now indexed the real transfer (settled at 450, i.e.
+                // BELOW the old reconciliation's block 500).
+                return [rec({ token_id: 'token.near', block_height: 450, receipt_id: 'REAL', amount: '-5', balance_before: '10', balance_after: '5' })];
+            },
+            reconcile: {
+                probe: async () => '3', // chain moved again since: 5 -> 3
+                block: 900,
+                timestamp: '2026-07-21T00:00:00.000Z',
+            },
+        });
+
+        // Watermark from the REAL tail (100), not the old reconciliation (500) —
+        // otherwise the block-450 transfer would never have been fetched.
+        assert.equal(calledAfter, 100);
+        assert.equal(result.changed, true);
+
+        const written = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        const tokenRecs = written.records.filter((r: any) => r.token_id === 'token.near');
+        assert.ok(tokenRecs.some((r: any) => r.receipt_id === 'REAL'), 'late-indexed real transfer ingested');
+        const recons = tokenRecs.filter((r: any) => r.reconciled);
+        assert.equal(recons.length, 1, 'old reconciliation replaced, not accumulated');
+        assert.equal(recons[0].balance_before, '5', 'recomputed from the new real tail');
+        assert.equal(recons[0].balance_after, '3');
+        assert.equal(recons[0].block_height, 900);
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('locate: persists the correction dated at the actual change block', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-recon4-'));
+        const file = path.join(dir, 'acct.json');
+        fs.writeFileSync(file, JSON.stringify({
+            version: 2,
+            accountId: 'acct.near',
+            records: [
+                rec({ token_id: 'meta-pool.near', block_height: 100, receipt_id: 'ACQ', amount: '287', balance_before: '0', balance_after: '287' }),
+            ],
+            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 1, ftBackfillVersion: 6, historyComplete: true },
+        }, null, 2));
+
+        const result = await syncFtTransfersForAccount('acct.near', file, {
+            now: '2026-07-21T00:00:00.000Z',
+            fetchRecords: async () => [],
+            reconcile: {
+                probe: async (_t, _a, block) => (block <= 450 ? '287' : '0'),
+                block: 999,
+                timestamp: 't-head',
+                locate: { timestampOf: async (b) => `ts-${b}` },
+            },
+        });
+
+        assert.equal(result.reconciled, 1);
+        const written = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        const fix = written.records.find((r: any) => r.reconciled);
+        assert.equal(fix.block_height, 451, 'disposal booked on the real burn block');
+        assert.equal(fix.block_timestamp, 'ts-451');
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('no-op cycle with an unchanged reconciliation does not rewrite the file', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-recon3-'));
+        const file = path.join(dir, 'acct.json');
+        fs.writeFileSync(file, JSON.stringify({
+            version: 2,
+            accountId: 'acct.near',
+            records: [
+                rec({ token_id: 'token.near', block_height: 100, amount: '287', balance_before: '0', balance_after: '287' }),
+                { ...rec({ token_id: 'token.near', block_height: 500, amount: '-287', balance_before: '287', balance_after: '0' }), tx_hash: null, reconciled: true },
+            ],
+            metadata: { firstBlock: 100, lastBlock: 100, totalRecords: 2, ftBackfillVersion: 6, historyComplete: true },
+        }, null, 2));
+        const before = fs.readFileSync(file, 'utf-8');
+
+        const result = await syncFtTransfersForAccount('acct.near', file, {
+            now: '2026-07-22T00:00:00.000Z',
+            fetchRecords: async () => [],
+            reconcile: { probe: async () => '0', block: 900, timestamp: 't' },
+        });
+
+        assert.equal(result.changed, false, 'same (tail, on-chain) pair -> reuse, no write');
+        assert.equal(result.reconciled, 1);
+        assert.equal(fs.readFileSync(file, 'utf-8'), before, 'file untouched');
         fs.rmSync(dir, { recursive: true, force: true });
     });
 });
