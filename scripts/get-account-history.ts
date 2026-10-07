@@ -20,7 +20,7 @@ import {
 } from './rpc.js';
 import {
     findLatestBalanceChangingBlock,
-    findBalanceChangingTransaction,
+    findBalanceChangingTransaction, settleBlockFor, RECEIPT_SETTLE_WINDOW,
     clearBalanceCache,
     getBalanceChangesAtBlock,
     accountExistsAtBlock,
@@ -2322,6 +2322,15 @@ async function processDiscoveredBlocks(
         try {
             // First, find the transaction details to discover which tokens changed
             const txInfo = await findBalanceChangingTransaction(accountId, txBlock.blockHeight);
+
+            // Where the transaction's receipts finished touching the account.
+            // Its NEAR effect is read up to there — but never into the next
+            // known transaction, whose effect is its own. Found without its
+            // receipts (block data unavailable), it is read a fixed window later.
+            const nextKnownBlock = [...blocks.map(b => b.blockHeight), ...history.transactions.map(t => t.block)]
+                .filter(h => h > txBlock.blockHeight)
+                .reduce((min, h) => (min === undefined || h < min ? h : min), undefined as number | undefined);
+            const nearSettleBlock = settleBlockFor(txBlock.blockHeight, txInfo.transfers || [], nextKnownBlock, RECEIPT_SETTLE_WINDOW);
             
             // Determine which tokens changed from the transfers
             const changedIntentsTokens = new Set<string>();
@@ -2350,7 +2359,8 @@ async function processDiscoveredBlocks(
                 txBlock.blockHeight,
                 fungibleTokensToCheck,
                 intentsTokensToCheck,
-                undefined
+                undefined,
+                nearSettleBlock
             );
             
             if (!balanceChange.hasChanges) {
