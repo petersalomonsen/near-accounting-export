@@ -132,6 +132,7 @@ interface AccountHistoryV2 {
         // through load/save here, or it gets wiped each cycle and the account
         // re-runs a full transfers backfill forever.
         ftBackfillVersion?: number;
+        nearGapAttempts?: Record<string, { tries: number; nextAfterMs: number }>;
     };
 }
 
@@ -151,6 +152,7 @@ interface AccountHistory {
         totalRecords?: number;
         historyComplete?: boolean;
         ftBackfillVersion?: number;  // preserved for transfers-sync (see V2 type)
+        nearGapAttempts?: Record<string, { tries: number; nextAfterMs: number }>;
     };
 }
 

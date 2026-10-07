@@ -677,10 +677,47 @@ export interface NearGapWindow {
  * largest gaps come first and at most `maxWindows` are returned, so one
  * cycle's spend is bounded and the gap that matters most is fixed first.
  */
+/**
+ * What is remembered about a window that was fetched and did not fill: how
+ * many times, and when it may be tried again. Keyed by the window's first
+ * block. A window the transfers API cannot fill — an outflow whose debit sits
+ * at the transaction block, which the API's block-level balances never show —
+ * would otherwise be the heaviest window every cycle and cost a request a
+ * minute for as long as the account exists.
+ */
+export interface NearGapAttempt {
+    tries: number;
+    nextAfterMs: number;
+}
+export type NearGapAttempts = Record<string, NearGapAttempt>;
+
+/** First retry an hour after a failed fill, doubling, never longer than a week. */
+export const NEAR_GAP_BACKOFF_BASE_MS = 60 * 60 * 1000;
+export const NEAR_GAP_BACKOFF_MAX_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function nearGapWindowKey(w: NearGapWindow): string {
+    return String(w.fromBlock);
+}
+
+export interface NearGapWindowOptions {
+    maxWindows?: number;
+    maxSpanMs?: number;
+    /** Windows already tried; those still in backoff are left out. */
+    attempts?: NearGapAttempts;
+    nowMs?: number;
+}
+
 export function nearGapWindows(
     records: BalanceChangeRecord[],
-    { maxWindows = 5, maxSpanMs = 60 * 60 * 1000 }: { maxWindows?: number; maxSpanMs?: number } = {}
+    { maxWindows = 5, maxSpanMs = 60 * 60 * 1000, attempts = {}, nowMs = Date.now() }: NearGapWindowOptions = {}
 ): NearGapWindow[] {
+    return allNearGapWindows(records, maxSpanMs)
+        .filter(w => !((attempts[nearGapWindowKey(w)]?.nextAfterMs ?? 0) > nowMs))
+        .slice(0, maxWindows);
+}
+
+/** Every window, heaviest first, before backoff and the cap. */
+export function allNearGapWindows(records: BalanceChangeRecord[], maxSpanMs = 60 * 60 * 1000): NearGapWindow[] {
     const near = records.filter(r => r.token_id === 'near' && !r.reconciled);
     const gaps = nearLedgerGaps(near);
     if (gaps.length === 0) return [];
@@ -722,7 +759,7 @@ export function nearGapWindows(
         }
     }
     merged.sort((a, b) => (a.weight === b.weight ? a.fromBlock - b.fromBlock : (a.weight < b.weight ? 1 : -1)));
-    return merged.slice(0, maxWindows);
+    return merged;
 }
 
 /**
@@ -750,6 +787,10 @@ function movedNothing(r: BalanceChangeRecord): boolean {
 export interface FillNearGapsResult extends FillGapsResult {
     windows: number;
     requests: number;
+    /** Windows left alone this time because their backoff has not passed. */
+    deferred: number;
+    /** The attempt memory after this run, to be persisted by the caller. */
+    attempts: NearGapAttempts;
 }
 
 /**
@@ -771,18 +812,29 @@ export async function fillNearGapsFromApi(
     accountId: string,
     records: BalanceChangeRecord[],
     fetchRecords: (accountId: string, options: GetAllTransfersOptions) => Promise<BalanceChangeRecord[]>,
-    opts: { maxWindows?: number; maxSpanMs?: number } = {}
+    opts: NearGapWindowOptions = {}
 ): Promise<FillNearGapsResult> {
-    const windows = nearGapWindows(records, opts);
+    const nowMs = opts.nowMs ?? Date.now();
+    const maxSpanMs = opts.maxSpanMs ?? 60 * 60 * 1000;
     const near = (r: BalanceChangeRecord) => r.token_id === 'near';
+
+    // Forget attempts for windows that no longer exist: filled, or reshaped by
+    // a neighbour that was.
+    const all = allNearGapWindows(records, maxSpanMs);
+    const live = new Set(all.map(nearGapWindowKey));
+    const attempts: NearGapAttempts = Object.fromEntries(
+        Object.entries(opts.attempts ?? {}).filter(([key]) => live.has(key)));
+    const windows = nearGapWindows(records, { ...opts, attempts, nowMs, maxSpanMs });
+    const deferred = all.filter(w => (attempts[nearGapWindowKey(w)]?.nextAfterMs ?? 0) > nowMs).length;
     if (windows.length === 0) {
-        return { records, gaps: nearLedgerGaps(records), filled: 0, windows: 0, requests: 0 };
+        return { records, gaps: nearLedgerGaps(records), filled: 0, windows: 0, requests: 0, deferred, attempts };
     }
 
     let current = records;
     let filled = 0;
     let requests = 0;
     for (const w of windows) {
+        const key = nearGapWindowKey(w);
         let fetched: BalanceChangeRecord[];
         try {
             requests++;
@@ -791,19 +843,28 @@ export async function fillNearGapsFromApi(
                 toTimestampMs: w.toTimestampMs + 1000,
             });
         } catch {
-            continue; // transient API error: the gap is still there next cycle
+            continue; // transient API error: not held against the window
         }
         const candidates = fetched.filter(r => near(r) && !movedNothing(r));
-        if (candidates.length === 0) continue;
         const nearExisting = current.filter(r => near(r) && !isSynthetic(r));
         // Only what falls inside a real gap of the tracker's series is adopted —
         // the same rule the merge applies to NEAR.
-        const fills = fillBlockGapsFromExisting(nearExisting, candidates);
-        if (fills.length === 0) continue;
-        filled += fills.length;
-        current = [...current, ...fills].sort((a, b) => b.block_height - a.block_height);
+        const fills = candidates.length ? fillBlockGapsFromExisting(nearExisting, candidates) : [];
+        if (fills.length > 0) {
+            filled += fills.length;
+            current = [...current, ...fills].sort((a, b) => b.block_height - a.block_height);
+        }
+        // Did the window's own gaps close? If not, it waits — twice as long each time.
+        const stillOpen = nearLedgerGaps(current).some(g => g.from_block >= w.fromBlock && g.to_block <= w.toBlock);
+        if (!stillOpen) {
+            delete attempts[key];
+        } else {
+            const tries = (attempts[key]?.tries ?? 0) + 1;
+            const wait = Math.min(NEAR_GAP_BACKOFF_MAX_MS, NEAR_GAP_BACKOFF_BASE_MS * 2 ** (tries - 1));
+            attempts[key] = { tries, nextAfterMs: nowMs + wait };
+        }
     }
-    return { records: current, gaps: nearLedgerGaps(current), filled, windows: windows.length, requests };
+    return { records: current, gaps: nearLedgerGaps(current), filled, windows: windows.length, requests, deferred, attempts };
 }
 
 /**
@@ -857,7 +918,11 @@ export interface SyncOptions extends MergeOptions {
      * transfers API can't represent. Omit to keep sync purely transfer-driven.
      */
     reconcile?: ReconcileOptions;
-    /** NEAR gap windows fetched per sync, see fillNearGapsFromApi. Default 5. */
+    /**
+     * NEAR gap windows fetched per sync, see fillNearGapsFromApi. A complete
+     * account syncs every eight hours, so this is the whole repair budget for
+     * a third of a day: twenty requests at most, none once the ledger chains.
+     */
     nearGapWindows?: number;
 }
 
@@ -953,10 +1018,19 @@ export async function syncFtTransfersForAccount(
 
     // NEAR gaps, found in the data and fetched one bounded window at a time.
     // Costs nothing when the ledger chains; a request per window when not.
-    const nearRepair = await fillNearGapsFromApi(accountId, result.records, fetchRecords, { maxWindows: opts.nearGapWindows ?? 5 });
+    const nowMs = Date.parse(opts.now ?? new Date().toISOString());
+    const nearRepair = await fillNearGapsFromApi(accountId, result.records, fetchRecords, {
+        maxWindows: opts.nearGapWindows ?? 20,
+        attempts: data.metadata.nearGapAttempts ?? {},
+        nowMs,
+    });
     if (nearRepair.filled > 0) {
         result = { ...result, records: nearRepair.records, filled: result.filled + nearRepair.filled };
     }
+    // The attempt memory must survive a cycle in which nothing else changed, or
+    // an unfillable window is fetched again next minute.
+    const attemptsChanged = JSON.stringify(nearRepair.attempts) !== JSON.stringify(data.metadata.nearGapAttempts ?? {});
+    if (attemptsChanged) data.metadata.nearGapAttempts = nearRepair.attempts;
 
     // Tail reconciliation (opt-in): catch non-transfer disposals (burns/
     // redemptions) that land after the last transfer, which detectTokenGaps can't
@@ -990,7 +1064,8 @@ export async function syncFtTransfersForAccount(
         result.filled > 0 ||
         needsBackfill ||
         flipIncomplete ||
-        reconcileModified;
+        reconcileModified ||
+        attemptsChanged;
 
     if (changed) {
         // Block-range metadata reflects real history only: a reconciliation record

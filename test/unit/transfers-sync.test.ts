@@ -312,6 +312,38 @@ describe('syncFtTransfersForAccount', function () {
         fs.rmSync(dir, { recursive: true, force: true });
     });
 
+    it('remembers a NEAR gap window that did not fill, so it is not fetched again next cycle', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-'));
+        const file = path.join(dir, 'acct.json');
+        const gapped = {
+            version: 2,
+            accountId: 'acct.near',
+            records: [
+                rec({ token_id: 'near', block_height: 723, block_timestamp: '2026-09-28T14:04:45.000Z', amount: '-1', balance_before: '1233', balance_after: '33' }),
+                rec({ token_id: 'near', block_height: 382, block_timestamp: '2026-09-28T14:01:21.000Z', amount: '-1', balance_before: '34', balance_after: '33' }),
+            ],
+            metadata: { firstBlock: 382, lastBlock: 723, totalRecords: 2, ftBackfillVersion: 6 },
+        };
+        fs.writeFileSync(file, JSON.stringify(gapped, null, 2));
+
+        let windowFetches = 0;
+        const fetchRecords = async (_acct: string, options: any) => { if (options.fromTimestampMs !== undefined) windowFetches++; return []; };
+
+        await syncFtTransfersForAccount('acct.near', file, { now: '2026-10-07T17:00:00.000Z', fetchRecords });
+        assert.equal(windowFetches, 1, 'the gap window is fetched once');
+        const written = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        assert.equal(written.metadata.nearGapAttempts['382'].tries, 1, 'the attempt is persisted although no record changed');
+
+        await syncFtTransfersForAccount('acct.near', file, { now: '2026-10-07T17:01:00.000Z', fetchRecords });
+        assert.equal(windowFetches, 1, 'a minute later the window is left alone');
+
+        await syncFtTransfersForAccount('acct.near', file, { now: '2026-10-07T18:30:00.000Z', fetchRecords });
+        assert.equal(windowFetches, 2, 'after the hour it is tried again');
+        assert.equal(JSON.parse(fs.readFileSync(file, 'utf-8')).metadata.nearGapAttempts['382'].tries, 2);
+
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
     it('syncs incrementally once already backfilled', async () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-'));
         const file = path.join(dir, 'acct.json');
