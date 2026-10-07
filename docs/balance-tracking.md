@@ -149,3 +149,23 @@ Gap detection is computed in-memory each time the script runs - it is NOT stored
 5. Check if the latest record's `balance_after` differs from current on-chain balance - gap to present
 
 This is a fast O(n) in-memory operation with no I/O required.
+
+### Repairing NEAR gaps from the data, not the history
+
+A NEAR gap is proof, from the records alone, that a transfer is missing — a
+staking pool that paid out without the credit ever being recorded, a gas refund
+the tracker never sampled. The records on both sides carry their timestamps, so
+the window the missing transfer must lie in is known before anything is
+fetched. `nearGapWindows` (transfers-sync.ts) turns the gaps into such windows:
+consecutive gaps are merged while the merged window stays under an hour, the
+heaviest come first, and at most five are returned per sync. `fillNearGapsFromApi`
+then asks the transfers API for exactly those stretches and adopts what falls
+inside a gap — one request per window, no requests when the ledger chains.
+
+Why the incremental sync alone cannot do this: it fetches after the latest stored
+block, so a receipt that lands a few blocks after its transaction is fetched
+once, before the record that would expose the gap exists, and never again.
+
+Two transfers that settle in one block both carry that block's start and end
+balances, so chaining them reports a "gap" inside a single block. Nothing is
+missing there; `nearLedgerGaps` ignores same-block gaps, and so does the repair.

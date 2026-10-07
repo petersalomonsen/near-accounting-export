@@ -646,6 +646,167 @@ export async function fillOwnedGapsFromApi(
 }
 
 /**
+ * A stretch of the NEAR ledger that does not add up, with the time it covers.
+ * Built from the records alone: the data already proves something is missing
+ * before anything is fetched.
+ */
+export interface NearGapWindow {
+    fromBlock: number;
+    toBlock: number;
+    fromTimestampMs: number;
+    toTimestampMs: number;
+    /** Sum of |diff| of the gaps inside, in yocto — what the window is worth fixing for. */
+    weight: bigint;
+    gaps: number;
+}
+
+/**
+ * Where the NEAR ledger does not chain, as fetch windows — found in the data,
+ * before any request is made.
+ *
+ * A staking pool that paid out without the credit ever being recorded, a gas
+ * refund the tracker never sampled: each is a record whose balance_after is
+ * not the next record's balance_before. The records on both sides carry their
+ * block timestamps, so the window the missing transfer must lie in is known
+ * exactly, and that is the only stretch worth asking the transfers API for.
+ *
+ * Consecutive gaps always touch — a window ends at the record where the next
+ * begins — so they are merged as long as the merged window stays within
+ * `maxSpanMs`: a run of specks minutes apart costs one request rather than one
+ * each, while a gap spanning days is not swallowed into a fetch of days. The
+ * largest gaps come first and at most `maxWindows` are returned, so one
+ * cycle's spend is bounded and the gap that matters most is fixed first.
+ */
+export function nearGapWindows(
+    records: BalanceChangeRecord[],
+    { maxWindows = 5, maxSpanMs = 60 * 60 * 1000 }: { maxWindows?: number; maxSpanMs?: number } = {}
+): NearGapWindow[] {
+    const near = records.filter(r => r.token_id === 'near' && !r.reconciled);
+    const gaps = nearLedgerGaps(near);
+    if (gaps.length === 0) return [];
+
+    const tsByBlock = new Map<number, number>();
+    for (const r of near) {
+        if (!r.block_timestamp) continue;
+        const ms = Date.parse(r.block_timestamp);
+        if (Number.isFinite(ms)) tsByBlock.set(r.block_height, ms);
+    }
+
+    const abs = (v: bigint) => (v < 0n ? -v : v);
+    const windows: NearGapWindow[] = [];
+    for (const g of gaps) {
+        const from = tsByBlock.get(g.from_block);
+        const to = tsByBlock.get(g.to_block);
+        // A record without a timestamp cannot bound a window; leave that gap alone.
+        if (from === undefined || to === undefined) continue;
+        windows.push({
+            fromBlock: g.from_block, toBlock: g.to_block,
+            fromTimestampMs: Math.min(from, to), toTimestampMs: Math.max(from, to),
+            weight: abs(BigInt(g.diff)), gaps: 1,
+        });
+    }
+
+    // Coalesce while the merged span stays short, then rank by weight.
+    windows.sort((a, b) => a.fromTimestampMs - b.fromTimestampMs);
+    const merged: NearGapWindow[] = [];
+    for (const w of windows) {
+        const last = merged[merged.length - 1];
+        if (last && Math.max(last.toTimestampMs, w.toTimestampMs) - last.fromTimestampMs <= maxSpanMs) {
+            last.toTimestampMs = Math.max(last.toTimestampMs, w.toTimestampMs);
+            last.toBlock = Math.max(last.toBlock, w.toBlock);
+            last.fromBlock = Math.min(last.fromBlock, w.fromBlock);
+            last.weight += w.weight;
+            last.gaps += w.gaps;
+        } else {
+            merged.push({ ...w });
+        }
+    }
+    merged.sort((a, b) => (a.weight === b.weight ? a.fromBlock - b.fromBlock : (a.weight < b.weight ? 1 : -1)));
+    return merged.slice(0, maxWindows);
+}
+
+/**
+ * The NEAR ledger's real discontinuities. Two transfers that settle in one
+ * block both carry that block's start and end balances, so reading them as a
+ * chain reports a "gap" from the first's end to the second's start, inside a
+ * single block. Nothing is missing there, and a window for it would be fetched
+ * every cycle forever. Only a gap between two different blocks counts.
+ */
+export function nearLedgerGaps(records: BalanceChangeRecord[]): TokenGap[] {
+    return detectTokenGaps(records.filter(r => r.token_id === 'near')).filter(g => g.from_block !== g.to_block);
+}
+
+/**
+ * A transfer the API attributes to a block in which it changed nothing — the
+ * NEAR a wrap moves inside its own call, reported again at the receipt block
+ * after the tracker already booked it where it left. Self-contradictory on its
+ * own, and adopting it puts a 1 200 NEAR "amount" on a record whose balances
+ * agree it moved nothing.
+ */
+function movedNothing(r: BalanceChangeRecord): boolean {
+    return r.amount !== '0' && r.balance_before === r.balance_after;
+}
+
+export interface FillNearGapsResult extends FillGapsResult {
+    windows: number;
+    requests: number;
+}
+
+/**
+ * Close NEAR gaps from the transfers API, one bounded window at a time.
+ *
+ * The owned-token safety net above re-fetches a whole token ledger, which is
+ * cheap for a token and ruinous for NEAR: an account's NEAR history is
+ * thousands of transfers, and re-reading it every minute is what a request
+ * budget is for. So the gaps are found first, in the data, and the API is
+ * asked only for the stretch each one spans — a request per window, no
+ * requests at all when the ledger chains.
+ *
+ * Why the incremental sync alone cannot do this: it fetches after the latest
+ * stored block. A receipt that lands a few blocks after its transaction — a
+ * pool paying out inside the unstake — is fetched once, before the record that
+ * would expose the gap exists, and never again.
+ */
+export async function fillNearGapsFromApi(
+    accountId: string,
+    records: BalanceChangeRecord[],
+    fetchRecords: (accountId: string, options: GetAllTransfersOptions) => Promise<BalanceChangeRecord[]>,
+    opts: { maxWindows?: number; maxSpanMs?: number } = {}
+): Promise<FillNearGapsResult> {
+    const windows = nearGapWindows(records, opts);
+    const near = (r: BalanceChangeRecord) => r.token_id === 'near';
+    if (windows.length === 0) {
+        return { records, gaps: nearLedgerGaps(records), filled: 0, windows: 0, requests: 0 };
+    }
+
+    let current = records;
+    let filled = 0;
+    let requests = 0;
+    for (const w of windows) {
+        let fetched: BalanceChangeRecord[];
+        try {
+            requests++;
+            fetched = await fetchRecords(accountId, {
+                fromTimestampMs: w.fromTimestampMs - 1000,
+                toTimestampMs: w.toTimestampMs + 1000,
+            });
+        } catch {
+            continue; // transient API error: the gap is still there next cycle
+        }
+        const candidates = fetched.filter(r => near(r) && !movedNothing(r));
+        if (candidates.length === 0) continue;
+        const nearExisting = current.filter(r => near(r) && !isSynthetic(r));
+        // Only what falls inside a real gap of the tracker's series is adopted —
+        // the same rule the merge applies to NEAR.
+        const fills = fillBlockGapsFromExisting(nearExisting, candidates);
+        if (fills.length === 0) continue;
+        filled += fills.length;
+        current = [...current, ...fills].sort((a, b) => b.block_height - a.block_height);
+    }
+    return { records: current, gaps: nearLedgerGaps(current), filled, windows: windows.length, requests };
+}
+
+/**
  * Highest block among records the transfers API supplies — FT + intents (owned)
  * AND NEAR. Used as the incremental fetch boundary. Must include NEAR: otherwise
  * NEAR-only accounts (no FT/intents) get a boundary of 0 and re-fetch their whole
@@ -696,6 +857,8 @@ export interface SyncOptions extends MergeOptions {
      * transfers API can't represent. Omit to keep sync purely transfer-driven.
      */
     reconcile?: ReconcileOptions;
+    /** NEAR gap windows fetched per sync, see fillNearGapsFromApi. Default 5. */
+    nearGapWindows?: number;
 }
 
 export interface SyncResult extends MergeResult {
@@ -786,6 +949,13 @@ export async function syncFtTransfersForAccount(
             gaps: repaired.gaps,
             filled: result.filled + repaired.filled,
         };
+    }
+
+    // NEAR gaps, found in the data and fetched one bounded window at a time.
+    // Costs nothing when the ledger chains; a request per window when not.
+    const nearRepair = await fillNearGapsFromApi(accountId, result.records, fetchRecords, { maxWindows: opts.nearGapWindows ?? 5 });
+    if (nearRepair.filled > 0) {
+        result = { ...result, records: nearRepair.records, filled: result.filled + nearRepair.filled };
     }
 
     // Tail reconciliation (opt-in): catch non-transfer disposals (burns/
