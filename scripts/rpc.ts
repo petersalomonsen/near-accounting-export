@@ -517,7 +517,9 @@ export async function fetchNeardataBlock(blockHeight: number): Promise<NeardataB
 
     try {
         await delay(RPC_DELAY_MS);
-        const response = await fetch(`${NEARDATA_ENDPOINT}/block/${blockHeight}`);
+        // Same key as the RPC and transfers calls: neardata is a FastNear service
+        // too, and without it a full run falls back to plain RPC within minutes.
+        const response = await fetch(`${NEARDATA_ENDPOINT}/block/${blockHeight}`, { headers: getRpcHeaders() });
         
         if (!response.ok) {
             if (response.status === 404) {
