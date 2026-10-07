@@ -1,6 +1,6 @@
 import { describe, it } from 'mocha';
 import assert from 'assert';
-import { nearGapWindows, fillNearGapsFromApi } from '../../scripts/transfers-sync.js';
+import { nearGapWindows, fillNearGapsFromApi, recordsForDebitsAtOrigin } from '../../scripts/transfers-sync.js';
 import type { BalanceChangeRecord } from '../../scripts/balance-tracker.js';
 
 // The NEAR ledger proves its own gaps: a record whose balance_after is not the
@@ -178,5 +178,99 @@ describe('fillNearGapsFromApi backoff', function () {
     it('does not hold a transient API error against the window', async () => {
         const r = await fillNearGapsFromApi('a', gapped(), async () => { throw new Error('503'); }, { nowMs: T0 });
         assert.deepEqual(r.attempts, {});
+    });
+});
+
+describe('recordsForDebitsAtOrigin', function () {
+    // The treasury on 2026-09-25: 249.284 until block 679; 230 leave at 680;
+    // 0.1 leaves at 684. The API reports both at their receipt blocks, 683
+    // and 685, with balances that already exclude them.
+    const balances: Record<number, number> = { 676: 249.284, 677: 249.284, 678: 249.284, 679: 249.284, 680: 19.284, 681: 19.284, 682: 19.284, 683: 19.284, 684: 19.184, 685: 19.184 };
+    let reads = 0;
+    const sampler = {
+        balanceAt: async (b: number) => { reads++; if (!(b in balances)) throw new Error('unexpected read at ' + b); return N(balances[b]!); },
+        timestampOf: async (b: number) => BigInt(T0 + b * 1000) * 1000000n as unknown as number,
+    };
+    const afterTheFact = [
+        rec(683, T0 + 683_000, 19.284, 19.284, { amount: N(-230), tx_hash: 'CS1J', counterparty: 'wrap.near', receipt_id: 'r1' }),
+        rec(685, T0 + 685_000, 19.184, 19.184, { amount: N(-0.1), tx_hash: 'CS1J', counterparty: 'petersalomonsen.near', receipt_id: 'r2' }),
+    ];
+
+    it('finds the block each debit left in and writes the record there', async () => {
+        reads = 0;
+        const { records, reads: r } = await recordsForDebitsAtOrigin(afterTheFact, sampler);
+        assert.equal(r, reads);
+        assert.ok(reads <= 10, 'a handful of reads, got ' + reads);
+        const byBlock = Object.fromEntries(records.map(x => [x.block_height, x]));
+        assert.deepEqual(Object.keys(byBlock).map(Number).sort(), [680, 684]);
+        assert.equal(byBlock[680]!.balance_before, N(249.284));
+        assert.equal(byBlock[680]!.balance_after, N(19.284));
+        assert.equal(byBlock[680]!.amount, N(-230));
+        assert.equal(byBlock[680]!.tx_hash, 'CS1J');
+        assert.equal(byBlock[680]!.counterparty, 'wrap.near');
+        assert.equal(byBlock[684]!.amount, N(-0.1));
+        assert.ok(byBlock[680]!.block_timestamp?.startsWith('20'));
+    });
+
+    it('two debits that left in one block become one record', async () => {
+        const both = {
+            balanceAt: async (b: number) => N(b >= 680 ? 19.184 : 249.284),
+            timestampOf: async () => null,
+        };
+        const { records } = await recordsForDebitsAtOrigin([
+            rec(683, T0, 19.184, 19.184, { amount: N(-230), tx_hash: 'CS1J', counterparty: 'wrap.near' }),
+            rec(685, T0, 19.184, 19.184, { amount: N(-0.1), tx_hash: 'CS1J', counterparty: 'petersalomonsen.near' }),
+        ], both);
+        assert.equal(records.length, 1);
+        assert.equal(records[0]!.block_height, 680);
+        assert.equal(records[0]!.amount, N(-230.1));
+        assert.equal(records[0]!.counterparty, 'wrap.near', 'named after the larger debit');
+    });
+
+    it('leaves a transfer alone when no drop of its size is within reach', async () => {
+        const flat = { balanceAt: async () => N(19.284), timestampOf: async () => null };
+        const { records } = await recordsForDebitsAtOrigin(afterTheFact, flat);
+        assert.deepEqual(records, []);
+    });
+});
+
+describe('fillNearGapsFromApi with a debit sampler', function () {
+    const balances: Record<number, number> = { 676: 249.284, 677: 249.284, 678: 249.284, 679: 249.284, 680: 19.284, 681: 19.284, 682: 19.284, 683: 19.284, 684: 19.184, 685: 19.184 };
+    const sampler = {
+        balanceAt: async (b: number) => N(balances[b] ?? (b < 680 ? 249.284 : 19.184)),
+        timestampOf: async (b: number) => BigInt(T0 + b * 1000) * 1000000n as unknown as number,
+    };
+    const stored = () => [
+        rec(100000, T0 + 100_000_000, 19.184, 19.195, { tx_hash: 'D2ef', counterparty: 'sponsor.trezu.near' }),
+        rec(667, T0 + 667_000, 249.282, 249.284, { tx_hash: 'CBM6', counterparty: 'sponsor.trezu.near' }),
+    ];
+    const api = async () => [
+        rec(683, T0 + 683_000, 19.284, 19.284, { amount: N(-230), tx_hash: 'CS1J', counterparty: 'wrap.near' }),
+        rec(685, T0 + 685_000, 19.184, 19.184, { amount: N(-0.1), tx_hash: 'CS1J', counterparty: 'petersalomonsen.near' }),
+    ];
+
+    it('closes a window the API alone could not, with the debits where they left', async () => {
+        const r = await fillNearGapsFromApi('dao', stored(), api, { nowMs: T0, debitSampler: sampler });
+        assert.equal(r.gaps.length, 0, 'the ledger chains');
+        assert.equal(r.filled, 2);
+        assert.ok(r.rpcReads > 0 && r.rpcReads <= 12, 'bounded reads: ' + r.rpcReads);
+        assert.ok(r.records.some(x => x.block_height === 680 && x.amount === N(-230) && x.tx_hash === 'CS1J'));
+        assert.deepEqual(r.attempts, {}, 'nothing left to wait for');
+    });
+
+    it('reads nothing without a sampler, and the window waits', async () => {
+        const r = await fillNearGapsFromApi('dao', stored(), api, { nowMs: T0 });
+        assert.equal(r.rpcReads, 0);
+        assert.equal(r.gaps.length, 1);
+        assert.equal(r.attempts['667']!.tries, 1);
+    });
+
+    it('reads nothing when the API alone closes the window', async () => {
+        let reads = 0;
+        const counting = { ...sampler, balanceAt: async (b: number) => { reads++; return sampler.balanceAt(b); } };
+        const closes = async () => [rec(680, T0 + 680_000, 249.284, 19.284, { amount: N(-230), tx_hash: 'CS1J', counterparty: 'wrap.near' }), rec(684, T0 + 684_000, 19.284, 19.184, { amount: N(-0.1), tx_hash: 'CS1J' })];
+        const r = await fillNearGapsFromApi('dao', stored(), closes, { nowMs: T0, debitSampler: counting });
+        assert.equal(r.gaps.length, 0);
+        assert.equal(reads, 0);
     });
 });
