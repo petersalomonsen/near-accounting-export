@@ -173,3 +173,13 @@ once, before the record that would expose the gap exists, and never again.
 Two transfers that settle in one block both carry that block's start and end
 balances, so chaining them reports a "gap" inside a single block. Nothing is
 missing there; `nearLedgerGaps` ignores same-block gaps, and so does the repair.
+
+NEAR leaves an account when the outgoing receipt is created, not when it
+executes on the receiver one to a few blocks later. The transfers API reports
+such a transfer at the execution block with balances that already exclude it —
+a record that moved nothing, which is not adopted. When a window's gaps are
+still open after the API fill and it holds such transfers, `recordsForDebitsAtOrigin`
+reads the balance backwards from the execution block until the drop of the
+transfer's size, and writes the record there with the transaction's hash and
+counterparty. A few archival reads per transfer, only for windows the API could
+not close, and never when the API alone closes them.

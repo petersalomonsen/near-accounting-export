@@ -19,9 +19,12 @@ import fs from 'fs';
 import {
     detectTokenGaps,
     isStakingPool,
+    RECEIPT_SETTLE_WINDOW,
     type BalanceChangeRecord,
     type TokenGap,
 } from './balance-tracker.js';
+import { rpcBalanceAt } from './rpc-gap-sampler.js';
+import { getBlockTimestamp } from './rpc.js';
 import {
     getAccountTransferRecords,
     type GapSampler,
@@ -705,6 +708,11 @@ export interface NearGapWindowOptions {
     /** Windows already tried; those still in backoff are left out. */
     attempts?: NearGapAttempts;
     nowMs?: number;
+    /**
+     * How to read balances when the API alone could not close a window and
+     * it reported transfers that moved nothing. Omit to never read.
+     */
+    debitSampler?: DebitSampler | null;
 }
 
 export function nearGapWindows(
@@ -784,9 +792,101 @@ function movedNothing(r: BalanceChangeRecord): boolean {
     return r.amount !== '0' && r.balance_before === r.balance_after;
 }
 
+/**
+ * Reads the account's NEAR balance at a block, for finding where a debit the
+ * transfers API could only report after the fact actually happened.
+ */
+export interface DebitSampler {
+    /** yocto, as a string */
+    balanceAt: (block: number) => Promise<string>;
+    /** nanoseconds, or null when the block cannot be read */
+    timestampOf: (block: number) => Promise<number | null>;
+}
+
+export function rpcDebitSampler(accountId: string): DebitSampler {
+    const at = rpcBalanceAt(accountId);
+    return { balanceAt: block => at('near', block), timestampOf: getBlockTimestamp };
+}
+
+/** A debit found this close to the transfer's amount is that transfer — gas rides along in the same block. */
+const DEBIT_TOLERANCE = 10n ** 22n; // 0.01 NEAR
+
+/**
+ * Records for outgoing transfers the API could only report after the fact.
+ *
+ * NEAR leaves an account when the outgoing receipt is created, not when it
+ * executes on the receiver one to a few blocks later. The transfers API
+ * reports the transfer at the execution block, with that block's start and
+ * end balances — both already without the money. Such a record moves nothing
+ * and is not adopted (see movedNothing); but it is evidence: a transfer of
+ * that size, under that transaction, settled at that block. Reading the
+ * balance backwards from there finds the block it left in, and the record
+ * written there has the real balances, the real hash and the real
+ * counterparty. The treasury's 230 NEAR sent through wrap.near on 2026-09-25
+ * was invisible to every other path.
+ *
+ * A few reads per transfer, bounded by `lookback`; two debits that landed in
+ * one block become one record.
+ */
+export async function recordsForDebitsAtOrigin(
+    transfers: BalanceChangeRecord[],
+    sampler: DebitSampler,
+    { lookback = RECEIPT_SETTLE_WINDOW, maxTransfers = 5 }: { lookback?: number; maxTransfers?: number } = {}
+): Promise<{ records: BalanceChangeRecord[]; reads: number }> {
+    const cache = new Map<number, bigint>();
+    let reads = 0;
+    const bal = async (block: number): Promise<bigint> => {
+        if (!cache.has(block)) { reads++; cache.set(block, BigInt(await sampler.balanceAt(block))); }
+        return cache.get(block)!;
+    };
+
+    const byBlock = new Map<number, { before: bigint; after: bigint; transfers: BalanceChangeRecord[] }>();
+    const outgoing = transfers.filter(t => t.token_id === 'near' && BigInt(t.amount) < 0n).slice(0, maxTransfers);
+    for (const t of outgoing) {
+        const target = -BigInt(t.amount);
+        for (let block = t.block_height; block > t.block_height - lookback && block > 0; block--) {
+            const after = await bal(block);
+            const before = await bal(block - 1);
+            const drop = before - after;
+            if (drop <= 0n) continue;
+            // The debit, or a block holding it together with another one.
+            if (drop + DEBIT_TOLERANCE >= target) {
+                const found = byBlock.get(block) ?? { before, after, transfers: [] };
+                found.transfers.push(t);
+                byBlock.set(block, found);
+                break;
+            }
+        }
+    }
+
+    const records: BalanceChangeRecord[] = [];
+    for (const [block, { before, after, transfers: ts }] of byBlock) {
+        const ns = await sampler.timestampOf(block);
+        const main = ts.reduce((a, b) => (BigInt(a.amount) < BigInt(b.amount) ? a : b));
+        records.push({
+            block_height: block,
+            block_timestamp: ns != null ? new Date(Number(BigInt(ns) / 1000000n)).toISOString() : null,
+            tx_hash: main.tx_hash,
+            tx_block: null,
+            signer_id: main.signer_id,
+            receiver_id: main.receiver_id,
+            predecessor_id: main.predecessor_id,
+            token_id: 'near',
+            receipt_id: main.receipt_id,
+            counterparty: main.counterparty,
+            amount: (after - before).toString(),
+            balance_before: before.toString(),
+            balance_after: after.toString(),
+        });
+    }
+    return { records, reads };
+}
+
 export interface FillNearGapsResult extends FillGapsResult {
     windows: number;
     requests: number;
+    /** Balance and timestamp reads spent finding where debits left (see recordsForDebitsAtOrigin). */
+    rpcReads: number;
     /** Windows left alone this time because their backoff has not passed. */
     deferred: number;
     /** The attempt memory after this run, to be persisted by the caller. */
@@ -827,12 +927,14 @@ export async function fillNearGapsFromApi(
     const windows = nearGapWindows(records, { ...opts, attempts, nowMs, maxSpanMs });
     const deferred = all.filter(w => (attempts[nearGapWindowKey(w)]?.nextAfterMs ?? 0) > nowMs).length;
     if (windows.length === 0) {
-        return { records, gaps: nearLedgerGaps(records), filled: 0, windows: 0, requests: 0, deferred, attempts };
+        return { records, gaps: nearLedgerGaps(records), filled: 0, windows: 0, requests: 0, rpcReads: 0, deferred, attempts };
     }
 
     let current = records;
     let filled = 0;
     let requests = 0;
+    let rpcReads = 0;
+    const openIn = (w: NearGapWindow) => nearLedgerGaps(current).some(g => g.from_block >= w.fromBlock && g.to_block <= w.toBlock);
     for (const w of windows) {
         const key = nearGapWindowKey(w);
         let fetched: BalanceChangeRecord[];
@@ -846,16 +948,32 @@ export async function fillNearGapsFromApi(
             continue; // transient API error: not held against the window
         }
         const candidates = fetched.filter(r => near(r) && !movedNothing(r));
-        const nearExisting = current.filter(r => near(r) && !isSynthetic(r));
-        // Only what falls inside a real gap of the tracker's series is adopted —
-        // the same rule the merge applies to NEAR.
-        const fills = candidates.length ? fillBlockGapsFromExisting(nearExisting, candidates) : [];
-        if (fills.length > 0) {
+        const adopt = (found: BalanceChangeRecord[]) => {
+            if (found.length === 0) return;
+            const nearExisting = current.filter(r => near(r) && !isSynthetic(r));
+            // Only what falls inside a real gap of the tracker's series is adopted —
+            // the same rule the merge applies to NEAR.
+            const fills = fillBlockGapsFromExisting(nearExisting, found);
+            if (fills.length === 0) return;
             filled += fills.length;
             current = [...current, ...fills].sort((a, b) => b.block_height - a.block_height);
+        };
+        adopt(candidates);
+        // The API alone could not close it, but it reported outgoing transfers
+        // that moved nothing at their block: the debits happened earlier, and a
+        // few balance reads say exactly where.
+        const afterTheFact = fetched.filter(r => near(r) && movedNothing(r) && BigInt(r.amount) < 0n);
+        if (opts.debitSampler && afterTheFact.length > 0 && openIn(w)) {
+            try {
+                const found = await recordsForDebitsAtOrigin(afterTheFact, opts.debitSampler);
+                rpcReads += found.reads;
+                adopt([...candidates, ...found.records]);
+            } catch {
+                // RPC trouble: the window stays open and waits like any other.
+            }
         }
         // Did the window's own gaps close? If not, it waits — twice as long each time.
-        const stillOpen = nearLedgerGaps(current).some(g => g.from_block >= w.fromBlock && g.to_block <= w.toBlock);
+        const stillOpen = openIn(w);
         if (!stillOpen) {
             delete attempts[key];
         } else {
@@ -864,7 +982,7 @@ export async function fillNearGapsFromApi(
             attempts[key] = { tries, nextAfterMs: nowMs + wait };
         }
     }
-    return { records: current, gaps: nearLedgerGaps(current), filled, windows: windows.length, requests, deferred, attempts };
+    return { records: current, gaps: nearLedgerGaps(current), filled, windows: windows.length, requests, rpcReads, deferred, attempts };
 }
 
 /**
@@ -924,6 +1042,8 @@ export interface SyncOptions extends MergeOptions {
      * a third of a day: twenty requests at most, none once the ledger chains.
      */
     nearGapWindows?: number;
+    /** Balance reads for debits the API reports after the fact; null to never read. Defaults to RPC. */
+    debitSampler?: DebitSampler | null;
 }
 
 export interface SyncResult extends MergeResult {
@@ -1023,6 +1143,7 @@ export async function syncFtTransfersForAccount(
         maxWindows: opts.nearGapWindows ?? 20,
         attempts: data.metadata.nearGapAttempts ?? {},
         nowMs,
+        debitSampler: opts.debitSampler === undefined ? rpcDebitSampler(accountId) : opts.debitSampler,
     });
     if (nearRepair.filled > 0) {
         result = { ...result, records: nearRepair.records, filled: result.filled + nearRepair.filled };
