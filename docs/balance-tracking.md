@@ -158,7 +158,11 @@ the tracker never sampled. The records on both sides carry their timestamps, so
 the window the missing transfer must lie in is known before anything is
 fetched. `nearGapWindows` (transfers-sync.ts) turns the gaps into such windows:
 consecutive gaps are merged while the merged window stays under an hour, the
-heaviest come first, and at most five are returned per sync. `fillNearGapsFromApi`
+heaviest come first, and at most twenty are returned per sync (a complete
+account syncs every eight hours). A window that was fetched and did not fill is
+remembered in the file's metadata and waits an hour before being tried again,
+doubling each time up to a week, so an outflow the API cannot represent does not
+cost a request every sync for ever. `fillNearGapsFromApi`
 then asks the transfers API for exactly those stretches and adopts what falls
 inside a gap — one request per window, no requests when the ledger chains.
 

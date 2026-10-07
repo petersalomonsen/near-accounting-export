@@ -124,3 +124,59 @@ describe('fillNearGapsFromApi', function () {
         assert.equal(result.records.length, 2);
     });
 });
+
+describe('fillNearGapsFromApi backoff', function () {
+    const gapped = () => [
+        rec(723, T0 + 200_000, 1233.3, 33.4, { tx_hash: 'wrap' }),
+        rec(382, T0, 33.5, 33.3, { tx_hash: 'unstake' }),
+    ];
+    const nothing = async () => [] as BalanceChangeRecord[];
+
+    it('does not fetch a window again until its backoff has passed, then doubles it', async () => {
+        let calls = 0;
+        const count = async () => { calls++; return [] as BalanceChangeRecord[]; };
+        const first = await fillNearGapsFromApi('a', gapped(), count, { nowMs: T0 });
+        assert.equal(calls, 1);
+        assert.equal(first.attempts['382']!.tries, 1);
+        assert.equal(first.attempts['382']!.nextAfterMs, T0 + 3_600_000, 'first wait is one hour');
+
+        const soon = await fillNearGapsFromApi('a', gapped(), count, { nowMs: T0 + 60_000, attempts: first.attempts });
+        assert.equal(calls, 1, 'no request one minute later');
+        assert.equal(soon.deferred, 1);
+        assert.deepEqual(soon.attempts, first.attempts, 'memory carried unchanged');
+
+        const later = await fillNearGapsFromApi('a', gapped(), count, { nowMs: T0 + 2 * 3_600_000, attempts: first.attempts });
+        assert.equal(calls, 2, 'tried again once the hour has passed');
+        assert.equal(later.attempts['382']!.tries, 2);
+        assert.equal(later.attempts['382']!.nextAfterMs, T0 + 2 * 3_600_000 + 2 * 3_600_000, 'second wait is two hours');
+    });
+
+    it('never waits longer than a week', async () => {
+        let attempts = {};
+        let now = T0;
+        const waits: number[] = [];
+        for (let i = 0; i < 12; i++) {
+            const r = await fillNearGapsFromApi('a', gapped(), nothing, { nowMs: now, attempts });
+            attempts = r.attempts;
+            waits.push(r.attempts['382']!.nextAfterMs - now);
+            now = r.attempts['382']!.nextAfterMs;
+        }
+        assert.equal(waits[0], 3_600_000);
+        assert.equal(waits[1], 2 * 3_600_000);
+        assert.equal(waits[11], 7 * 24 * 3_600_000);
+        assert.ok(waits.every(w => w <= 7 * 24 * 3_600_000));
+        assert.equal((attempts as any)['382'].tries, 12);
+    });
+
+    it('forgets a window once it fills, and one that no longer exists', async () => {
+        const payout = async () => [rec(384, T0 + 1_000, 33.3, 1233.3, { tx_hash: 'unstake', counterparty: 'npro.poolv1.near' })];
+        const r = await fillNearGapsFromApi('a', gapped(), payout, { nowMs: T0, attempts: { '382': { tries: 3, nextAfterMs: 0 }, '999': { tries: 1, nextAfterMs: 0 } } });
+        assert.equal(r.filled, 1);
+        assert.deepEqual(r.attempts, {}, 'the filled window and the stale key are both gone');
+    });
+
+    it('does not hold a transient API error against the window', async () => {
+        const r = await fillNearGapsFromApi('a', gapped(), async () => { throw new Error('503'); }, { nowMs: T0 });
+        assert.deepEqual(r.attempts, {});
+    });
+});
