@@ -51,6 +51,7 @@ export interface TransferDetail {
     signerId?: string;        // Who signed the transaction
     receiverId?: string;      // The receiver account in the receipt
     predecessorId?: string;   // The predecessor account that initiated this receipt
+    receiptBlock?: number;    // Block in which this receipt executed — at or after the transaction block
 }
 
 export interface TransactionInfo {
@@ -60,6 +61,55 @@ export interface TransactionInfo {
     receiptBlock: number;
     blockTimestamp: number | null;
     transfers: TransferDetail[];  // Detailed transfer information
+    /**
+     * The last block in which a receipt of this transaction touched the account.
+     * A transaction's NEAR effect is not confined to its own block: the attached
+     * deposit leaves at the transaction block, and what comes back — a staking
+     * pool paying out, the gas refund — executes one to a few blocks later. The
+     * balance after the transaction is the balance here, not at the transaction
+     * block. Equal to receiptBlock when nothing settled later.
+     */
+    settleBlock?: number;
+}
+
+/**
+ * How many blocks after a transaction its receipts are looked for, and how far
+ * after it the balance is read when nothing says where they landed.
+ */
+export const RECEIPT_SETTLE_WINDOW = 5;
+
+/**
+ * The block to read the balance after a transaction at: the last block one of
+ * its receipts executed in, but never as far as the next known transaction,
+ * whose own effect must not be folded into this one. NEAR Mobile's staking
+ * pool pays out two blocks after the unstake, under the same transaction;
+ * read at the transaction block alone, that transaction was a 0.18 NEAR debit
+ * and the 1 200 NEAR that came back belonged to nobody.
+ *
+ * When no transfer carries a receipt block — the block-data source was
+ * unavailable and the plain-RPC fallback found the transaction without its
+ * receipts — the balance is read `fallbackWindow` blocks after the
+ * transaction, where everything it set in motion has settled. Zero keeps the
+ * transaction block.
+ */
+export function settleBlockFor(
+    txBlock: number,
+    transfers: TransferDetail[],
+    nextKnownBlock?: number,
+    fallbackWindow: number = 0
+): number {
+    let settle = txBlock;
+    let receiptBlocksKnown = false;
+    for (const t of transfers) {
+        if (t.receiptBlock === undefined) continue;
+        receiptBlocksKnown = true;
+        if (t.receiptBlock > settle) settle = t.receiptBlock;
+    }
+    if (!receiptBlocksKnown) settle = txBlock + fallbackWindow;
+    if (nextKnownBlock !== undefined && settle >= nextKnownBlock) {
+        settle = Math.max(txBlock, nextKnownBlock - 1);
+    }
+    return settle;
 }
 
 export interface StakingBalanceChange {
@@ -650,15 +700,19 @@ export async function getBalanceChangesAtBlock(
     blockHeight: number,
     tokenContracts: string[] | null | undefined = undefined,
     intentsTokens: string[] | null | undefined = undefined,
-    stakingPools: string[] | null | undefined = undefined
+    stakingPools: string[] | null | undefined = undefined,
+    nearSettleBlock: number | undefined = undefined
 ): Promise<BalanceChanges> {
     if (getStopSignal()) {
         throw new Error('Operation cancelled by user');
     }
 
-    // Get NEAR balance at block-1 and block (NEAR updates at block N)
+    // Get NEAR balance at block-1 and block (NEAR updates at block N) — or, when
+    // the transaction's receipts settled later, at the block they settled in,
+    // so the record carries the transaction's net effect (see settleBlockFor).
+    const nearAfterBlock = nearSettleBlock !== undefined && nearSettleBlock > blockHeight ? nearSettleBlock : blockHeight;
     const nearBalanceBefore = await getAllBalances(accountId, blockHeight - 1, null, null, true, null);
-    const nearBalanceAfter = await getAllBalances(accountId, blockHeight, null, null, true, null);
+    const nearBalanceAfter = await getAllBalances(accountId, nearAfterBlock, null, null, true, null);
 
     // Get FT/MT balances at block and block+1 (FT/MT update at block N+1)
     const ftMtBalanceBefore = tokenContracts || intentsTokens
@@ -1726,8 +1780,18 @@ export async function findBalanceChangingTransaction(
             const matchingTxHashes = new Set<string>();
             const processedReceipts = new Set<string>();
 
+            // Every transfer remembers the block its receipt executed in: the
+            // balance after the transaction is read where the last of them landed.
+            const stampReceiptBlock = (from: number, block: number) => {
+                for (let i = from; i < transfers.length; i++) {
+                    const t = transfers[i];
+                    if (t) t.receiptBlock = block;
+                }
+            };
+
             // Process the main block
             processBlockReceipts(neardataBlock, targetAccountId, transfers, matchingTxHashes, processedReceipts, balanceBefore);
+            stampReceiptBlock(0, balanceChangeBlock);
 
             // Also check subsequent blocks for cross-contract call receipts.
             // This is needed because NEAR deducts the deposit from sender's balance when
@@ -1753,11 +1817,13 @@ export async function findBalanceChangingTransaction(
             // - Gas rewards don't explain the full balance change (e.g., staking deposits)
             // - Cross-contract FT transfers (e.g., wrap.near via intents) execute later
             // - Multiple receipt chains can execute across several blocks
-            const MAX_SUBSEQUENT_BLOCKS = 5;
+            const MAX_SUBSEQUENT_BLOCKS = RECEIPT_SETTLE_WINDOW;
             for (let i = 1; i <= MAX_SUBSEQUENT_BLOCKS; i++) {
                 const subsequentBlock = await fetchNeardataBlock(balanceChangeBlock + i);
                 if (subsequentBlock) {
+                    const before = transfers.length;
                     processBlockReceipts(subsequentBlock, targetAccountId, transfers, matchingTxHashes, processedReceipts);
+                    stampReceiptBlock(before, balanceChangeBlock + i);
                 }
             }
 
@@ -1799,7 +1865,8 @@ export async function findBalanceChangingTransaction(
                     transactionBlock: balanceChangeBlock,
                     receiptBlock: balanceChangeBlock,
                     blockTimestamp: blockTimestamp || null,
-                    transfers
+                    transfers,
+                    settleBlock: settleBlockFor(balanceChangeBlock, transfers)
                 };
             }
         }
