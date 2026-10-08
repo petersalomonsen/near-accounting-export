@@ -14,6 +14,7 @@ import { getAccountHistory, reEnrichFTBalances, repairMissingStakingRecordsV2, r
 import { convertJsonToCsv } from './json-to-csv.js';
 import { callViewFunction, getCurrentBlockHeight, getBlockTimestamp } from './rpc.js';
 import { detectGapsV2 } from './gap-detection.js';
+import { openSyncClock } from './sync-clock.js';
 import { migrateToV2 } from './migrate-to-flat-format.js';
 import { isStakingPool } from './balance-tracker.js';
 import { syncFtTransfersForAccount } from './transfers-sync.js';
@@ -694,8 +695,13 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
     let continuousSyncRunning = false;
     let continuousSyncShuttingDown = false;
 
-    // Track last sync time per account to implement different polling intervals
-    const lastSyncTime = new Map<string, number>();
+    // Last sync time per account, for the per-account polling intervals. On
+    // disk, so a restart resumes the schedule instead of syncing every account
+    // at once (see sync-clock.ts).
+    const lastSyncTime = openSyncClock(path.join(dataDir, 'sync-clock.json'));
+    if (lastSyncTime.size > 0) {
+        console.log(`Sync clock: ${lastSyncTime.size} account(s) remembered from before the restart`);
+    }
 
     /**
      * Record this cycle's FastNear request counts into the cumulative per-account
