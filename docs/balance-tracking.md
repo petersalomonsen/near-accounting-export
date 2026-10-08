@@ -8,6 +8,10 @@ When there are no gaps, the data collection should look for new data from todays
 
 Then there is the past. We go to the earliest recorded block, and find that it has balance - which means it is a gap to the account was created - back where the balance was zero. The data collection needs to use the approach above to start filling gaps back in time.
 
+The worker defers a complete account for eight hours between syncs. The last
+sync time per account is kept in `sync-clock.json` in the data directory, so a
+restart resumes the schedule instead of syncing every account at once.
+
 ## Organizing the code
 
 The orchestration of the process, should be expressed in a simple source file that calls into the gap detection and filling logic. High level orchestration logic
