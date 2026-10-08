@@ -133,6 +133,7 @@ interface AccountHistoryV2 {
         // re-runs a full transfers backfill forever.
         ftBackfillVersion?: number;
         nearGapAttempts?: Record<string, { tries: number; nextAfterMs: number }>;
+        poolTruthCheckedUpTo?: number;
     };
 }
 
@@ -153,6 +154,7 @@ interface AccountHistory {
         historyComplete?: boolean;
         ftBackfillVersion?: number;  // preserved for transfers-sync (see V2 type)
         nearGapAttempts?: Record<string, { tries: number; nextAfterMs: number }>;
+        poolTruthCheckedUpTo?: number;
     };
 }
 

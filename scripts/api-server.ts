@@ -15,6 +15,7 @@ import { convertJsonToCsv } from './json-to-csv.js';
 import { callViewFunction, getCurrentBlockHeight, getBlockTimestamp } from './rpc.js';
 import { detectGapsV2 } from './gap-detection.js';
 import { openSyncClock } from './sync-clock.js';
+import { repairPoolRecordsAgainstChain } from './staking-truth.js';
 import { migrateToV2 } from './migrate-to-flat-format.js';
 import { isStakingPool } from './balance-tracker.js';
 import { syncFtTransfersForAccount } from './transfers-sync.js';
@@ -834,6 +835,17 @@ export async function startWorker(config: WorkerConfig = {}): Promise<WorkerHand
                     }
                 } catch (error) {
                     console.error(`[${accountId}] Transfers sync failed:`, error);
+                }
+                // Pool records near a principal move, checked against the pool
+                // itself; a sample that reports a transition the pool never
+                // made would be read downstream as staking income.
+                try {
+                    const truth = await repairPoolRecordsAgainstChain(accountId, outputFile);
+                    if (truth.removed.length > 0) {
+                        console.log(`[${accountId}] Pool records vs chain: dropped ${truth.removed.length} of ${truth.checked} checked (${truth.reads} reads): ${truth.removed.map(r => `${r.token_id}@${r.block_height}`).join(', ')}`);
+                    }
+                } catch (error) {
+                    console.error(`[${accountId}] Pool record check failed:`, error);
                 }
 
                 // Skip backward search if shutting down
