@@ -609,18 +609,36 @@ export interface FillGapsResult {
  * per-transfer block snapshots don't chain) and are returned for the caller to
  * report — they do not indicate genuinely-missing data.
  */
+/**
+ * Owned tokens whose earliest record opens with a balance. Continuity between
+ * records says nothing about what came before the first one: a token that
+ * starts at 294.79 with no record of how it got there has lost its first
+ * transfer — on one real account the first of two stNEAR purchases the same
+ * afternoon — and the between-record check never sees it.
+ */
+export function tokensWithUnexplainedOpening(records: BalanceChangeRecord[]): string[] {
+    const earliest = new Map<string, BalanceChangeRecord>();
+    for (const r of records) {
+        if (!isTransfersOwned(r.token_id) || r.reconciled) continue;
+        const e = earliest.get(r.token_id);
+        if (!e || r.block_height < e.block_height) earliest.set(r.token_id, r);
+    }
+    return [...earliest.values()].filter(r => BigInt(r.balance_before) !== 0n).map(r => r.token_id);
+}
+
 export async function fillOwnedGapsFromApi(
     accountId: string,
     records: BalanceChangeRecord[],
     fetchRecords: (
         accountId: string,
         options: GetAllTransfersOptions
-    ) => Promise<BalanceChangeRecord[]>
+    ) => Promise<BalanceChangeRecord[]>,
+    { alsoTokens = [] }: { alsoTokens?: string[] } = {}
 ): Promise<FillGapsResult> {
     const gaps = detectTokenGaps(records.filter(r => isTransfersOwned(r.token_id)));
-    if (gaps.length === 0) return { records, gaps, filled: 0 };
+    if (gaps.length === 0 && alsoTokens.length === 0) return { records, gaps, filled: 0 };
 
-    const gappedTokens = [...new Set(gaps.map(g => g.token_id))].filter(isTransfersOwned);
+    const gappedTokens = [...new Set([...gaps.map(g => g.token_id), ...alsoTokens])].filter(isTransfersOwned);
     const byToken = groupByToken(records);
     let filled = 0;
 
@@ -1126,8 +1144,14 @@ export async function syncFtTransfersForAccount(
     // Safety net: if any owned token has a balance discontinuity (the incremental
     // watermark skipped an FT claim / intents deposit), repair it directly from
     // the transfers API — re-fetch the gapped token's full ledger and adopt it.
-    if (result.gaps.length > 0) {
-        const repaired = await fillOwnedGapsFromApi(accountId, result.records, fetchRecords);
+    // A token whose first record opens with a balance gets the same, once: the
+    // API may hold the transfer the watermark skipped before the token had any
+    // record at all. Once, because a history older than the API's reach would
+    // otherwise be fetched again every sync.
+    const openingChecked: string[] = data.metadata.openingChecked ?? [];
+    const opening = tokensWithUnexplainedOpening(result.records).filter(t => !openingChecked.includes(t));
+    if (result.gaps.length > 0 || opening.length > 0) {
+        const repaired = await fillOwnedGapsFromApi(accountId, result.records, fetchRecords, { alsoTokens: opening });
         result = {
             records: repaired.records,
             fetched: result.fetched,
@@ -1135,6 +1159,8 @@ export async function syncFtTransfersForAccount(
             filled: result.filled + repaired.filled,
         };
     }
+    const openingChanged = opening.length > 0;
+    if (openingChanged) data.metadata.openingChecked = [...openingChecked, ...opening];
 
     // NEAR gaps, found in the data and fetched one bounded window at a time.
     // Costs nothing when the ledger chains; a request per window when not.
@@ -1186,7 +1212,8 @@ export async function syncFtTransfersForAccount(
         needsBackfill ||
         flipIncomplete ||
         reconcileModified ||
-        attemptsChanged;
+        attemptsChanged ||
+        openingChanged;
 
     if (changed) {
         // Block-range metadata reflects real history only: a reconciliation record

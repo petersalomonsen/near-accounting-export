@@ -14,6 +14,7 @@ import {
     syntheticGapSampler,
     syncFtTransfersForAccount,
     tokenIdToAssetId,
+    tokensWithUnexplainedOpening,
     type BalanceProbe,
 } from '../../scripts/transfers-sync.js';
 import type { BalanceChangeRecord } from '../../scripts/balance-tracker.js';
@@ -867,6 +868,50 @@ describe('syncFtTransfersForAccount — gap repair + historyComplete', function 
         assert.ok(result.gaps.some(g => g.token_id === 'npro.nearmobile.near'), 'gap still open');
         const written = JSON.parse(fs.readFileSync(file, 'utf-8'));
         assert.equal(written.metadata.historyComplete, false, 'genuinely-missing FT data marks the account incomplete');
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+});
+
+describe('a token whose first record opens with a balance', function () {
+    // petersalomonsen.near, stNEAR on intents, 2026-09-28: two purchases the
+    // same afternoon, 294.79 at 15:02 and 687.81 at 16:31. The export held only
+    // the second, opening at 294.79 with nothing behind it.
+    const T = 'nep141:lst-pool.near';
+    const later = rec({ token_id: T, block_height: 217656556, receipt_id: 'FdAx', tx_hash: 'FdAx9vrA', amount: '687814000000000000000000000', balance_before: '294790000000000000000000000', balance_after: '982604000000000000000000000' });
+    const first = rec({ token_id: T, block_height: 217647568, receipt_id: 'Gjid', tx_hash: 'GjiDsqH2', amount: '294790000000000000000000000', balance_before: '0', balance_after: '294790000000000000000000000' });
+
+    it('is named, and a token that starts from zero is not', () => {
+        assert.deepEqual(tokensWithUnexplainedOpening([later, rec({ token_id: 'near', block_height: 1, balance_before: '5', balance_after: '6' })]), [T]);
+        assert.deepEqual(tokensWithUnexplainedOpening([first, later]), []);
+    });
+
+    it('gets its ledger refetched once, and the missing first transfer back', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-'));
+        const file = path.join(dir, 'acct.json');
+        fs.writeFileSync(file, JSON.stringify({ version: 2, accountId: 'acct.near', records: [later], metadata: { firstBlock: 217656556, lastBlock: 217656556, totalRecords: 1, ftBackfillVersion: 6 } }, null, 2));
+        const asked: Array<string | undefined> = [];
+        const fetchRecords = async (_a: string, o: any) => { asked.push(o.assetId); return o.assetId ? [first, later] : []; };
+
+        await syncFtTransfersForAccount('acct.near', file, { now: '2026-10-08T22:00:00.000Z', fetchRecords, debitSampler: null });
+        assert.deepEqual(asked.filter(Boolean), ['nep245:intents.near:nep141:lst-pool.near'], 'the token is refetched by asset id');
+        const written = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        assert.ok(written.records.some((r: any) => r.receipt_id === 'Gjid'), 'the first purchase is recovered');
+        assert.deepEqual(written.metadata.openingChecked, [T]);
+
+        await syncFtTransfersForAccount('acct.near', file, { now: '2026-10-08T22:01:00.000Z', fetchRecords, debitSampler: null });
+        assert.equal(asked.filter(Boolean).length, 1, 'not refetched again');
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('is not refetched again when the API cannot explain it either', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-'));
+        const file = path.join(dir, 'acct.json');
+        fs.writeFileSync(file, JSON.stringify({ version: 2, accountId: 'acct.near', records: [later], metadata: { ftBackfillVersion: 6 } }, null, 2));
+        let tokenFetches = 0;
+        const fetchRecords = async (_a: string, o: any) => { if (o.assetId) tokenFetches++; return o.assetId ? [later] : []; };
+        await syncFtTransfersForAccount('acct.near', file, { now: '2026-10-08T22:00:00.000Z', fetchRecords, debitSampler: null });
+        await syncFtTransfersForAccount('acct.near', file, { now: '2026-10-08T22:01:00.000Z', fetchRecords, debitSampler: null });
+        assert.equal(tokenFetches, 1);
         fs.rmSync(dir, { recursive: true, force: true });
     });
 });
