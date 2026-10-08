@@ -134,6 +134,7 @@ interface AccountHistoryV2 {
         ftBackfillVersion?: number;
         nearGapAttempts?: Record<string, { tries: number; nextAfterMs: number }>;
         poolTruthCheckedUpTo?: number;
+        openingChecked?: string[];
     };
 }
 
@@ -155,6 +156,7 @@ interface AccountHistory {
         ftBackfillVersion?: number;  // preserved for transfers-sync (see V2 type)
         nearGapAttempts?: Record<string, { tries: number; nextAfterMs: number }>;
         poolTruthCheckedUpTo?: number;
+        openingChecked?: string[];
     };
 }
 
