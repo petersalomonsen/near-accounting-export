@@ -12,6 +12,13 @@ The worker defers a complete account for eight hours between syncs. The last
 sync time per account is kept in `sync-clock.json` in the data directory, so a
 restart resumes the schedule instead of syncing every account at once.
 
+A staking pool record with no transaction behind it is a sample of the pool's
+balance. Within a block or two of a principal move a sample can land on the
+wrong side of it and report the move reversed, which downstream reads as
+staking income. Each cycle, `repairPoolRecordsAgainstChain` (staking-truth.ts)
+checks such records newer than a watermark against the pool contract's own
+balance at the surrounding blocks and drops the ones that match no transition.
+
 ## Organizing the code
 
 The orchestration of the process, should be expressed in a simple source file that calls into the gap detection and filling logic. High level orchestration logic
