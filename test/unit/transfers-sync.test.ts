@@ -915,3 +915,36 @@ describe('a token whose first record opens with a balance', function () {
         fs.rmSync(dir, { recursive: true, force: true });
     });
 });
+
+describe('syncFtTransfersForAccount and a NEAR movement stored twice', function () {
+    // petersalomonsen.near, 2026-10-22: one intents withdrawal at block 221111269,
+    // where the balance moved, and again at 221111265 with the same receipt.
+    const Y = (near: string) => (BigInt(near.replace('.', '')) * 10n ** 20n).toString();
+    const copy = (block: number) => rec({
+        token_id: 'near', block_height: block, tx_hash: 'DTJZ3FQK', receipt_id: 'HrwfSfUV', counterparty: 'intents.near',
+        amount: Y('2.2893'), balance_before: Y('35.6028'), balance_after: Y('37.8921'),
+    });
+    const sampler = { balanceAt: async (b: number) => (b >= 221111269 ? Y('37.8921') : Y('35.6028')), timestampOf: async () => null };
+
+    it('writes the file back with the one copy the chain confirms', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-near-copies-'));
+        const file = path.join(dir, 'acct.json');
+        const records = [copy(221111269), copy(221111265)];
+        fs.writeFileSync(file, JSON.stringify({ version: 2, accountId: 'acct.near', records, metadata: { ftBackfillVersion: 6, totalRecords: 2 } }, null, 2));
+        const result = await syncFtTransfersForAccount('acct.near', file, { now: '2026-11-12T18:00:00.000Z', fetchRecords: async () => [], debitSampler: sampler });
+        assert.equal(result.changed, true);
+        const written = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        assert.deepEqual(written.records.map((r: any) => r.block_height), [221111269]);
+        assert.equal(written.metadata.totalRecords, 1);
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('leaves the file alone without a way to read the chain', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ftsync-near-copies-'));
+        const file = path.join(dir, 'acct.json');
+        fs.writeFileSync(file, JSON.stringify({ version: 2, accountId: 'acct.near', records: [copy(221111269), copy(221111265)], metadata: { ftBackfillVersion: 6 } }, null, 2));
+        await syncFtTransfersForAccount('acct.near', file, { now: '2026-11-12T18:00:00.000Z', fetchRecords: async () => [], debitSampler: null });
+        assert.equal(JSON.parse(fs.readFileSync(file, 'utf-8')).records.length, 2);
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+});

@@ -1004,6 +1004,134 @@ export async function fillNearGapsFromApi(
 }
 
 /**
+ * How far apart two copies of one NEAR movement are looked for. The copies seen
+ * so far were four blocks apart; a credit settles within RECEIPT_SETTLE_WINDOW
+ * of its transaction, and twice that leaves room.
+ */
+const NEAR_DUPLICATE_SPAN = 2 * RECEIPT_SETTLE_WINDOW;
+
+/** Transaction details a kept copy takes from a dropped one when it has none. */
+const NEAR_DUPLICATE_DETAILS = ['tx_hash', 'receipt_id', 'signer_id', 'receiver_id', 'predecessor_id', 'counterparty'] as const;
+
+export interface ResolveNearDuplicatesResult {
+    records: BalanceChangeRecord[];
+    removed: number;
+    reads: number;
+}
+
+/**
+ * One NEAR movement stored twice, a few blocks apart.
+ *
+ * The tracker records a NEAR movement at the block the balance changed, and the
+ * gap repair adopts the transfers API's record for a movement when it falls
+ * inside a gap of the tracker's series. Neither asks whether the other already
+ * holds that movement, and the API can date a credit a few blocks before the
+ * balance shows it. petersalomonsen.near got ten intents withdrawals (2026-10-22
+ * to 11-09, about 26.6 NEAR) twice, four blocks apart, with the same amount and
+ * balances: read as a ledger each copy is an outflow that never happened, and
+ * anything that sums amounts counts the income twice.
+ *
+ * Copies are the same amount with the same balances on both sides within a few
+ * blocks, or one receipt with one amount at two blocks. Which copy is right is
+ * not a matter of where it came from — in one pair the API's row was early, in
+ * another the row without a transaction — so the chain decides: a copy is kept
+ * when the balance at its block and the block before are its balances. The kept
+ * copy takes the transaction details the dropped one had and it lacked.
+ *
+ * Nothing is removed unless the chain confirms at least one copy. When it
+ * confirms all of them they are separate movements and all stay. Rows in one
+ * block are never copies of each other: two transfers settling in one block
+ * both carry that block's balances.
+ */
+export async function resolveNearDuplicates(
+    records: BalanceChangeRecord[],
+    sampler: DebitSampler | null,
+    { maxGroups = 20 }: { maxGroups?: number } = {}
+): Promise<ResolveNearDuplicatesResult> {
+    const candidates = records.filter(r => r.token_id === 'near' && !r.reconciled && r.amount !== '0');
+
+    // Group copies: union-find over the candidates.
+    const parent = candidates.map((_, i) => i);
+    const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i]!)));
+    const join = (a: number, b: number) => { parent[find(a)] = find(b); };
+
+    const byMovement = new Map<string, number[]>();
+    const byReceipt = new Map<string, number[]>();
+    candidates.forEach((r, i) => {
+        const movement = `${r.amount}|${r.balance_before}|${r.balance_after}`;
+        byMovement.set(movement, [...(byMovement.get(movement) ?? []), i]);
+        if (r.receipt_id) {
+            const receipt = `${r.receipt_id}|${r.amount}`;
+            byReceipt.set(receipt, [...(byReceipt.get(receipt) ?? []), i]);
+        }
+    });
+    for (const members of byMovement.values()) {
+        const sorted = [...members].sort((a, b) => candidates[a]!.block_height - candidates[b]!.block_height);
+        for (let k = 1; k < sorted.length; k++) {
+            const [a, b] = [candidates[sorted[k - 1]!]!, candidates[sorted[k]!]!];
+            if (a.block_height !== b.block_height && b.block_height - a.block_height <= NEAR_DUPLICATE_SPAN) {
+                join(sorted[k - 1]!, sorted[k]!);
+            }
+        }
+    }
+    for (const members of byReceipt.values()) {
+        for (let k = 1; k < members.length; k++) {
+            if (candidates[members[k]!]!.block_height !== candidates[members[0]!]!.block_height) join(members[0]!, members[k]!);
+        }
+    }
+
+    const groups = new Map<number, number[]>();
+    candidates.forEach((_, i) => {
+        const root = find(i);
+        groups.set(root, [...(groups.get(root) ?? []), i]);
+    });
+    const copies = [...groups.values()].filter(g => g.length > 1).slice(0, maxGroups);
+    if (copies.length === 0 || !sampler) return { records, removed: 0, reads: 0 };
+
+    const cache = new Map<number, string>();
+    let reads = 0;
+    const bal = async (block: number): Promise<string> => {
+        if (!cache.has(block)) { reads++; cache.set(block, BigInt(await sampler.balanceAt(block)).toString()); }
+        return cache.get(block)!;
+    };
+
+    const drop = new Set<BalanceChangeRecord>();
+    const replace = new Map<BalanceChangeRecord, BalanceChangeRecord>();
+    for (const group of copies) {
+        const members = group.map(i => candidates[i]!);
+        let confirmed: BalanceChangeRecord[];
+        try {
+            confirmed = [];
+            for (const r of members) {
+                const [before, after] = [await bal(r.block_height - 1), await bal(r.block_height)];
+                if (BigInt(before) === BigInt(r.balance_before) && BigInt(after) === BigInt(r.balance_after)) confirmed.push(r);
+            }
+        } catch {
+            continue; // RPC trouble: leave the group for the next sync
+        }
+        if (confirmed.length === 0 || confirmed.length === members.length) continue;
+
+        const dropped = members.filter(r => !confirmed.includes(r));
+        for (const r of dropped) drop.add(r);
+        for (const kept of confirmed) {
+            const merged: BalanceChangeRecord = { ...kept };
+            for (const field of NEAR_DUPLICATE_DETAILS) {
+                const missing = merged[field] == null || (field === 'counterparty' && merged[field] === 'unknown');
+                const from = dropped.find(r => r[field] != null && !(field === 'counterparty' && r[field] === 'unknown'));
+                if (missing && from) (merged as any)[field] = from[field];
+            }
+            replace.set(kept, merged);
+        }
+    }
+    if (drop.size === 0) return { records, removed: 0, reads };
+    return {
+        records: records.filter(r => !drop.has(r)).map(r => replace.get(r) ?? r),
+        removed: drop.size,
+        reads,
+    };
+}
+
+/**
  * Highest block among records the transfers API supplies — FT + intents (owned)
  * AND NEAR. Used as the incremental fetch boundary. Must include NEAR: otherwise
  * NEAR-only accounts (no FT/intents) get a boundary of 0 and re-fetch their whole
@@ -1165,14 +1293,22 @@ export async function syncFtTransfersForAccount(
     // NEAR gaps, found in the data and fetched one bounded window at a time.
     // Costs nothing when the ledger chains; a request per window when not.
     const nowMs = Date.parse(opts.now ?? new Date().toISOString());
+    const nearSampler = opts.debitSampler === undefined ? rpcDebitSampler(accountId) : opts.debitSampler;
     const nearRepair = await fillNearGapsFromApi(accountId, result.records, fetchRecords, {
         maxWindows: opts.nearGapWindows ?? 20,
         attempts: data.metadata.nearGapAttempts ?? {},
         nowMs,
-        debitSampler: opts.debitSampler === undefined ? rpcDebitSampler(accountId) : opts.debitSampler,
+        debitSampler: nearSampler,
     });
     if (nearRepair.filled > 0) {
         result = { ...result, records: nearRepair.records, filled: result.filled + nearRepair.filled };
+    }
+    // A NEAR movement stored twice, by the tracker and by a repair, or already
+    // in the file from an earlier sync: one copy, where the chain shows it.
+    // Reads nothing when there are none.
+    const nearCopies = await resolveNearDuplicates(result.records, nearSampler);
+    if (nearCopies.removed > 0) {
+        result = { ...result, records: nearCopies.records };
     }
     // The attempt memory must survive a cycle in which nothing else changed, or
     // an unfillable window is fetched again next minute.
